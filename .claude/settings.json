@@ -1,0 +1,6 @@
+{
+  "statusLine": {
+    "command": "input=$(cat); cwd=$(echo \"$input\" | jq -r '.workspace.current_dir'); branch=$(git -C \"$cwd\" --no-optional-locks branch --show-current 2\u003e/dev/null); if [ -n \"$branch\" ]; then echo \"armstrong ($branch)\"; else echo \"armstrong\"; fi",
+    "type": "command"
+  }
+}

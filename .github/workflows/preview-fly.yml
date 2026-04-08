@@ -1,0 +1,150 @@
+name: Preview Deploy to Fly.io
+
+on:
+  workflow_call:
+    inputs:
+      app-prefix:
+        description: "Preview app prefix, e.g. flux-preview"
+        required: true
+        type: string
+      cue-path:
+        description: "CUE export path, e.g. ./apps/flux"
+        required: true
+        type: string
+      nix-target:
+        description: "Nix build target, e.g. oci-image"
+        required: true
+        type: string
+      nix-input-name:
+        description: "Flake input to override, e.g. flux"
+        required: true
+        type: string
+      image-name:
+        description: "Docker image name, e.g. flux"
+        required: true
+        type: string
+      source-repo:
+        description: "PR source repo, e.g. gunk-dev/flux"
+        required: true
+        type: string
+      pr-number:
+        description: "PR number from dispatch payload"
+        required: true
+        type: string
+      head-sha:
+        description: "Commit SHA for --override-input"
+        required: false
+        type: string
+        default: ""
+      org:
+        description: "Fly.io org"
+        required: false
+        type: string
+        default: "gunk-dev"
+      action:
+        description: "deploy or cleanup"
+        required: true
+        type: string
+    secrets:
+      FLY_API_TOKEN:
+        required: true
+      APP_ID:
+        required: true
+      APP_PRIVATE_KEY:
+        required: true
+
+jobs:
+  deploy:
+    if: inputs.action == 'deploy'
+    runs-on: ubuntu-latest
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      APP_NAME: "${{ inputs.app-prefix }}-${{ inputs.pr-number }}"
+    steps:
+      - name: Validate PR number
+        run: |
+          if ! echo "${{ inputs.pr-number }}" | grep -qE '^[1-9][0-9]*$'; then
+            echo "Error: pr-number must be a positive integer"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@e50d5f73bfe71c2dd0aa4218de8f4afa59f8f81d # v16
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: ${{ inputs.source-repo }}
+
+      - name: Generate fly.toml
+        run: |
+          nix develop -c cue export ${{ inputs.cue-path }} \
+            -t preview \
+            -t "appName=$APP_NAME" \
+            -e preview \
+            --out toml > fly.toml
+
+      - name: Build OCI image
+        run: |
+          if [ -n "${{ inputs.head-sha }}" ]; then
+            nix build .#${{ inputs.nix-target }} \
+              --override-input ${{ inputs.nix-input-name }} \
+              "github:${{ inputs.source-repo }}/${{ inputs.head-sha }}"
+          else
+            nix build .#${{ inputs.nix-target }}
+          fi
+
+      - name: Ensure Fly app exists
+        run: |
+          if ! fly apps list --org ${{ inputs.org }} | grep -q "^$APP_NAME"; then
+            fly apps create "$APP_NAME" --org "${{ inputs.org }}"
+          fi
+
+      - name: Load and push OCI image
+        run: |
+          docker load < result
+          fly auth docker
+          docker tag "${{ inputs.image-name }}:latest" "registry.fly.io/$APP_NAME:latest"
+          docker push "registry.fly.io/$APP_NAME:latest"
+
+      - name: Deploy
+        run: |
+          fly deploy \
+            --config fly.toml \
+            --app "$APP_NAME" \
+            --image "registry.fly.io/$APP_NAME:latest"
+
+      - name: Comment preview URL
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh pr comment ${{ inputs.pr-number }} \
+            --repo "${{ inputs.source-repo }}" \
+            --body "Preview deployed: https://$APP_NAME.fly.dev"
+
+  cleanup:
+    if: inputs.action == 'cleanup'
+    runs-on: ubuntu-latest
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+    steps:
+      - name: Validate PR number
+        run: |
+          if ! echo "${{ inputs.pr-number }}" | grep -qE '^[1-9][0-9]*$'; then
+            echo "Error: pr-number must be a positive integer"
+            exit 1
+          fi
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@e50d5f73bfe71c2dd0aa4218de8f4afa59f8f81d # v16
+
+      - name: Destroy preview app
+        run: fly apps destroy "${{ inputs.app-prefix }}-${{ inputs.pr-number }}" -y
