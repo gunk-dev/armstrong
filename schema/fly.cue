@@ -10,11 +10,11 @@ package schema
 }
 
 #HttpService: {
-	internal_port:        int
+	internal_port:        int & >=1 & <=65535
 	force_https:          bool | *true
-	auto_stop_machines:   string | *"suspend"
+	auto_stop_machines:   bool | "off" | "stop" | *"suspend"
 	auto_start_machines:  bool | *true
-	min_machines_running: int | *0
+	min_machines_running: int & >=0 | *0
 	checks?: [...#HttpCheck]
 }
 
@@ -24,5 +24,5 @@ package schema
 	custom_domains?: [...string]
 	[string]:        _
 
-	http_service: #HttpService
+	http_service?: #HttpService
 }

@@ -23,7 +23,7 @@ Available definitions:
 - `#FlyApp` — Fly.io app configuration (app name, region, HTTP service, custom domains)
 - `#HttpService` — HTTP service settings (port, auto-stop, auto-start, health checks)
 - `#HttpCheck` — HTTP health check configuration
-- `#DNSRecord` — DNS record definition (A, CNAME, TXT, MX, AAAA)
+- `#DNSRecord` — DNS record definition (A, AAAA, CNAME, MX, NS, SRV, TXT)
 
 ## Reusable Workflows
 
