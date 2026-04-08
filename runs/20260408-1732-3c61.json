@@ -1,0 +1,17 @@
+{
+  "id": "20260408-1732-3c61",
+  "prompt": "Add a CI workflow to the armstrong repo. Armstrong contains CUE schemas and reusable GitHub Actions workflows.\n\n## Create `.github/workflows/ci.yml`\n\nThe CI should validate:\n\n1. **CUE schema validation** — verify the CUE files are valid\n2. **YAML lint** — validate workflow YAML files  \n3. **Zizmor** — security lint GitHub Actions workflows\n\nUse this structure:\n\n```yaml\nname: CI\n\non:\n  push:\n    branches: [main]\n  pull_request:\n\npermissions: {}\n\njobs:\n  validate-cue:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n    steps:\n      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4\n        with:\n          persist-credentials: false\n      - name: Install CUE\n        run: |\n          curl -sSL https://github.com/cue-lang/cue/releases/download/v0.9.2/cue_v0.9.2_linux_amd64.tar.gz | tar xz\n          sudo mv cue /usr/local/bin/\n      - name: Validate CUE schemas\n        run: cue vet ./schema/\n\n  yaml-lint:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n    steps:\n      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4\n        with:\n          persist-credentials: false\n      - name: Validate workflow YAML\n        run: |\n          pip install --quiet yamllint\n          yamllint -d \"{extends: default, rules: {line-length: disable, truthy: disable}}\" .github/workflows/\n\n  zizmor:\n    runs-on: ubuntu-latest\n    permissions:\n      contents: read\n    steps:\n      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4\n        with:\n          persist-credentials: false\n      - name: Install zizmor\n        run: pip install --quiet zizmor\n      - name: Run zizmor\n        run: zizmor . --no-online-audits\n```\n\n## Constraints\n- Commit directly to main (this is initial setup, not a PR)\n- Use the same checkout action pin as the other gunk-dev repos: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11\n- Keep it simple — just these three checks",
+  "issue": null,
+  "branch": "agent/20260408-1732-3c61",
+  "worktree": "/tmp/klaus-sessions/armstrong/20260408-1732-3c61",
+  "tmux_pane": "%14",
+  "budget": "5.00",
+  "log_file": "/home/patrick/.klaus/sessions/session-20260407-1651-0aa4/logs/20260408-1732-3c61.jsonl",
+  "created_at": "2026-04-08T17:32:48-04:00",
+  "cost_usd": 0.15385274999999998,
+  "duration_ms": 39028,
+  "pr_url": null,
+  "target_repo": "gunk-dev/armstrong",
+  "clone_dir": "/tmp/klaus-sessions/.repos/gunk-dev/armstrong",
+  "session_name": "20260408-1732-3c61"
+}
