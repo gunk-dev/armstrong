@@ -1,0 +1,17 @@
+{
+  "id": "20260409-1119-f37f",
+  "prompt": "Move the DNS CLI tool from gunk-dev/infra into this repo (armstrong). This tool manages DNS records via the Porkbun API.\n\n## What to move\nFrom gunk-dev/infra, copy these files into a new cmd/dns/ directory. You can fetch them with: gh api repos/gunk-dev/infra/contents/cmd/dns/\u003cfile\u003e --jq .content | base64 -d\n\nFiles: main.go, sync.go, porkbun.go, preview.go, sync_test.go\n\n## Go module setup\nCreate go.mod with module gunk.dev/armstrong, go 1.25.0, dep github.com/spf13/cobra v1.10.2. Run go mod tidy.\n\n## Reusable DNS workflow\nCreate .github/workflows/dns-sync.yml (workflow_call) that checks out the caller repo, checks out armstrong to build the DNS tool, then runs: cue export ./dns --out json | ./dns-tool sync. Accept secrets for PORKBUN_API_KEY/PORKBUN_SECRET_KEY.\n\n## CI\nUpdate CI to build and test Go code.\n\n## Acceptance criteria\n- cmd/dns/ building, go test passing\n- Reusable dns-sync.yml\n- CI updated\n- All checks pass",
+  "issue": null,
+  "branch": "agent/20260409-1119-f37f",
+  "worktree": "/tmp/klaus-sessions/armstrong/20260409-1119-f37f",
+  "tmux_pane": "%16",
+  "budget": "5.00",
+  "log_file": "/home/patrick/.klaus/sessions/session-20260407-1651-0aa4/logs/20260409-1119-f37f.jsonl",
+  "created_at": "2026-04-09T11:19:53-04:00",
+  "cost_usd": 0.68313315,
+  "duration_ms": 200417,
+  "pr_url": "https://github.com/gunk-dev/armstrong/pull/3",
+  "target_repo": "gunk-dev/armstrong",
+  "clone_dir": "/tmp/klaus-sessions/.repos/gunk-dev/armstrong",
+  "session_name": "20260409-1119-f37f"
+}
