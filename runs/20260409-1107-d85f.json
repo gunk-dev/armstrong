@@ -1,0 +1,17 @@
+{
+  "id": "20260409-1107-d85f",
+  "prompt": "Read README.md and say done",
+  "issue": null,
+  "branch": "agent/20260409-1107-d85f",
+  "worktree": "/tmp/klaus-sessions/armstrong/20260409-1107-d85f",
+  "tmux_pane": "%13",
+  "budget": "5.00",
+  "log_file": "/home/patrick/.klaus/sessions/session-20260407-1651-0aa4/logs/20260409-1107-d85f.jsonl",
+  "created_at": "2026-04-09T11:07:08-04:00",
+  "cost_usd": 0.0539895,
+  "duration_ms": 5372,
+  "pr_url": null,
+  "target_repo": "gunk-dev/armstrong",
+  "clone_dir": "/tmp/klaus-sessions/.repos/gunk-dev/armstrong",
+  "session_name": "20260409-1107-d85f"
+}
