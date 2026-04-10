@@ -64,14 +64,14 @@ jobs:
 
       - name: Ensure Fly app exists
         run: |
-          if ! fly apps list --org ${{ inputs.org }} | grep -q "^${{ inputs.app-name }}"; then
-            fly apps create "${{ inputs.app-name }}" --org "${{ inputs.org }}"
+          if ! nix develop -c fly apps list --org ${{ inputs.org }} | grep -q "^${{ inputs.app-name }}"; then
+            nix develop -c fly apps create "${{ inputs.app-name }}" --org "${{ inputs.org }}"
           fi
 
       - name: Load and push OCI image
         run: |
           docker load < result
-          fly auth docker
+          nix develop -c fly auth docker
           docker tag "${{ inputs.image-name }}:latest" "registry.fly.io/${{ inputs.app-name }}:latest"
           docker push "registry.fly.io/${{ inputs.app-name }}:latest"
 
@@ -84,7 +84,7 @@ jobs:
 
       - name: Deploy
         run: |
-          fly deploy \
+          nix develop -c fly deploy \
             --config fly.toml \
             --app "${{ inputs.app-name }}" \
             --image "registry.fly.io/${{ inputs.app-name }}:latest"
@@ -96,5 +96,5 @@ jobs:
             -e ${{ inputs.environment }} \
             --out json | jq -r '.custom_domains // [] | .[]')
           for domain in $DOMAINS; do
-            fly certs create "$domain" --app "${{ inputs.app-name }}" || true
+            nix develop -c fly certs create "$domain" --app "${{ inputs.app-name }}" || true
           done
