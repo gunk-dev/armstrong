@@ -60,10 +60,18 @@ jobs:
     env:
       FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       APP_NAME: "${{ inputs.app-prefix }}-${{ inputs.pr-number }}"
+      CUE_PATH: ${{ inputs.cue-path }}
+      NIX_TARGET: ${{ inputs.nix-target }}
+      NIX_INPUT_NAME: ${{ inputs.nix-input-name }}
+      IMAGE_NAME: ${{ inputs.image-name }}
+      SOURCE_REPO: ${{ inputs.source-repo }}
+      PR_NUMBER: ${{ inputs.pr-number }}
+      HEAD_SHA: ${{ inputs.head-sha }}
+      FLY_ORG: ${{ inputs.org }}
     steps:
       - name: Validate PR number
         run: |
-          if ! echo "${{ inputs.pr-number }}" | grep -qE '^[1-9][0-9]*$'; then
+          if ! echo "$PR_NUMBER" | grep -qE '^[1-9][0-9]*$'; then
             echo "Error: pr-number must be a positive integer"
             exit 1
           fi
@@ -86,7 +94,7 @@ jobs:
 
       - name: Generate fly.toml
         run: |
-          nix develop -c cue export ${{ inputs.cue-path }} \
+          nix develop -c cue export "$CUE_PATH" \
             -t preview \
             -t "appName=$APP_NAME" \
             -e preview \
@@ -94,40 +102,40 @@ jobs:
 
       - name: Build OCI image
         run: |
-          if [ -n "${{ inputs.head-sha }}" ]; then
-            nix build .#${{ inputs.nix-target }} \
-              --override-input ${{ inputs.nix-input-name }} \
-              "github:${{ inputs.source-repo }}/${{ inputs.head-sha }}"
+          if [ -n "$HEAD_SHA" ]; then
+            nix build ".#${NIX_TARGET}" \
+              --override-input "$NIX_INPUT_NAME" \
+              "github:${SOURCE_REPO}/${HEAD_SHA}"
           else
-            nix build .#${{ inputs.nix-target }}
+            nix build ".#${NIX_TARGET}"
           fi
 
       - name: Ensure Fly app exists
         run: |
-          if ! fly apps list --org ${{ inputs.org }} | grep -q "^$APP_NAME"; then
-            fly apps create "$APP_NAME" --org "${{ inputs.org }}"
+          if ! nix develop -c fly apps list --org "$FLY_ORG" | grep -q "^${APP_NAME}"; then
+            nix develop -c fly apps create "$APP_NAME" --org "$FLY_ORG"
           fi
 
       - name: Load and push OCI image
         run: |
           docker load < result
-          fly auth docker
-          docker tag "${{ inputs.image-name }}:latest" "registry.fly.io/$APP_NAME:latest"
-          docker push "registry.fly.io/$APP_NAME:latest"
+          nix develop -c fly auth docker
+          docker tag "${IMAGE_NAME}:latest" "registry.fly.io/${APP_NAME}:latest"
+          docker push "registry.fly.io/${APP_NAME}:latest"
 
       - name: Deploy
         run: |
-          fly deploy \
+          nix develop -c fly deploy \
             --config fly.toml \
             --app "$APP_NAME" \
-            --image "registry.fly.io/$APP_NAME:latest"
+            --image "registry.fly.io/${APP_NAME}:latest"
 
       - name: Comment preview URL
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          gh pr comment ${{ inputs.pr-number }} \
-            --repo "${{ inputs.source-repo }}" \
+          gh pr comment "$PR_NUMBER" \
+            --repo "$SOURCE_REPO" \
             --body "Preview deployed: https://$APP_NAME.fly.dev"
 
   cleanup:
@@ -135,16 +143,23 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      APP_NAME: "${{ inputs.app-prefix }}-${{ inputs.pr-number }}"
+      PR_NUMBER: ${{ inputs.pr-number }}
     steps:
       - name: Validate PR number
         run: |
-          if ! echo "${{ inputs.pr-number }}" | grep -qE '^[1-9][0-9]*$'; then
+          if ! echo "$PR_NUMBER" | grep -qE '^[1-9][0-9]*$'; then
             echo "Error: pr-number must be a positive integer"
             exit 1
           fi
+
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@e50d5f73bfe71c2dd0aa4218de8f4afa59f8f81d # v16
 
       - name: Destroy preview app
-        run: fly apps destroy "${{ inputs.app-prefix }}-${{ inputs.pr-number }}" -y
+        run: nix develop -c fly apps destroy "$APP_NAME" -y
