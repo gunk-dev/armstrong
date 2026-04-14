@@ -1,0 +1,20 @@
+{
+  "id": "20260414-0636-e09b",
+  "prompt": "CI is failing on PR #3. Diagnose the failures and push fixes. Check `gh pr checks 3` for details and `gh run view \u003crun-id\u003e --log-failed` for error output.",
+  "issue": null,
+  "pr": "3",
+  "branch": "agent/20260409-1119-f37f",
+  "worktree": "/tmp/klaus-sessions/armstrong/20260414-0636-e09b",
+  "tmux_pane": "%11",
+  "budget": "5.00",
+  "log_file": "/home/patrick/.klaus/sessions/session-20260407-1651-0aa4/logs/20260414-0636-e09b.jsonl",
+  "created_at": "2026-04-14T06:37:00-04:00",
+  "cost_usd": 0.6681467500000001,
+  "duration_ms": 153821,
+  "pr_url": "https://github.com/gunk-dev/armstrong/pull/3",
+  "type": "pr-fix",
+  "target_repo": "gunk-dev/armstrong",
+  "clone_dir": "/tmp/klaus-sessions/.repos/gunk-dev/armstrong",
+  "session_name": "20260414-0636-e09b",
+  "original_run_id": "20260414-0635-9cdc"
+}
