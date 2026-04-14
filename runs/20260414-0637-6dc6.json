@@ -1,0 +1,19 @@
+{
+  "id": "20260414-0637-6dc6",
+  "prompt": "Fix all zizmor findings so the CI zizmor check passes.\n\n## Context\nPR #3 (branch: agent/20260409-1119-f37f) adds a DNS CLI tool. The zizmor CI job fails with 58 findings (6 medium, 35 high, 17 suppressed). The CI runs: `zizmor . --no-online-audits`\n\n## What I found\nThe failed log shows `secrets-outside-env` warnings in `.github/workflows/preview-fly.yml` at lines 61, 83, 84, 137 — but both the `deploy` and `cleanup` jobs already have `environment: preview`. So either zizmor doesn't recognize the existing environment declarations, or there's a version issue. The full log was truncated so I only saw 4 of the 58 findings.\n\n## Workflow files\nThere are 3 workflow files plus whatever the PR adds:\n- `.github/workflows/ci.yml` — runs validate-cue, yaml-lint, zizmor, and go-build-test\n- `.github/workflows/deploy-fly.yml` — reusable deploy workflow (has `environment: ${{ inputs.environment }}`)\n- `.github/workflows/preview-fly.yml` — reusable preview deploy/cleanup workflow (has `environment: preview` on both jobs)\n- The PR also adds `.github/workflows/dns-sync.yml`\n\n## Approach\n1. Run `pip install zizmor \u0026\u0026 zizmor . --no-online-audits` to see ALL findings\n2. Fix what can be fixed (pin actions, add permissions, add environments, etc.)\n3. For findings that are intentional/acceptable (e.g., reusable workflows receiving secrets from callers), suppress them in a `.zizmor.yml` config file at the repo root\n4. Run zizmor again to confirm 0 non-suppressed findings that would cause failure\n5. Commit and push to the PR branch\n\n## Acceptance criteria\n- `zizmor . --no-online-audits` exits 0 (or only has informational/low findings that don't fail)\n- All workflow files remain functionally correct\n- Prefer fixing over suppressing, but suppress if the finding is a false positive",
+  "issue": null,
+  "pr": "3",
+  "branch": "agent/20260409-1119-f37f",
+  "worktree": "/tmp/klaus-sessions/armstrong/20260414-0637-6dc6",
+  "tmux_pane": "%12",
+  "budget": "5.00",
+  "log_file": "/home/patrick/.klaus/sessions/session-20260407-1651-0aa4/logs/20260414-0637-6dc6.jsonl",
+  "created_at": "2026-04-14T06:37:47-04:00",
+  "cost_usd": 1.0013947500000002,
+  "duration_ms": 218961,
+  "pr_url": "https://github.com/gunk-dev/armstrong/pull/3",
+  "type": "pr-fix",
+  "target_repo": "gunk-dev/armstrong",
+  "clone_dir": "/tmp/klaus-sessions/.repos/gunk-dev/armstrong",
+  "session_name": "20260414-0637-6dc6"
+}
