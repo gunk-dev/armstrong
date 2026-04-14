@@ -13,6 +13,7 @@ permissions: {}
 jobs:
   dns-sync:
     runs-on: ubuntu-latest
+    environment: dns
     permissions:
       contents: read
     steps:
