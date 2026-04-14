@@ -25,7 +25,32 @@ Available definitions:
 - `#HttpCheck` — HTTP health check configuration
 - `#DNSRecord` — DNS record definition (A, AAAA, CNAME, MX, NS, SRV, TXT)
 
+## DNS Tool
+
+A CLI tool (`cmd/dns/`) that manages DNS records for gunk.dev via the Porkbun API.
+
+Commands:
+
+- `dns sync` — Reads a JSON DNS definition from stdin and converges Porkbun records to match. Use `--prune` to delete records not in the definition (skips NS, SOA, and preview-* records).
+- `dns preview create <app> <pr-number>` — Creates a preview CNAME record for PR environments.
+- `dns preview delete <app> <pr-number>` — Deletes a preview CNAME record.
+
+Requires `PORKBUN_API_KEY` and `PORKBUN_SECRET_KEY` environment variables.
+
 ## Reusable Workflows
+
+### dns-sync.yml
+
+Syncs DNS records from a CUE definition to Porkbun. Checks out the caller repo and armstrong, builds the DNS tool, then runs the sync.
+
+```yaml
+jobs:
+  dns:
+    uses: gunk-dev/armstrong/.github/workflows/dns-sync.yml@main
+    secrets:
+      PORKBUN_API_KEY: ${{ secrets.PORKBUN_API_KEY }}
+      PORKBUN_SECRET_KEY: ${{ secrets.PORKBUN_SECRET_KEY }}
+```
 
 ### deploy-fly.yml
 

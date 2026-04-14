@@ -60,47 +60,67 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@e50d5f73bfe71c2dd0aa4218de8f4afa59f8f81d # v16
 
       - name: Generate fly.toml
+        env:
+          CUE_PATH: ${{ inputs.cue-path }}
+          ENVIRONMENT: ${{ inputs.environment }}
         run: |
           nix develop -c cue export "$CUE_PATH" \
-            -t "$DEPLOY_ENV" \
-            -e "$DEPLOY_ENV" \
+            -t "$ENVIRONMENT" \
+            -e "$ENVIRONMENT" \
             --out toml > fly.toml
 
       - name: Build OCI image
-        run: nix build ".#${NIX_TARGET}"
+        env:
+          NIX_TARGET: ${{ inputs.nix-target }}
+        run: nix build ".#$NIX_TARGET"
 
       - name: Ensure Fly app exists
+        env:
+          ORG: ${{ inputs.org }}
+          APP_NAME: ${{ inputs.app-name }}
         run: |
-          if ! nix develop -c fly apps list --org "$FLY_ORG" | grep -q "^${APP_NAME}"; then
-            nix develop -c fly apps create "$APP_NAME" --org "$FLY_ORG"
+          if ! nix develop -c fly apps list --org "$ORG" | grep -q "^$APP_NAME"; then
+            nix develop -c fly apps create "$APP_NAME" --org "$ORG"
           fi
 
       - name: Load and push OCI image
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          APP_NAME: ${{ inputs.app-name }}
         run: |
           docker load < result
           nix develop -c fly auth docker
-          docker tag "${IMAGE_NAME}:latest" "registry.fly.io/${APP_NAME}:latest"
-          docker push "registry.fly.io/${APP_NAME}:latest"
+          docker tag "$IMAGE_NAME:latest" "registry.fly.io/$APP_NAME:latest"
+          docker push "registry.fly.io/$APP_NAME:latest"
 
       - name: Smoke test
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          HEALTH_CHECK_PATH: ${{ inputs.health-check-path }}
         run: |
-          CONTAINER_ID=$(docker run -d -p 8080:8080 "${IMAGE_NAME}:latest")
+          CONTAINER_ID=$(docker run -d -p 8080:8080 "$IMAGE_NAME:latest")
           sleep 3
-          curl -f "http://localhost:8080${HEALTH_CHECK_PATH}"
+          curl -f "http://localhost:8080$HEALTH_CHECK_PATH"
           docker stop "$CONTAINER_ID"
 
       - name: Deploy
+        env:
+          APP_NAME: ${{ inputs.app-name }}
         run: |
           nix develop -c fly deploy \
             --config fly.toml \
             --app "$APP_NAME" \
-            --image "registry.fly.io/${APP_NAME}:latest"
+            --image "registry.fly.io/$APP_NAME:latest"
 
       - name: Configure custom domains
+        env:
+          CUE_PATH: ${{ inputs.cue-path }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          APP_NAME: ${{ inputs.app-name }}
         run: |
           DOMAINS=$(nix develop -c cue export "$CUE_PATH" \
-            -t "$DEPLOY_ENV" \
-            -e "$DEPLOY_ENV" \
+            -t "$ENVIRONMENT" \
+            -e "$ENVIRONMENT" \
             --out json | jq -r '.custom_domains // [] | .[]')
           for domain in $DOMAINS; do
             nix develop -c fly certs create "$domain" --app "$APP_NAME" || true

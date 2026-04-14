@@ -71,6 +71,8 @@ jobs:
       FLY_ORG: ${{ inputs.org }}
     steps:
       - name: Validate PR number
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
         run: |
           if ! echo "$PR_NUMBER" | grep -qE '^[1-9][0-9]*$'; then
             echo "Error: pr-number must be a positive integer"
@@ -94,6 +96,8 @@ jobs:
           repositories: ${{ inputs.source-repo }}
 
       - name: Generate fly.toml
+        env:
+          CUE_PATH: ${{ inputs.cue-path }}
         run: |
           nix develop -c cue export "$CUE_PATH" \
             -t preview \
@@ -102,38 +106,49 @@ jobs:
             --out toml > fly.toml
 
       - name: Build OCI image
+        env:
+          HEAD_SHA: ${{ inputs.head-sha }}
+          NIX_TARGET: ${{ inputs.nix-target }}
+          NIX_INPUT_NAME: ${{ inputs.nix-input-name }}
+          SOURCE_REPO: ${{ inputs.source-repo }}
         run: |
           if [ -n "$HEAD_SHA" ]; then
-            nix build ".#${NIX_TARGET}" \
+            nix build ".#$NIX_TARGET" \
               --override-input "$NIX_INPUT_NAME" \
-              "github:${SOURCE_REPO}/${HEAD_SHA}"
+              "github:$SOURCE_REPO/$HEAD_SHA"
           else
-            nix build ".#${NIX_TARGET}"
+            nix build ".#$NIX_TARGET"
           fi
 
       - name: Ensure Fly app exists
+        env:
+          ORG: ${{ inputs.org }}
         run: |
-          if ! nix develop -c fly apps list --org "$FLY_ORG" | grep -q "^${APP_NAME}"; then
-            nix develop -c fly apps create "$APP_NAME" --org "$FLY_ORG"
+          if ! nix develop -c fly apps list --org "$ORG" | grep -q "^$APP_NAME"; then
+            nix develop -c fly apps create "$APP_NAME" --org "$ORG"
           fi
 
       - name: Load and push OCI image
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
         run: |
           docker load < result
           nix develop -c fly auth docker
-          docker tag "${IMAGE_NAME}:latest" "registry.fly.io/${APP_NAME}:latest"
-          docker push "registry.fly.io/${APP_NAME}:latest"
+          docker tag "$IMAGE_NAME:latest" "registry.fly.io/$APP_NAME:latest"
+          docker push "registry.fly.io/$APP_NAME:latest"
 
       - name: Deploy
         run: |
           nix develop -c fly deploy \
             --config fly.toml \
             --app "$APP_NAME" \
-            --image "registry.fly.io/${APP_NAME}:latest"
+            --image "registry.fly.io/$APP_NAME:latest"
 
       - name: Comment preview URL
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          SOURCE_REPO: ${{ inputs.source-repo }}
         run: |
           gh pr comment "$PR_NUMBER" \
             --repo "$SOURCE_REPO" \
@@ -149,6 +164,8 @@ jobs:
       PR_NUMBER: ${{ inputs.pr-number }}
     steps:
       - name: Validate PR number
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
         run: |
           if ! echo "$PR_NUMBER" | grep -qE '^[1-9][0-9]*$'; then
             echo "Error: pr-number must be a positive integer"
@@ -164,4 +181,7 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@e50d5f73bfe71c2dd0aa4218de8f4afa59f8f81d # v16
 
       - name: Destroy preview app
-        run: nix develop -c fly apps destroy "$APP_NAME" -y
+        env:
+          APP_PREFIX: ${{ inputs.app-prefix }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+        run: nix develop -c fly apps destroy "$APP_PREFIX-$PR_NUMBER" -y
