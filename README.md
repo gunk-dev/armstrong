@@ -31,7 +31,7 @@ A CLI tool (`cmd/dns/`) that manages DNS records for gunk.dev via the Porkbun AP
 
 Commands:
 
-- `dns sync` — Reads a JSON DNS definition from stdin and converges Porkbun records to match. Use `--prune` to delete records not in the definition (skips NS, SOA, and preview-* records).
+- `dns sync` — Reads a JSON DNS definition from stdin and converges Porkbun records to match. Use `--prune` to delete records not in the definition (skips NS, SOA, and preview-* records). Pass `--dry-run` to print the planned changes without calling the Porkbun API.
 - `dns preview create <app> <pr-number>` — Creates a preview CNAME record for PR environments.
 - `dns preview delete <app> <pr-number>` — Deletes a preview CNAME record.
 
@@ -47,6 +47,8 @@ Syncs DNS records from a CUE definition to Porkbun. Checks out the caller repo a
 jobs:
   dns:
     uses: gunk-dev/armstrong/.github/workflows/dns-sync.yml@main
+    with:
+      dry_run: false  # optional; set true to preview without mutating Porkbun
     secrets:
       PORKBUN_API_KEY: ${{ secrets.PORKBUN_API_KEY }}
       PORKBUN_SECRET_KEY: ${{ secrets.PORKBUN_SECRET_KEY }}

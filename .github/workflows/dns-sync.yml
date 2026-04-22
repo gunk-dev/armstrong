@@ -2,6 +2,11 @@ name: DNS Sync
 
 on:
   workflow_call:
+    inputs:
+      dry_run:
+        description: "If true, print the changes that would be made without calling Porkbun."
+        type: boolean
+        default: false
     secrets:
       PORKBUN_API_KEY:
         required: true
@@ -41,7 +46,7 @@ jobs:
           sudo mv cue /usr/local/bin/
 
       - name: Sync DNS records
-        run: cue export ./dns --out json | ./_armstrong/dns-tool sync --prune
+        run: cue export ./dns --out json | ./_armstrong/dns-tool sync --prune${{ inputs.dry_run && ' --dry-run' || '' }}
         env:
           PORKBUN_API_KEY: ${{ secrets.PORKBUN_API_KEY }}
           PORKBUN_SECRET_KEY: ${{ secrets.PORKBUN_SECRET_KEY }}
