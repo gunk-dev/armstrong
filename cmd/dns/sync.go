@@ -25,23 +25,34 @@ type dnsRecord struct {
 	Priority *int   `json:"priority"`
 }
 
+// porkbunMutator is the subset of the Porkbun client used by sync. It exists
+// so tests can inject a fake and verify that --dry-run makes no mutations.
+type porkbunMutator interface {
+	retrieve(domain string) ([]porkbunRecord, error)
+	create(domain string, req createRequest) error
+	editByNameType(domain, recordType, subdomain string, req editRequest) error
+	deleteByID(domain, id string) error
+}
+
 func newSyncCmd() *cobra.Command {
 	var prune bool
+	var dryRun bool
 
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "Sync DNS records from CUE definition to Porkbun",
 		Long:  "Reads JSON from stdin (pipe from: cue export ./dns --out json) and converges Porkbun records to match.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runSync(prune)
+			return runSync(prune, dryRun)
 		},
 	}
 
 	cmd.Flags().BoolVar(&prune, "prune", false, "Delete records not in CUE definition (skips NS, SOA, and preview-* records)")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Print the changes that would be made without calling the Porkbun API")
 	return cmd
 }
 
-func runSync(prune bool) error {
+func runSync(prune, dryRun bool) error {
 	data, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return fmt.Errorf("read stdin: %w", err)
@@ -55,6 +66,14 @@ func runSync(prune bool) error {
 	client, err := newPorkbunClient()
 	if err != nil {
 		return err
+	}
+
+	return syncRecords(client, input, prune, dryRun, os.Stdout)
+}
+
+func syncRecords(client porkbunMutator, input dnsInput, prune, dryRun bool, out io.Writer) error {
+	if dryRun {
+		fmt.Fprintln(out, "DRY RUN — no changes will be made")
 	}
 
 	existing, err := client.retrieve(input.Domain)
@@ -93,7 +112,7 @@ func runSync(prune bool) error {
 				wantPrio = *want.Priority
 			}
 			if gotTTL != want.TTL || (want.Priority != nil && gotPrio != wantPrio) {
-				fmt.Printf("UPDATE %s %s -> %s (ttl=%d)\n", want.Type, displayName(want.Name), want.Content, want.TTL)
+				fmt.Fprintf(out, "UPDATE %s %s -> %s (ttl=%d%s)\n", want.Type, displayName(want.Name), want.Content, want.TTL, prioSuffix(want.Priority))
 				req := editRequest{
 					Content: want.Content,
 					TTL:     strconv.Itoa(want.TTL),
@@ -101,14 +120,16 @@ func runSync(prune bool) error {
 				if want.Priority != nil {
 					req.Priority = strconv.Itoa(*want.Priority)
 				}
-				if err := client.editByNameType(input.Domain, want.Type, want.Name, req); err != nil {
-					return fmt.Errorf("update %s %s: %w", want.Type, want.Name, err)
+				if !dryRun {
+					if err := client.editByNameType(input.Domain, want.Type, want.Name, req); err != nil {
+						return fmt.Errorf("update %s %s: %w", want.Type, displayName(want.Name), err)
+					}
 				}
 			} else {
-				fmt.Printf("OK     %s %s -> %s\n", want.Type, displayName(want.Name), want.Content)
+				fmt.Fprintf(out, "OK     %s %s -> %s\n", want.Type, displayName(want.Name), want.Content)
 			}
 		} else {
-			fmt.Printf("CREATE %s %s -> %s\n", want.Type, displayName(want.Name), want.Content)
+			fmt.Fprintf(out, "CREATE %s %s -> %s (ttl=%d%s)\n", want.Type, displayName(want.Name), want.Content, want.TTL, prioSuffix(want.Priority))
 			req := createRequest{
 				Type:    want.Type,
 				Name:    want.Name,
@@ -118,8 +139,10 @@ func runSync(prune bool) error {
 			if want.Priority != nil {
 				req.Priority = strconv.Itoa(*want.Priority)
 			}
-			if err := client.create(input.Domain, req); err != nil {
-				return fmt.Errorf("create %s %s: %w", want.Type, want.Name, err)
+			if !dryRun {
+				if err := client.create(input.Domain, req); err != nil {
+					return fmt.Errorf("create %s %s: %w", want.Type, displayName(want.Name), err)
+				}
 			}
 		}
 	}
@@ -139,9 +162,11 @@ func runSync(prune bool) error {
 			if strings.HasPrefix(name, "preview-") {
 				continue
 			}
-			fmt.Printf("DELETE %s %s -> %s (id=%s)\n", r.Type, displayName(name), r.Content, r.ID)
-			if err := client.deleteByID(input.Domain, r.ID); err != nil {
-				return fmt.Errorf("delete %s (id=%s): %w", r.Type, r.ID, err)
+			fmt.Fprintf(out, "DELETE %s %s -> %s (id=%s)\n", r.Type, displayName(name), r.Content, r.ID)
+			if !dryRun {
+				if err := client.deleteByID(input.Domain, r.ID); err != nil {
+					return fmt.Errorf("delete %s (id=%s): %w", r.Type, r.ID, err)
+				}
 			}
 		}
 	}
@@ -162,6 +187,13 @@ func displayName(name string) string {
 		return "@"
 	}
 	return name
+}
+
+func prioSuffix(priority *int) string {
+	if priority == nil {
+		return ""
+	}
+	return fmt.Sprintf(", prio=%d", *priority)
 }
 
 // normalizeContent canonicalizes the content string for comparison.
