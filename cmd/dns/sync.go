@@ -112,7 +112,7 @@ func syncRecords(client porkbunMutator, input dnsInput, prune, dryRun bool, out 
 				wantPrio = *want.Priority
 			}
 			if gotTTL != want.TTL || (want.Priority != nil && gotPrio != wantPrio) {
-				fmt.Fprintf(out, "UPDATE %s %s -> %s (ttl=%d)\n", want.Type, displayName(want.Name), want.Content, want.TTL)
+				fmt.Fprintf(out, "UPDATE %s %s -> %s (ttl=%d%s)\n", want.Type, displayName(want.Name), want.Content, want.TTL, prioSuffix(want.Priority))
 				req := editRequest{
 					Content: want.Content,
 					TTL:     strconv.Itoa(want.TTL),
@@ -122,14 +122,14 @@ func syncRecords(client porkbunMutator, input dnsInput, prune, dryRun bool, out 
 				}
 				if !dryRun {
 					if err := client.editByNameType(input.Domain, want.Type, want.Name, req); err != nil {
-						return fmt.Errorf("update %s %s: %w", want.Type, want.Name, err)
+						return fmt.Errorf("update %s %s: %w", want.Type, displayName(want.Name), err)
 					}
 				}
 			} else {
 				fmt.Fprintf(out, "OK     %s %s -> %s\n", want.Type, displayName(want.Name), want.Content)
 			}
 		} else {
-			fmt.Fprintf(out, "CREATE %s %s -> %s\n", want.Type, displayName(want.Name), want.Content)
+			fmt.Fprintf(out, "CREATE %s %s -> %s (ttl=%d%s)\n", want.Type, displayName(want.Name), want.Content, want.TTL, prioSuffix(want.Priority))
 			req := createRequest{
 				Type:    want.Type,
 				Name:    want.Name,
@@ -141,7 +141,7 @@ func syncRecords(client porkbunMutator, input dnsInput, prune, dryRun bool, out 
 			}
 			if !dryRun {
 				if err := client.create(input.Domain, req); err != nil {
-					return fmt.Errorf("create %s %s: %w", want.Type, want.Name, err)
+					return fmt.Errorf("create %s %s: %w", want.Type, displayName(want.Name), err)
 				}
 			}
 		}
@@ -187,6 +187,13 @@ func displayName(name string) string {
 		return "@"
 	}
 	return name
+}
+
+func prioSuffix(priority *int) string {
+	if priority == nil {
+		return ""
+	}
+	return fmt.Sprintf(", prio=%d", *priority)
 }
 
 // normalizeContent canonicalizes the content string for comparison.
