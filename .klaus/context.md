@@ -6,7 +6,7 @@
 ## Tech stack
 - Go 1.25.0 (`go.mod`), module path `gunk.dev/armstrong`.
 - CUE v0.9.2 — module declared in `cue.mod/module.cue`; CI installs the same version (`.github/workflows/ci.yml`).
-- Cobra v1.10.2 for the CLI (`github.com/spf13/cobra` in `go.mod`; used in `cmd/dns/main.go`, `sync.go`, `preview.go`). No other direct Go dependencies — the standard library handles HTTP/JSON for the Porkbun client.
+- Cobra v1.10.2 for the CLI (`github.com/spf13/cobra` in `go.mod`; used in `cmd/dns/main.go`, `cmd/dns/sync.go`, `cmd/dns/preview.go`). No other direct Go dependencies — the standard library handles HTTP/JSON for the Porkbun client.
 - GitHub Actions for CI and reusable workflows. Workflows pin actions by SHA.
 - Nix is used by the reusable Fly.io deploy workflows (`nix develop -c …`, `nix build …`) — there is no flake in this repo; the caller repo is expected to provide it.
 
@@ -28,7 +28,7 @@
 ## Build, test, run
 - Build everything: `go build ./...` (see CI step in `.github/workflows/ci.yml`).
 - Run Go tests: `go test ./...` (CI uses the same command).
-- Build the DNS CLI specifically: `go build -o dns-tool ./cmd/dns/` (matches the `dns-sync.yml` workflow step).
+- Build the DNS CLI specifically: `go build -o dns-tool ./cmd/dns/` (matches the `.github/workflows/dns-sync.yml` workflow step).
 - Validate CUE: `cue vet ./schema/` (CI step). Requires `cue` v0.9.2 on PATH.
 - Lint workflow YAML locally: `yamllint -d "{extends: default, rules: {line-length: disable, truthy: disable}}" .github/workflows/` (CI step).
 - Static-analyse workflows: `zizmor . --no-online-audits` (CI step).
@@ -41,17 +41,17 @@
 - AAAA record content is normalised via `net.ParseIP` before comparison so equivalent IPv6 textual forms don't cause spurious updates (`cmd/dns/sync.go:202-208`).
 - Reusable workflows declare `permissions: {}` at the top level and grant only what each job needs; `actions/checkout` is always invoked with `persist-credentials: false` (see all four workflow files).
 - GitHub Actions are pinned by full commit SHA, not tag, with the version in a trailing comment (e.g. `actions/checkout@b4ffde65...` `# v4`).
-- User-supplied workflow inputs are passed to shell steps via `env:` rather than interpolated directly into `run:` scripts, to avoid shell injection (e.g. `deploy-fly.yml`, `preview-fly.yml` validation step).
+- User-supplied workflow inputs are passed to shell steps via `env:` rather than interpolated directly into `run:` scripts, to avoid shell injection (e.g. `.github/workflows/deploy-fly.yml`, `.github/workflows/preview-fly.yml` validation step).
 - Errors are wrapped with `%w` and context (`cmd/dns/sync.go`, `cmd/dns/porkbun.go`).
 
 ## Gotchas
-- The `dns-sync.yml` reusable workflow checks out the caller repo at the workspace root **and** checks out `gunk-dev/armstrong` into `_armstrong/`, then runs `cue export ./dns` against the caller and pipes into `./_armstrong/dns-tool sync`. The caller must therefore have a top-level `./dns` CUE package; this is not configurable via input.
+- The `.github/workflows/dns-sync.yml` reusable workflow checks out the caller repo at the workspace root **and** checks out `gunk-dev/armstrong` into `_armstrong/`, then runs `cue export ./dns` against the caller and pipes into `./_armstrong/dns-tool sync`. The caller must therefore have a top-level `./dns` CUE package; this is not configurable via input.
 - `dns sync` reads JSON from stdin only — there is no file-path flag (`cmd/dns/sync.go:56`).
-- The `preview` subcommand hardcodes `defaultDomain = "gunk.dev"` (`cmd/dns/preview.go:10`) and the CNAME target shape `<app>-preview-<pr>.fly.dev` (`preview.go:43`). Changing either requires a code change, not config.
-- `deploy-fly.yml` and `preview-fly.yml` rely on the caller's Nix flake providing the requested `nix-target` and (for previews) a flake input named `nix-input-name` that can be overridden via `--override-input`. There is no flake in this repo to test against.
-- The smoke test in `deploy-fly.yml` curls `http://localhost:8080` against the just-loaded image (`deploy-fly.yml:96-104`) — apps that don't listen on 8080 will fail the smoke test even if otherwise healthy.
+- The `preview` subcommand hardcodes `defaultDomain = "gunk.dev"` (`cmd/dns/preview.go:10`) and the CNAME target shape `<app>-preview-<pr>.fly.dev` (`cmd/dns/preview.go:43`). Changing either requires a code change, not config.
+- `.github/workflows/deploy-fly.yml` and `.github/workflows/preview-fly.yml` rely on the caller's Nix flake providing the requested `nix-target` and (for previews) a flake input named `nix-input-name` that can be overridden via `--override-input`. There is no flake in this repo to test against.
+- The smoke test in `.github/workflows/deploy-fly.yml` curls `http://localhost:8080` against the just-loaded image (`.github/workflows/deploy-fly.yml:96-104`) — apps that don't listen on 8080 will fail the smoke test even if otherwise healthy.
 
 ## External dependencies
 - Porkbun DNS API (`https://api.porkbun.com/api/json/v3`, `cmd/dns/porkbun.go:12`) — requires `PORKBUN_API_KEY` and `PORKBUN_SECRET_KEY`.
 - Fly.io — reusable deploy workflows shell out to the `fly` CLI (provided by the caller's Nix devshell) and push images to `registry.fly.io`. Require `FLY_API_TOKEN`.
-- GitHub App credentials (`APP_ID`, `APP_PRIVATE_KEY`) used by `preview-fly.yml` to mint a token via `actions/create-github-app-token` so it can comment the preview URL back on the source-repo PR.
+- GitHub App credentials (`APP_ID`, `APP_PRIVATE_KEY`) used by `.github/workflows/preview-fly.yml` to mint a token via `actions/create-github-app-token` so it can comment the preview URL back on the source-repo PR.
