@@ -103,6 +103,7 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: ${{ steps.parse-repo.outputs.owner }}
           repositories: ${{ steps.parse-repo.outputs.repo }}
+          permission-pull-requests: write
 
       - name: Generate fly.toml
         env:
