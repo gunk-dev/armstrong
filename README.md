@@ -24,6 +24,7 @@ Available definitions:
 - `#HttpService` — HTTP service settings (port, auto-stop, auto-start, health checks)
 - `#HttpCheck` — HTTP health check configuration
 - `#DNSRecord` — DNS record definition (A, AAAA, CNAME, MX, NS, SRV, TXT)
+- `#Site` — a UniFi Network site (see `schema/unifi.cue`), holding `#Network`, `#FirewallZone`, `#WiFi`, `#FirewallPolicy` and `#DNSPolicy` lists
 
 ## DNS Tool
 
@@ -95,3 +96,60 @@ jobs:
       APP_ID: ${{ secrets.APP_ID }}
       APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
 ```
+
+## UniFi Tool
+
+A CLI tool (`cmd/unifi/`) that manages a UniFi Network site via the official
+**Integration API** served by the console at
+`https://<console>/proxy/network/integration/v1`. It is the sibling of the DNS
+tool: it reads a JSON document on stdin (pipe from `cue export`) and converges
+the console to match.
+
+Commands:
+
+- `unifi export` — Dumps the live site as `#Site`-shaped JSON so a consumer repo can bootstrap its instance file from real state. WiFi passphrases are never included; each SSID gets a `passphraseEnv` name instead.
+- `unifi diff` — Reads `#Site` JSON from stdin and prints the plan without changing anything. Exits 2 when a change would be made and 1 on failure, so CI can tell drift apart from a broken run. Pass `--prune` to include deletions in the plan.
+- `unifi sync [--prune] [--dry-run]` — Reads `#Site` JSON from stdin and converges the site. `--prune` deletes `USER_DEFINED` objects absent from the input; `--dry-run` prints the plan without calling the API.
+
+Environment:
+
+| Variable | Meaning |
+| --- | --- |
+| `UNIFI_URL` | Console base URL, e.g. `https://unifi.lan` |
+| `UNIFI_API_KEY` | Integration API key (Settings → Control Plane → Integrations). Never printed. |
+| `UNIFI_SITE` | Site name, default `Default` |
+| `UNIFI_CA_FILE` | PEM bundle for the console's self-signed certificate |
+| `UNIFI_INSECURE_TLS` | Set to `1` to skip certificate verification instead |
+| `UNIFI_WIFI_*` | Whatever `passphraseEnv` names your `#WiFi` entries reference |
+
+### Rules
+
+- **Names are the identity.** Ids are server-assigned and must never appear in a
+  consumer repo, so desired and actual objects are matched by `name` (DNS
+  policies, which have no name, are matched by type plus domain).
+- **`SYSTEM_DEFINED` objects are never deleted**, not even with `--prune`. Their
+  configurable fields are updated when the instance file declares them, so you
+  can manage the console's own default LAN.
+- **`--prune` only acts on resource types the instance file declares.** An empty
+  `wifi` list deletes no SSIDs — an instance file that simply forgot a section
+  must not wipe it.
+- **Secrets stay out of git.** `#WiFiSecurity` carries `passphraseEnv` — the name
+  of an environment variable — not the passphrase. Passphrases and the API key
+  are redacted from all output, including API error responses.
+- Resources are reconciled in dependency order: networks → firewall zones →
+  wifi, firewall policies, DNS policies.
+
+### Running it
+
+`unifi sync` is meant to run on a **LAN host** (e.g. under a NixOS systemd
+timer), not in GitHub Actions: the console is only reachable on the local
+network and presents a self-signed certificate.
+
+```sh
+cue export ./unifi --out json -e site | unifi sync --prune
+```
+
+See `examples/unifi/site.cue` for a complete example instance (RFC 5737
+documentation addresses), `docs/unifi.md` for the full guide, and
+`docs/unifi-api-notes.md` for the API shapes — including which are confirmed
+against a live console and which are documented but not yet exercised.
