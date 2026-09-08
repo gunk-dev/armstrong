@@ -28,7 +28,7 @@ const apiPrefix = "/proxy/network/integration/v1"
 
 // newClient builds a client from the environment:
 //
-//	UNIFI_URL           console base URL, e.g. https://192.168.1.1
+//	UNIFI_URL           console base URL, e.g. https://unifi.lan
 //	UNIFI_API_KEY       Integration API key
 //	UNIFI_CA_FILE       PEM bundle for the console's self-signed cert
 //	UNIFI_INSECURE_TLS  set to 1 to skip certificate verification instead

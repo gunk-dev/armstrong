@@ -108,14 +108,14 @@ the console to match.
 Commands:
 
 - `unifi export` — Dumps the live site as `#Site`-shaped JSON so a consumer repo can bootstrap its instance file from real state. WiFi passphrases are never included; each SSID gets a `passphraseEnv` name instead.
-- `unifi diff` — Reads `#Site` JSON from stdin and prints the plan without changing anything. Exits non-zero when a change would be made, for CI. Pass `--prune` to include deletions in the plan.
+- `unifi diff` — Reads `#Site` JSON from stdin and prints the plan without changing anything. Exits 2 when a change would be made and 1 on failure, so CI can tell drift apart from a broken run. Pass `--prune` to include deletions in the plan.
 - `unifi sync [--prune] [--dry-run]` — Reads `#Site` JSON from stdin and converges the site. `--prune` deletes `USER_DEFINED` objects absent from the input; `--dry-run` prints the plan without calling the API.
 
 Environment:
 
 | Variable | Meaning |
 | --- | --- |
-| `UNIFI_URL` | Console base URL, e.g. `https://192.168.1.1` |
+| `UNIFI_URL` | Console base URL, e.g. `https://unifi.lan` |
 | `UNIFI_API_KEY` | Integration API key (Settings → Control Plane → Integrations). Never printed. |
 | `UNIFI_SITE` | Site name, default `Default` |
 | `UNIFI_CA_FILE` | PEM bundle for the console's self-signed certificate |
@@ -130,9 +130,12 @@ Environment:
 - **`SYSTEM_DEFINED` objects are never deleted**, not even with `--prune`. Their
   configurable fields are updated when the instance file declares them, so you
   can manage the console's own default LAN.
+- **`--prune` only acts on resource types the instance file declares.** An empty
+  `wifi` list deletes no SSIDs — an instance file that simply forgot a section
+  must not wipe it.
 - **Secrets stay out of git.** `#WiFiSecurity` carries `passphraseEnv` — the name
   of an environment variable — not the passphrase. Passphrases and the API key
-  are redacted from all output.
+  are redacted from all output, including API error responses.
 - Resources are reconciled in dependency order: networks → firewall zones →
   wifi, firewall policies, DNS policies.
 
@@ -147,6 +150,6 @@ cue export ./unifi --out json -e site | unifi sync --prune
 ```
 
 See `examples/unifi/site.cue` for a complete example instance (RFC 5737
-documentation addresses) and `docs/unifi.md` for the API details, including
-which parts are confirmed against a live console and which are documented but
-untested.
+documentation addresses), `docs/unifi.md` for the full guide, and
+`docs/unifi-api-notes.md` for the API shapes — including which are confirmed
+against a live console and which are documented but not yet exercised.

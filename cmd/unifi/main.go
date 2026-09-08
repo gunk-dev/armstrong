@@ -34,13 +34,14 @@ func newRootCmd() *cobra.Command {
 		Long: "Reconciles a UniFi Network site against a JSON #Site document (pipe from:\n" +
 			"cue export ./unifi --out json -e site).\n\n" +
 			"Configuration comes from the environment:\n" +
-			"  UNIFI_URL           console base URL, e.g. https://192.168.1.1\n" +
+			"  UNIFI_URL           console base URL, e.g. https://unifi.lan\n" +
 			"  UNIFI_API_KEY       Integration API key (never printed)\n" +
 			"  UNIFI_SITE          site name (default \"Default\")\n" +
 			"  UNIFI_CA_FILE       PEM bundle for the console's self-signed certificate\n" +
 			"  UNIFI_INSECURE_TLS  set to 1 to skip certificate verification instead\n\n" +
 			"Objects are matched by name; SYSTEM_DEFINED objects are updated in place\n" +
-			"but never deleted, even with --prune.",
+			"but never deleted, even with --prune. Passphrases live in the environment,\n" +
+			"named by each SSID's passphraseEnv, and are redacted from all output.",
 		SilenceUsage: true,
 	}
 	root.AddCommand(newExportCmd(), newDiffCmd(), newSyncCmd())
@@ -82,7 +83,7 @@ func newDiffCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&prune, "prune", false, "Include deletions of USER_DEFINED objects absent from the input")
+	cmd.Flags().BoolVar(&prune, "prune", false, "Include the deletions that sync --prune would make in the plan")
 	return cmd
 }
 
@@ -98,7 +99,7 @@ func newSyncCmd() *cobra.Command {
 			return err
 		},
 	}
-	cmd.Flags().BoolVar(&prune, "prune", false, "Delete USER_DEFINED objects absent from the input (SYSTEM_DEFINED objects are never deleted)")
+	cmd.Flags().BoolVar(&prune, "prune", false, "Delete USER_DEFINED objects absent from the input. SYSTEM_DEFINED objects are never deleted, and resource types the input leaves empty are never pruned")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Print the planned changes without calling the API")
 	return cmd
 }
