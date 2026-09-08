@@ -33,6 +33,15 @@ type reconciler struct {
 // brand-new object cannot be resolved.
 const pendingID = "<pending>"
 
+// newID is the id to remember for a just-created object: the one the console
+// assigned, or the placeholder when --dry-run meant nothing was created.
+func newID(created string, dryRun bool) string {
+	if dryRun {
+		return pendingID
+	}
+	return created
+}
+
 func (r *reconciler) logf(verb, kind, name, format string, args ...any) {
 	if verb != "OK" {
 		r.changed = true
@@ -95,10 +104,7 @@ func (r *reconciler) syncNetworks() error {
 			if err := r.mutate(http.MethodPost, base, want.body(), &created); err != nil {
 				return fmt.Errorf("create network %q: %w", want.Name, err)
 			}
-			r.networkIDs[want.Name] = created.ID
-			if r.dryRun {
-				r.networkIDs[want.Name] = pendingID
-			}
+			r.networkIDs[want.Name] = newID(created.ID, r.dryRun)
 			continue
 		}
 		if reflect.DeepEqual(normalizeNetwork(got.Spec), normalizeNetwork(want)) {
@@ -171,10 +177,7 @@ func (r *reconciler) syncZones() error {
 			if err := r.mutate(http.MethodPost, base, body, &created); err != nil {
 				return fmt.Errorf("create firewall zone %q: %w", want.Name, err)
 			}
-			r.zoneIDs[want.Name] = created.ID
-			if r.dryRun {
-				r.zoneIDs[want.Name] = pendingID
-			}
+			r.zoneIDs[want.Name] = newID(created.ID, r.dryRun)
 			continue
 		}
 		if sameStringSet(got.Spec.NetworkIDs, ids) {
@@ -348,11 +351,7 @@ func (r *reconciler) syncFirewallPolicies() error {
 			if err := r.mutate(http.MethodPost, base, body, &created); err != nil {
 				return fmt.Errorf("create firewall policy %q: %w", want.Name, err)
 			}
-			id := created.ID
-			if r.dryRun {
-				id = pendingID
-			}
-			ordered = append(ordered, id)
+			ordered = append(ordered, newID(created.ID, r.dryRun))
 			continue
 		}
 		ordered = append(ordered, got.ID)
