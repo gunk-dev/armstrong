@@ -293,9 +293,12 @@ in
       type = lib.types.listOf lib.types.str;
       default = [ "network-online.target" ];
       description = ''
-        `After=` for the unit. The default only orders the run behind the
-        network being up; it does not pull that target in, because on a host
-        that never reaches it a manual `systemctl start` should still run.
+        `After=` for the unit. The default orders the run behind the network
+        being up, and adds a matching `Wants=` for that target — ordering
+        after a target nothing pulls in would silently do nothing. `Wants=`
+        rather than `Requires=`: a console that cannot be reached should
+        produce a failed run with the error in the journal, not a run that
+        never happened.
       '';
     };
 
@@ -349,6 +352,7 @@ in
         unifi-sync = {
           description = "Reconcile UniFi site ${cfg.site} at ${cfg.consoleUrl} (${cfg.mode})";
           inherit (cfg) after wantedBy;
+          wants = lib.optional (lib.elem "network-online.target" cfg.after) "network-online.target";
           serviceConfig = {
             Type = "oneshot";
             ExecStart = "${syncScript}/bin/unifi-sync-run";

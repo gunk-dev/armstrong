@@ -23,7 +23,8 @@ Outputs, for `x86_64-linux` and `aarch64-linux`:
 | `packages.<system>.dns` | the `dns` CLI |
 | `packages.<system>.schema` | `schema/*.cue` laid out as a CUE module package path |
 | `devShells.<system>.default` | go, cue, nixfmt, gh |
-| `checks.<system>` | `go vet`, `go test ./...`, `cue vet ./schema`, `nixfmt --check`, and a build of `examples/unifi` against `packages.schema` |
+| `nixosModules.unifi-sync` | the NixOS unit that keeps a UniFi site converged (also `nixosModules.default`) |
+| `checks.<system>` | `go vet`, `go test ./...`, `cue vet ./schema`, `nixfmt --check`, a build of `examples/unifi` against `packages.schema`, and the `unifi-sync` module's VM test |
 
 ### The CLIs
 
@@ -33,16 +34,20 @@ Run one without installing anything:
 nix run github:gunk-dev/armstrong#unifi -- --help
 ```
 
-Or reference the package — for example from a NixOS systemd timer that syncs a
-UniFi console on the LAN:
+Or reference the package directly:
 
 ```nix
-{ config, pkgs, inputs, ... }:
+{ pkgs, inputs, ... }:
 {
-  systemd.services.unifi-sync.serviceConfig.ExecStart =
-    "${inputs.armstrong.packages.${pkgs.stdenv.hostPlatform.system}.unifi}/bin/unifi sync --prune";
+  environment.systemPackages = [
+    inputs.armstrong.packages.${pkgs.stdenv.hostPlatform.system}.unifi
+  ];
 }
 ```
+
+To actually run `unifi` on a schedule, import
+[`nixosModules.unifi-sync`](#nixos-module) rather than writing the unit by
+hand.
 
 ### The schema
 
@@ -86,6 +91,136 @@ site: schema.#Site & { /* ... */ }
 
 Bumping the schemas is `nix flake update armstrong` — the CLIs and the CUE
 definitions move together, and `VERSION` records which rev is in use.
+
+## NixOS module
+
+`nixosModules.unifi-sync` is the actuator for `#Site`: a hardened oneshot that
+runs the same pipeline a human runs by hand —
+
+```sh
+cue export ./instance --out json -e site | unifi <diff|sync> [--prune]
+```
+
+— plus a daily drift timer and a `unifi-plan` wrapper on `PATH`. It is meant
+for a **LAN host**: the console is only reachable on the local network.
+
+`instance` is a path inside *your* flake, so it is copied to the store at build
+time and the unit runs against the exact tree the host converged to — there is
+no second copy of the desired state on the machine to drift from the
+repository. The schema the instance is validated against and the binary that
+consumes the export both come from the pinned `armstrong` input, so they cannot
+disagree.
+
+### Minimal host
+
+```nix
+{ config, inputs, ... }:
+{
+  imports = [ inputs.armstrong.nixosModules.unifi-sync ];
+
+  modules.unifi-sync = {
+    enable = true;
+    consoleUrl = "https://198.51.100.1";
+    insecureTls = true;              # or caFile, see below
+    instance = ./net/unifi;          # holds `site: schema.#Site & {…}`
+    apiKeyFile = config.age.secrets."unifi-api-key".path;
+    secretsFile = config.age.secrets."unifi-wifi.env".path;
+
+    # Reconcile as soon as the host finishes converging, not just daily.
+    onSuccessOf = [ "nixos-upgrade" ];
+  };
+}
+```
+
+That host is in **diff mode**: it never writes. `unifi diff` exits 2 when the
+plan is non-empty, so drift leaves `unifi-sync.service` failed with the plan
+itself in the journal:
+
+```console
+$ systemctl status unifi-sync
+   Active: failed (Result: exit-code)
+$ journalctl -u unifi-sync -n 20
+UPDATE network        Default (mdnsForwardingEnabled)
+UPDATE dns policy     A_RECORD host.example.invalid
+```
+
+Turning the detector into an actuator is one line — `mode = "sync"` — and is
+deliberately a separate decision from adopting the module. Whatever `mode` is,
+`unifi-plan` prints the plan without changing anything: it is always `sync
+--dry-run`.
+
+### Options
+
+All under `modules.unifi-sync`:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `enable` | `false` | Install the unit and the timer. |
+| `consoleUrl` | — | Base URL of the console; the Integration API lives under `/proxy/network/integration/v1` on it. |
+| `site` | `"Default"` | Site name, as shown in the console's site list. |
+| `instance` | — | CUE package directory holding `site: schema.#Site & {…}`. |
+| `mode` | `"diff"` | `diff` never writes and fails on drift; `sync` applies the plan. |
+| `prune` | `false` | Delete `USER_DEFINED` objects the instance file does not declare. |
+| `apiKeyFile` | — | File holding the Integration API key. Reaches the unit as a systemd credential. |
+| `secretsFile` | `null` | `EnvironmentFile` of SSID passphrases, one `NAME=value` per `passphraseEnv`. |
+| `caFile` | `null` | PEM bundle pinning the console's certificate (`UNIFI_CA_FILE`). |
+| `insecureTls` | `false` | Skip certificate verification instead (`UNIFI_INSECURE_TLS=1`). |
+| `onSuccessOf` | `[ ]` | Unit names (no `.service`) whose success triggers a run. |
+| `after` | `[ "network-online.target" ]` | `After=` for the unit; the default target also gets a matching `Wants=`. |
+| `wantedBy` | `[ ]` | `WantedBy=` for the unit. |
+| `checkAt` | `"05:30"` | `OnCalendar` for the daily drift check, or `null` for no timer. |
+| `package` | `packages.<system>.unifi` | The `unifi` build to run. |
+| `schema` | `packages.<system>.schema` | Where `gunk.dev/armstrong/schema` is resolved from. |
+| `moduleFile` | armstrong's own | The `cue.mod/module.cue` the store module is assembled around. |
+
+`package` and `schema` default to this flake's outputs, so the module works
+with nothing but an import; override them to run a different build of either.
+`moduleFile` exists because `cue` finds a module by walking up from the working
+directory, so the CUE module has to be reassembled in the store around
+`instance` rather than pointed at — set it to your repository's own
+`cue.mod/module.cue` if you want the instance evaluated under exactly the
+module identity and language version you use elsewhere.
+
+A console reached over `https` serves a certificate no public CA signed, so
+exactly one of `caFile` or `insecureTls` has to be set: an assertion fails the
+build otherwise, because silently pinning nothing is the failure mode a TLS
+option must never have.
+
+### Secrets
+
+Two files, both outside the store, both typically agenix or sops-nix paths:
+
+- `apiKeyFile` — the Integration API key (Settings → Control Plane →
+  Integrations). It is passed as a systemd `LoadCredential`, never through the
+  unit's environment where anything able to read `/proc` could lift it.
+- `secretsFile` — an `EnvironmentFile` with one line per SSID passphrase, named
+  by the `passphraseEnv` of the matching `#WiFi`:
+
+  ```sh
+  # SSID passphrases, by passphraseEnv.
+  UNIFI_PSK_HOME=correct-horse-battery
+  ```
+
+  Required whenever the instance declares a non-OPEN SSID — `unifi` fails
+  rather than write an empty passphrase.
+
+`unifi-plan`, run by hand, reads both files directly, so it needs enough
+privilege to; run under `sudo` or it will report every SSID as needing a
+passphrase update (and say so on stderr).
+
+The unit runs `DynamicUser`, `ProtectSystem=strict`, with an empty capability
+bounding set and no address families beyond `AF_UNIX`/`AF_INET`/`AF_INET6`: it
+talks to one endpoint and writes nothing to disk.
+
+### Testing it
+
+`checks.<system>.unifi-sync-vm` boots a host running the real unit against a
+fake console and asserts that a clean site succeeds, a drifted site leaves the
+unit failed with the plan in the journal, and that neither run issues a single
+write. It needs KVM, which GitHub-hosted `ubuntu-latest` runners have;
+`nix flake check` on a machine without `/dev/kvm` will not be able to build it.
+`checks.<system>.unifi-sync-eval` imports the module into a scratch
+`nixosSystem` and needs no VM.
 
 ## CUE Schemas
 
@@ -226,13 +361,16 @@ Environment:
 
 ### Running it
 
-`unifi sync` is meant to run on a **LAN host** (e.g. under a NixOS systemd
-timer), not in GitHub Actions: the console is only reachable on the local
-network and presents a self-signed certificate.
+`unifi sync` is meant to run on a **LAN host**, not in GitHub Actions: the
+console is only reachable on the local network and presents a self-signed
+certificate.
 
 ```sh
 cue export ./unifi --out json -e site | unifi sync --prune
 ```
+
+On NixOS, `nixosModules.unifi-sync` runs exactly that pipeline as a hardened
+oneshot on a timer — see [NixOS module](#nixos-module).
 
 See `examples/unifi/site.cue` for a complete example instance (RFC 5737
 documentation addresses), `docs/unifi.md` for the full guide, and
