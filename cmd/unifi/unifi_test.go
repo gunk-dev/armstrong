@@ -675,3 +675,78 @@ func equalStrings(a, b []string) bool {
 func itoa(i int) string {
 	return string(rune('0'+i/100%10)) + string(rune('0'+i/10%10)) + string(rune('0'+i%10))
 }
+
+// TestFirewallPolicyOrdering exercises the zone-based firewall end to end
+// against the fake — the one resource type no live console could confirm.
+// Policies must be created, ordered by their `order` field, and left alone on
+// a second run.
+func TestFirewallPolicyOrdering(t *testing.T) {
+	f := newFakeConsole(t)
+	seedSite(f)
+
+	desired := `{
+	  "networks": [], "wifi": [], "dnsPolicies": [],
+	  "firewallZones": [
+	    {"name":"internal","networks":["Default"]},
+	    {"name":"iot","networks":["IoT"]}
+	  ],
+	  "firewallPolicies": [
+	    {"name":"alpha-runs-last","enabled":true,"action":"BLOCK","allowReturnTraffic":true,
+	     "sourceZone":"iot","destinationZone":"internal","ipVersion":"IPV4",
+	     "loggingEnabled":false,"order":30},
+	    {"name":"zulu-runs-first","enabled":true,"action":"ALLOW","allowReturnTraffic":true,
+	     "sourceZone":"internal","destinationZone":"iot","ipVersion":"IPV4",
+	     "protocol":"tcp","destinationPorts":["443","8000-8100"],
+	     "loggingEnabled":false,"order":10},
+	    {"name":"mike-runs-second","enabled":true,"action":"REJECT","allowReturnTraffic":false,
+	     "sourceZone":"iot","destinationZone":"iot","ipVersion":"IPV4",
+	     "loggingEnabled":true,"order":20}
+	  ]
+	}`
+
+	mustRun(t, f, desired, nil, "sync")
+
+	// The ordering call must list the policies in `order` sequence — which here
+	// is neither the order they appear in the document nor alphabetical, so
+	// sorting on the wrong key is visible.
+	var ordering []string
+	for _, m := range f.recorded() {
+		if m.Path == collPolicies+"/ordering" {
+			ids, _ := m.Body["orderedFirewallPolicyIds"].(map[string]any)
+			before, _ := ids["beforeSystemDefined"].([]any)
+			for _, v := range before {
+				ordering = append(ordering, f.get(collPolicies, v.(string))["name"].(string))
+			}
+		}
+	}
+	if want := []string{"zulu-runs-first", "mike-runs-second", "alpha-runs-last"}; !equalStrings(ordering, want) {
+		t.Errorf("policies ordered %v, want %v", ordering, want)
+	}
+
+	// "443" and "8000-8100" must reach the API as the two different item
+	// shapes it distinguishes, not as two of the same.
+	policy := f.objectNamed(collPolicies, "zulu-runs-first")
+	dst, _ := policy["destination"].(map[string]any)
+	tf, _ := dst["trafficFilter"].(map[string]any)
+	pf, _ := tf["portFilter"].(map[string]any)
+	items, _ := pf["items"].([]any)
+	if len(items) != 2 {
+		t.Fatalf("destination ports rendered as %v", pf)
+	}
+	single, _ := items[0].(map[string]any)
+	if single["type"] != "PORT_NUMBER" || single["port"] != float64(443) {
+		t.Errorf("port 443 rendered as %v", single)
+	}
+	ranged, _ := items[1].(map[string]any)
+	if ranged["type"] != "PORT_NUMBER_RANGE" || ranged["startPort"] != float64(8000) || ranged["endPort"] != float64(8100) {
+		t.Errorf("port range 8000-8100 rendered as %v", ranged)
+	}
+
+	before := len(f.recorded())
+	if out := mustRun(t, f, desired, nil, "sync"); strings.Contains(out, "ORDER") {
+		t.Errorf("second sync reordered again:\n%s", out)
+	}
+	if after := len(f.recorded()); after != before {
+		t.Errorf("second sync made %d further writes; want none", after-before)
+	}
+}
