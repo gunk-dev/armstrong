@@ -90,6 +90,13 @@ then carries on with the rest of the site. Only that specific error code is
 treated this way — any other firewall failure, including an expired key, is a
 hard error, so a sync can never silently stop managing the firewall.
 
+The skip counts as an unreconciled change, so `unifi diff` keeps exiting 2 for
+as long as an instance file declares zones or policies the console cannot
+accept. That is deliberate: declared firewall rules that are not in force are
+drift, and reporting "no changes" would hide it. Drop the `firewallZones` and
+`firewallPolicies` entries until the console is migrated if you want a clean
+`diff`.
+
 Because no console was available with the zone-based firewall enabled, that code
 path is exercised only against the test fake. Run `--dry-run` first.
 

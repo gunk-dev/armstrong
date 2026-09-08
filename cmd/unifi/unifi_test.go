@@ -412,6 +412,36 @@ func TestLegacyFirewallIsSkipped(t *testing.T) {
 	}
 }
 
+// TestSkippedFirewallCountsAsDrift pins the documented consequence of the skip:
+// firewall rules an instance file declares but the console cannot accept are
+// drift, so diff keeps reporting changes rather than claiming the site is
+// converged. Declaring no firewall objects leaves diff clean.
+func TestSkippedFirewallCountsAsDrift(t *testing.T) {
+	f := newFakeConsole(t)
+	f.zbfConfigured = false
+	seedSite(f)
+
+	withFirewall := exampleSiteJSON(t)
+	env := []string{"UNIFI_WIFI_MAIN=main-pass", "UNIFI_WIFI_IOT=iot-pass"}
+	mustRun(t, f, withFirewall, env, "sync")
+
+	// Everything except the firewall is now converged, but the declared zones
+	// and policies still cannot be applied.
+	stdout, _, code := run(t, f, withFirewall, env, "diff")
+	if code != exitChangesPending {
+		t.Errorf("diff exited %d; a permanently skipped firewall must still read as drift:\n%s", code, stdout)
+	}
+
+	// The same site without firewall objects has nothing left to reconcile.
+	noFirewall := strings.NewReplacer(
+		`"firewallZones"`, `"_firewallZones"`,
+		`"firewallPolicies"`, `"_firewallPolicies"`,
+	).Replace(withFirewall)
+	if stdout, _, code := run(t, f, noFirewall, env, "diff"); code != 0 {
+		t.Errorf("diff exited %d with no firewall objects declared:\n%s", code, stdout)
+	}
+}
+
 // TestBadAPIKeyFailsLoudly: an outright auth failure must exit non-zero rather
 // than quietly producing an empty site.
 func TestBadAPIKeyFailsLoudly(t *testing.T) {
