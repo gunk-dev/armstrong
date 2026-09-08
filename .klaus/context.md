@@ -8,7 +8,7 @@
 - CUE v0.9.2 — module declared in `cue.mod/module.cue`; CI installs the same version (`.github/workflows/ci.yml`).
 - Cobra v1.10.2 for the CLI (`github.com/spf13/cobra` in `go.mod`; used in `cmd/dns/main.go`, `cmd/dns/sync.go`, `cmd/dns/preview.go`). No other direct Go dependencies — the standard library handles HTTP/JSON for the Porkbun client.
 - GitHub Actions for CI and reusable workflows. Workflows pin actions by SHA.
-- Nix is used by the reusable Fly.io deploy workflows (`nix develop -c …`, `nix build …`) — there is no flake in this repo; the caller repo is expected to provide it.
+- Nix: this repo is a flake (`flake.nix`) exposing `packages.{unifi,dns,schema}`, `checks`, and a devshell; `nix flake check` runs in CI. The reusable Fly.io deploy workflows (`nix develop -c …`, `nix build …`) still act on the *caller's* flake, not this one.
 
 ## Entry points
 - `cmd/dns/main.go` — `dns` CLI binary. Registers `sync` and `preview` subcommands on a Cobra root command.
@@ -22,6 +22,7 @@
 - `cmd/dns/` — Go source for the `dns` CLI. `main.go` (root command), `sync.go` (`dns sync`), `preview.go` (`dns preview create|delete`), `porkbun.go` (Porkbun API client), `sync_test.go` (unit tests).
 - `schema/` — CUE definitions imported by other repos as `gunk.dev/armstrong/schema`.
 - `cue.mod/` — CUE module metadata (`module.cue` only; no `pkg/` vendoring).
+- `flake.nix` / `flake.lock` — Nix flake. `packages.schema` re-lays `schema/*.cue` as `$out/cue.mod/pkg/gunk.dev/armstrong/schema/` so consumers can build a `cue.mod/pkg` without vendoring the files in git.
 - `.github/workflows/` — `ci.yml` for this repo's CI, plus three `workflow_call` reusable workflows (`dns-sync.yml`, `deploy-fly.yml`, `preview-fly.yml`).
 - `.claude/` — local Claude Code settings (`settings.json`).
 
@@ -48,7 +49,7 @@
 - The `.github/workflows/dns-sync.yml` reusable workflow checks out the caller repo at the workspace root **and** checks out `gunk-dev/armstrong` into `_armstrong/`, then runs `cue export ./dns` against the caller and pipes into `./_armstrong/dns-tool sync`. The caller must therefore have a top-level `./dns` CUE package; this is not configurable via input.
 - `dns sync` reads JSON from stdin only — there is no file-path flag (`cmd/dns/sync.go:56`).
 - The `preview` subcommand hardcodes `defaultDomain = "gunk.dev"` (`cmd/dns/preview.go:10`) and the CNAME target shape `<app>-preview-<pr>.fly.dev` (`cmd/dns/preview.go:43`). Changing either requires a code change, not config.
-- `.github/workflows/deploy-fly.yml` and `.github/workflows/preview-fly.yml` rely on the caller's Nix flake providing the requested `nix-target` and (for previews) a flake input named `nix-input-name` that can be overridden via `--override-input`. There is no flake in this repo to test against.
+- `.github/workflows/deploy-fly.yml` and `.github/workflows/preview-fly.yml` rely on the caller's Nix flake providing the requested `nix-target` and (for previews) a flake input named `nix-input-name` that can be overridden via `--override-input`. This repo's own `flake.nix` exposes no such target — it is for consuming armstrong, not for deploying it.
 - The smoke test in `.github/workflows/deploy-fly.yml` curls `http://localhost:8080` against the just-loaded image (`.github/workflows/deploy-fly.yml:96-104`) — apps that don't listen on 8080 will fail the smoke test even if otherwise healthy.
 
 ## External dependencies
