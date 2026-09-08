@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 // Origins the API reports. SYSTEM_DEFINED objects are created by the console
@@ -418,8 +420,9 @@ func (c *client) firewallPolicies(siteID string) ([]actual[apiFirewallPolicy], b
 }
 
 // body renders a firewall policy payload. zones and networks have already been
-// resolved to ids by the caller.
-func (p firewallPolicy) body(srcZoneID, dstZoneID string, srcNetIDs, dstNetIDs []string) map[string]any {
+// resolved to ids by the caller. It fails on a malformed port rather than
+// sending a policy that silently matches something else.
+func (p firewallPolicy) body(srcZoneID, dstZoneID string, srcNetIDs, dstNetIDs []string) (map[string]any, error) {
 	action := map[string]any{"type": p.Action}
 	if p.Action == "ALLOW" {
 		action["allowReturnTraffic"] = p.AllowReturnTraffic
@@ -430,12 +433,21 @@ func (p firewallPolicy) body(srcZoneID, dstZoneID string, srcNetIDs, dstNetIDs [
 		scope["protocolFilter"] = map[string]any{"type": "NAMED", "name": p.Protocol}
 	}
 
+	source, err := policyEndpoint(srcZoneID, srcNetIDs, p.SourcePorts)
+	if err != nil {
+		return nil, fmt.Errorf("source: %w", err)
+	}
+	destination, err := policyEndpoint(dstZoneID, dstNetIDs, p.DestinationPorts)
+	if err != nil {
+		return nil, fmt.Errorf("destination: %w", err)
+	}
+
 	b := map[string]any{
 		"name":            p.Name,
 		"enabled":         p.Enabled,
 		"action":          action,
-		"source":          policyEndpoint(srcZoneID, srcNetIDs, p.SourcePorts),
-		"destination":     policyEndpoint(dstZoneID, dstNetIDs, p.DestinationPorts),
+		"source":          source,
+		"destination":     destination,
 		"ipProtocolScope": scope,
 		"loggingEnabled":  p.LoggingEnabled,
 	}
@@ -445,13 +457,13 @@ func (p firewallPolicy) body(srcZoneID, dstZoneID string, srcNetIDs, dstNetIDs [
 	if len(p.ConnectionStates) > 0 {
 		b["connectionStateFilter"] = p.ConnectionStates
 	}
-	return b
+	return b, nil
 }
 
-func policyEndpoint(zoneID string, networkIDs, ports []string) map[string]any {
+func policyEndpoint(zoneID string, networkIDs, ports []string) (map[string]any, error) {
 	ep := map[string]any{"zoneId": zoneID}
 	if len(networkIDs) == 0 && len(ports) == 0 {
-		return ep
+		return ep, nil
 	}
 	tf := map[string]any{"type": "NETWORK"}
 	if len(networkIDs) > 0 {
@@ -460,21 +472,37 @@ func policyEndpoint(zoneID string, networkIDs, ports []string) map[string]any {
 		tf["networkFilter"] = map[string]any{"networkIds": sorted, "matchOpposite": false}
 	}
 	if len(ports) > 0 {
+		items, err := portItems(ports)
+		if err != nil {
+			return nil, err
+		}
 		tf["type"] = "PORT"
-		tf["portFilter"] = map[string]any{"type": "PORTS", "matchOpposite": false, "items": portItems(ports)}
+		tf["portFilter"] = map[string]any{"type": "PORTS", "matchOpposite": false, "items": items}
 	}
 	ep["trafficFilter"] = tf
-	return ep
+	return ep, nil
 }
 
-func portItems(ports []string) []map[string]any {
+// portItems renders "443" and "8000-8100" as the two item shapes the API
+// distinguishes. A port that does not parse is an error: silently sending 0
+// would produce a policy that matches something other than what was written.
+func portItems(ports []string) ([]map[string]any, error) {
 	items := make([]map[string]any, 0, len(ports))
 	for _, p := range ports {
 		if start, end, ok := splitPortRange(p); ok {
+			if !validPort(start) || !validPort(end) || start > end {
+				return nil, fmt.Errorf("port range %q is not a valid 1-65535 range", p)
+			}
 			items = append(items, map[string]any{"type": "PORT_NUMBER_RANGE", "startPort": start, "endPort": end})
 			continue
 		}
-		items = append(items, map[string]any{"type": "PORT_NUMBER", "port": atoiOrZero(p)})
+		n, err := strconv.Atoi(strings.TrimSpace(p))
+		if err != nil || !validPort(n) {
+			return nil, fmt.Errorf("port %q is not a number in 1-65535", p)
+		}
+		items = append(items, map[string]any{"type": "PORT_NUMBER", "port": n})
 	}
-	return items
+	return items, nil
 }
+
+func validPort(n int) bool { return n >= 1 && n <= 65535 }

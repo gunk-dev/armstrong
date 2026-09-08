@@ -89,7 +89,10 @@ func TestPassphraseEnvFor(t *testing.T) {
 // Firewall ports are written as "443" or "8000-8100" and have to become the
 // two different item shapes the API distinguishes.
 func TestPortItems(t *testing.T) {
-	items := portItems([]string{"443", "8000-8100"})
+	items, err := portItems([]string{"443", "8000-8100"})
+	if err != nil {
+		t.Fatalf("portItems: %v", err)
+	}
 	if len(items) != 2 {
 		t.Fatalf("got %d items, want 2", len(items))
 	}
@@ -98,5 +101,19 @@ func TestPortItems(t *testing.T) {
 	}
 	if items[1]["type"] != "PORT_NUMBER_RANGE" || items[1]["startPort"] != 8000 || items[1]["endPort"] != 8100 {
 		t.Errorf("port range rendered as %v", items[1])
+	}
+}
+
+func TestPortItemsRejectsOutOfRange(t *testing.T) {
+	// The CUE regex allows five digits, so 1-65535 is enforced here.
+	for _, ports := range [][]string{{"70000"}, {"0"}, {"443", "99999"}, {"8100-8000"}, {"1-70000"}, {"abc"}, {""}} {
+		if _, err := portItems(ports); err == nil {
+			t.Errorf("portItems(%v) accepted an invalid port", ports)
+		}
+	}
+	for _, ports := range [][]string{{"1"}, {"65535"}, {"443", "8000-8100"}} {
+		if _, err := portItems(ports); err != nil {
+			t.Errorf("portItems(%v) rejected a valid port: %v", ports, err)
+		}
 	}
 }

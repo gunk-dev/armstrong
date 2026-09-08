@@ -750,3 +750,37 @@ func TestFirewallPolicyOrdering(t *testing.T) {
 		t.Errorf("second sync made %d further writes; want none", after-before)
 	}
 }
+
+// TestInvalidPortIsRejected: the CUE regex cannot express the 65535 upper
+// bound on a string, so the tool is the last line of defence. A port it cannot
+// parse must fail the sync — sending 0 would quietly open or close the wrong
+// traffic.
+func TestInvalidPortIsRejected(t *testing.T) {
+	for _, port := range []string{"70000", "0", "8100-8000", "abc"} {
+		t.Run(port, func(t *testing.T) {
+			f := newFakeConsole(t)
+			seedSite(f)
+			desired := `{
+			  "networks": [], "wifi": [], "dnsPolicies": [],
+			  "firewallZones": [{"name":"internal","networks":["Default"]}],
+			  "firewallPolicies": [
+			    {"name":"p","enabled":true,"action":"ALLOW","allowReturnTraffic":true,
+			     "sourceZone":"internal","destinationZone":"internal","ipVersion":"IPV4",
+			     "loggingEnabled":false,"order":10,"destinationPorts":["` + port + `"]}
+			  ]
+			}`
+			stdout, stderr, code := run(t, f, desired, nil, "sync")
+			if code == 0 {
+				t.Fatalf("port %q was accepted:\n%s", port, stdout)
+			}
+			if !strings.Contains(stderr, "port") {
+				t.Errorf("error does not mention the port: %s", stderr)
+			}
+			for _, m := range f.recorded() {
+				if strings.HasPrefix(m.Path, collPolicies) {
+					t.Errorf("a policy was written despite the invalid port: %+v", m)
+				}
+			}
+		})
+	}
+}

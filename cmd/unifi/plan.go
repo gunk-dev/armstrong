@@ -342,7 +342,10 @@ func (r *reconciler) syncFirewallPolicies() error {
 		if err != nil {
 			return fmt.Errorf("firewall policy %q: %w", want.Name, err)
 		}
-		body := want.body(srcZone, dstZone, srcNets, dstNets)
+		body, err := want.body(srcZone, dstZone, srcNets, dstNets)
+		if err != nil {
+			return fmt.Errorf("firewall policy %q: %w", want.Name, err)
+		}
 
 		got, ok := byName[want.Name]
 		if !ok {
@@ -595,9 +598,4 @@ func splitPortRange(s string) (start, end int, ok bool) {
 		return 0, 0, false
 	}
 	return a, b, true
-}
-
-func atoiOrZero(s string) int {
-	n, _ := strconv.Atoi(strings.TrimSpace(s))
-	return n
 }

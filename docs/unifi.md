@@ -72,6 +72,12 @@ substitutes a generated variable name for each SSID's passphrase, so its output
 is safe to commit. Passphrases and the API key are redacted from all output,
 including API error responses, which can quote a rejected payload back.
 
+**Ports are validated, not coerced.** `sourcePorts` / `destinationPorts` take
+`"443"` or `"8000-8100"`. The CUE regex catches anything that is not a number
+or a range; the tool additionally enforces 1-65535 and `start <= end`, which a
+string regex cannot express. A port it cannot parse fails the sync rather than
+being sent as 0.
+
 **Reconciliation runs in dependency order:** networks → firewall zones → wifi,
 firewall policies and DNS policies. Zones reference networks by name, and
 policies reference zones by name, so the ids exist by the time they are needed.

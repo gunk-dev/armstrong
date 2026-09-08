@@ -150,8 +150,8 @@ package schema
 	destinationNetworks?: [...string]
 
 	// Port numbers or "start-end" ranges, e.g. "443" or "8000-8100".
-	sourcePorts?: [...string]
-	destinationPorts?: [...string]
+	sourcePorts?: [...#Port]
+	destinationPorts?: [...#Port]
 
 	connectionStates?: [...("NEW" | "INVALID" | "ESTABLISHED" | "RELATED")]
 	loggingEnabled: bool | *false
@@ -160,6 +160,11 @@ package schema
 	// Policies are ordered ahead of the system-defined ones.
 	order: int | *100
 }
+
+// #Port is a single port or an inclusive "start-end" range, written as a
+// string. `unifi sync` rejects anything outside 1-65535 rather than sending a
+// policy that would match the wrong traffic.
+#Port: string & =~"^([1-9][0-9]{0,4})(-[1-9][0-9]{0,4})?$"
 
 // #DNSPolicy is a local DNS record or forwarding rule served by the gateway.
 #DNSPolicy: {
