@@ -14,6 +14,10 @@ const (
 	originUser   = "USER_DEFINED"
 )
 
+// codeZBFNotConfigured is the error code a console still running the legacy
+// firewall returns from every /firewall/zones and /firewall/policies request.
+const codeZBFNotConfigured = "api.firewall.zone-based-firewall-not-configured"
+
 type metadata struct {
 	Origin       string `json:"origin"`
 	Configurable *bool  `json:"configurable,omitempty"`
@@ -25,41 +29,40 @@ type actual[T any] struct {
 	ID       string
 	Origin   string
 	Spec     T
-	Raw      json.RawMessage
 	IsSystem bool
 }
 
 // ---------------------------------------------------------------- networks
 
 type apiNetwork struct {
-	ID                    string    `json:"id"`
-	Name                  string    `json:"name"`
-	Management            string    `json:"management"`
-	Enabled               bool      `json:"enabled"`
-	VlanID                int       `json:"vlanId"`
-	Metadata              metadata  `json:"metadata"`
-	IsolationEnabled      bool      `json:"isolationEnabled"`
-	InternetAccessEnabled bool      `json:"internetAccessEnabled"`
-	CellularBackupEnabled bool      `json:"cellularBackupEnabled"`
-	MDNSForwardingEnabled bool      `json:"mdnsForwardingEnabled"`
-	IPv4Configuration     *apiIPv4  `json:"ipv4Configuration,omitempty"`
-	Default               bool      `json:"default"`
+	ID                    string   `json:"id"`
+	Name                  string   `json:"name"`
+	Management            string   `json:"management"`
+	Enabled               bool     `json:"enabled"`
+	VlanID                int      `json:"vlanId"`
+	Metadata              metadata `json:"metadata"`
+	IsolationEnabled      bool     `json:"isolationEnabled"`
+	InternetAccessEnabled bool     `json:"internetAccessEnabled"`
+	CellularBackupEnabled bool     `json:"cellularBackupEnabled"`
+	MDNSForwardingEnabled bool     `json:"mdnsForwardingEnabled"`
+	IPv4Configuration     *apiIPv4 `json:"ipv4Configuration,omitempty"`
+	Default               bool     `json:"default"`
 }
 
 type apiIPv4 struct {
-	AutoScaleEnabled  bool        `json:"autoScaleEnabled"`
-	HostIPAddress     string      `json:"hostIpAddress"`
-	PrefixLength      int         `json:"prefixLength"`
+	AutoScaleEnabled  bool         `json:"autoScaleEnabled"`
+	HostIPAddress     string       `json:"hostIpAddress"`
+	PrefixLength      int          `json:"prefixLength"`
 	DHCPConfiguration *apiIPv4DHCP `json:"dhcpConfiguration,omitempty"`
 }
 
 type apiIPv4DHCP struct {
-	Mode                         string     `json:"mode"`
-	IPAddressRange               *apiRange  `json:"ipAddressRange,omitempty"`
-	DNSServerIPAddressesOverride []string   `json:"dnsServerIpAddressesOverride,omitempty"`
-	LeaseTimeSeconds             int        `json:"leaseTimeSeconds,omitempty"`
-	DomainName                   string     `json:"domainName,omitempty"`
-	PingConflictDetectionEnabled bool       `json:"pingConflictDetectionEnabled,omitempty"`
+	Mode                         string    `json:"mode"`
+	IPAddressRange               *apiRange `json:"ipAddressRange,omitempty"`
+	DNSServerIPAddressesOverride []string  `json:"dnsServerIpAddressesOverride,omitempty"`
+	LeaseTimeSeconds             int       `json:"leaseTimeSeconds,omitempty"`
+	DomainName                   string    `json:"domainName,omitempty"`
+	PingConflictDetectionEnabled bool      `json:"pingConflictDetectionEnabled,omitempty"`
 }
 
 type apiRange struct {
@@ -179,12 +182,18 @@ type apiZone struct {
 	Metadata   metadata `json:"metadata"`
 }
 
+// zones lists the firewall zones. The bool reports whether the zone-based
+// firewall is configured at all: a console still running the legacy firewall
+// answers 400 with codeZBFNotConfigured rather than returning an empty list.
+// Any other failure is a real error — an expired key must never look like an
+// unconfigured firewall.
 func (c *client) zones(siteID string) ([]actual[apiZone], bool, error) {
 	raws, err := c.list("/sites/" + siteID + "/firewall/zones")
+	if hasErrorCode(err, codeZBFNotConfigured) {
+		return nil, false, nil
+	}
 	if err != nil {
-		// A console still running the legacy firewall answers with an error
-		// rather than an empty list. Treat that as "feature unavailable".
-		return nil, false, nil //nolint:nilerr // reported by the caller
+		return nil, false, fmt.Errorf("list firewall zones: %w", err)
 	}
 	out := make([]actual[apiZone], 0, len(raws))
 	for _, raw := range raws {
@@ -241,6 +250,9 @@ func (c *client) wifis(siteID string) ([]actual[apiWiFi], error) {
 		if err := c.do(http.MethodGet, "/sites/"+siteID+"/wifi/broadcasts/"+overview.ID, nil, &detail); err != nil {
 			return nil, fmt.Errorf("get wifi broadcast %q: %w", overview.Name, err)
 		}
+		// The API returns the passphrase in plaintext; make sure it can never
+		// surface in output, however it is quoted.
+		registerSecret(detail.SecurityConfiguration.Passphrase)
 		out = append(out, actual[apiWiFi]{ID: detail.ID, Origin: detail.Metadata.Origin, Spec: detail, IsSystem: detail.Metadata.Origin == originSystem})
 	}
 	return out, nil
@@ -384,10 +396,15 @@ type apiPolicyEndpoint struct {
 	} `json:"trafficFilter,omitempty"`
 }
 
+// firewallPolicies lists the zone-based firewall policies. As with zones, the
+// bool distinguishes "feature not configured" from a genuine failure.
 func (c *client) firewallPolicies(siteID string) ([]actual[apiFirewallPolicy], bool, error) {
 	raws, err := c.list("/sites/" + siteID + "/firewall/policies")
+	if hasErrorCode(err, codeZBFNotConfigured) {
+		return nil, false, nil
+	}
 	if err != nil {
-		return nil, false, nil //nolint:nilerr // zone-based firewall not configured
+		return nil, false, fmt.Errorf("list firewall policies: %w", err)
 	}
 	out := make([]actual[apiFirewallPolicy], 0, len(raws))
 	for _, raw := range raws {

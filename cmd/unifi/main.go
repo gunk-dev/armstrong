@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -9,8 +10,18 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// exitChangesPending is what `unifi diff` returns when the plan is non-empty,
+// so CI can tell "changes are needed" apart from "the command failed".
+const exitChangesPending = 2
+
 func main() {
-	if err := newRootCmd().Execute(); err != nil {
+	err := newRootCmd().Execute()
+	switch {
+	case err == nil:
+		return
+	case errors.Is(err, errChangesPending):
+		os.Exit(exitChangesPending)
+	default:
 		fmt.Fprintln(os.Stderr, redact(err.Error()))
 		os.Exit(1)
 	}
@@ -65,6 +76,7 @@ func newDiffCmd() *cobra.Command {
 				return err
 			}
 			if changed {
+				cmd.SilenceErrors = true
 				return errChangesPending
 			}
 			return nil
@@ -91,8 +103,9 @@ func newSyncCmd() *cobra.Command {
 	return cmd
 }
 
-// errChangesPending makes `unifi diff` exit non-zero when a change is planned.
-var errChangesPending = fmt.Errorf("changes required")
+// errChangesPending makes `unifi diff` exit with exitChangesPending when a
+// change is planned. It is never printed: the plan itself is the output.
+var errChangesPending = errors.New("changes required")
 
 func connect() (*client, string, error) {
 	c, err := newClient()

@@ -5,12 +5,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -100,7 +102,13 @@ func (c *client) do(method, path string, body, out any) error {
 		return fmt.Errorf("%s %s: read response: %w", method, path, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, redact(string(data)))
+		return &apiError{
+			Method: method,
+			Path:   path,
+			Status: resp.Status,
+			Code:   errorCode(data),
+			Body:   redact(string(data)),
+		}
 	}
 	if out == nil {
 		return nil
@@ -109,6 +117,40 @@ func (c *client) do(method, path string, body, out any) error {
 		return fmt.Errorf("%s %s: parse response: %w", method, path, err)
 	}
 	return nil
+}
+
+// apiError is a non-2xx response. The API reports application-level failures
+// with a machine-readable `code`, which callers branch on instead of matching
+// the human-readable message.
+type apiError struct {
+	Method string
+	Path   string
+	Status string
+	Code   string
+	Body   string
+}
+
+func (e *apiError) Error() string {
+	return fmt.Sprintf("%s %s: %s: %s", e.Method, e.Path, e.Status, e.Body)
+}
+
+// errorCode pulls the `code` out of an error body. Authentication failures use
+// a different, nested envelope (`{"error":{"code":401,…}}`) whose code is a
+// number, not a string; those simply yield "".
+func errorCode(data []byte) string {
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(data, &body); err != nil {
+		return ""
+	}
+	return body.Code
+}
+
+// hasErrorCode reports whether err is an API error carrying the given code.
+func hasErrorCode(err error, code string) bool {
+	var apiErr *apiError
+	return errors.As(err, &apiErr) && apiErr.Code == code
 }
 
 type page struct {
@@ -174,21 +216,68 @@ func siteName() string {
 	return "Default"
 }
 
+// secrets holds values that must never appear in output: every wifi passphrase
+// the tool reads from the console or resolves from the environment. Redacting
+// by value as well as by field name is what makes the API's own error
+// responses safe to print — when a console rejects a payload it quotes it back
+// escaped inside a JSON string, where a `"passphrase":"…"` scrubber finds
+// nothing to match.
+var secrets struct {
+	mu   sync.RWMutex
+	vals []string
+}
+
+// registerSecret marks a value for redaction from all later output. Very short
+// values are ignored: they are not real passphrases and would blank out
+// unrelated text.
+func registerSecret(v string) {
+	if len(v) < 6 {
+		return
+	}
+	secrets.mu.Lock()
+	defer secrets.mu.Unlock()
+	for _, existing := range secrets.vals {
+		if existing == v {
+			return
+		}
+	}
+	secrets.vals = append(secrets.vals, v)
+}
+
 // redact strips anything that looks like a secret out of text that is about to
-// be printed: the passphrase fields the API returns, and the API key itself.
+// be printed: known passphrase values, the passphrase fields the API returns,
+// and the API key itself.
 func redact(s string) string {
+	secrets.mu.RLock()
+	for _, v := range secrets.vals {
+		s = strings.ReplaceAll(s, v, redacted)
+	}
+	secrets.mu.RUnlock()
+
 	for _, field := range []string{"passphrase", "xPassphrase", "presharedKey"} {
 		s = redactJSONString(s, field)
 	}
 	if key := os.Getenv("UNIFI_API_KEY"); key != "" {
-		s = strings.ReplaceAll(s, key, "[REDACTED]")
+		s = strings.ReplaceAll(s, key, redacted)
 	}
 	return s
 }
 
-// redactJSONString replaces the value of every `"<field>":"..."` occurrence.
+const redacted = "[REDACTED]"
+
+// redactJSONString replaces the value of every `"<field>": "..."` occurrence.
+// The pair may appear at either of two levels of quoting: plainly in a JSON
+// document, or backslash-escaped inside a JSON string when the API echoes a
+// rejected payload back in an error message.
 func redactJSONString(s, field string) string {
-	needle := `"` + field + `":"`
+	for _, quote := range []string{`"`, `\"`} {
+		s = redactQuoted(s, field, quote)
+	}
+	return s
+}
+
+func redactQuoted(s, field, quote string) string {
+	needle := quote + field + quote + ":"
 	var b strings.Builder
 	for {
 		i := strings.Index(s, needle)
@@ -198,22 +287,46 @@ func redactJSONString(s, field string) string {
 		}
 		b.WriteString(s[:i+len(needle)])
 		rest := s[i+len(needle):]
-		end := 0
-		for end < len(rest) {
-			if rest[end] == '\\' {
-				end += 2
-				continue
-			}
-			if rest[end] == '"' {
-				break
-			}
-			end++
+
+		j := 0
+		for j < len(rest) && (rest[j] == ' ' || rest[j] == '\t') {
+			j++
 		}
-		if end >= len(rest) {
-			b.WriteString("[REDACTED]")
+		if !strings.HasPrefix(rest[j:], quote) {
+			// Not a string value (a number, null, an object) — leave it be.
+			b.WriteString(rest[:j])
+			s = rest[j:]
+			continue
+		}
+		b.WriteString(rest[:j+len(quote)])
+		rest = rest[j+len(quote):]
+
+		b.WriteString(redacted)
+		end := endOfQuoted(rest, quote)
+		if end < 0 {
 			return b.String()
 		}
-		b.WriteString("[REDACTED]")
 		s = rest[end:]
 	}
+}
+
+// endOfQuoted returns the offset of the quote closing a string value, skipping
+// escaped characters, or -1 if the value is not terminated.
+func endOfQuoted(s, quote string) int {
+	for i := 0; i < len(s); {
+		if s[i] == '\\' {
+			// A backslash escapes what follows — unless what follows is the
+			// escaped-level closing quote itself.
+			if strings.HasPrefix(s[i:], quote) {
+				return i
+			}
+			i += 2
+			continue
+		}
+		if strings.HasPrefix(s[i:], quote) {
+			return i
+		}
+		i++
+	}
+	return -1
 }

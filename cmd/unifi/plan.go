@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -186,7 +187,7 @@ func (r *reconciler) syncZones() error {
 		}
 	}
 
-	return r.pruneList("firewall zone", base, true, func(yield func(id, name, origin string)) {
+	return r.pruneList("firewall zone", base, len(r.want.FirewallZones) > 0, func(yield func(id, name, origin string)) {
 		for _, a := range existing {
 			if !seen[a.Spec.Name] {
 				yield(a.ID, a.Spec.Name, a.Origin)
@@ -218,6 +219,7 @@ func (r *reconciler) syncWiFi() error {
 			if passphrase == "" {
 				return fmt.Errorf("wifi %q: environment variable %s is empty", want.Name, want.Security.PassphraseEnv)
 			}
+			registerSecret(passphrase)
 		}
 		networkID := ""
 		if want.Network != "" && want.Network != "NATIVE" {
@@ -248,7 +250,7 @@ func (r *reconciler) syncWiFi() error {
 		}
 	}
 
-	return r.pruneList("wifi", base, true, func(yield func(id, name, origin string)) {
+	return r.pruneList("wifi", base, len(r.want.WiFi) > 0, func(yield func(id, name, origin string)) {
 		for _, a := range existing {
 			if !seen[a.Spec.Name] {
 				yield(a.ID, a.Spec.Name, a.Origin)
@@ -346,7 +348,11 @@ func (r *reconciler) syncFirewallPolicies() error {
 			if err := r.mutate(http.MethodPost, base, body, &created); err != nil {
 				return fmt.Errorf("create firewall policy %q: %w", want.Name, err)
 			}
-			ordered = append(ordered, created.ID)
+			id := created.ID
+			if r.dryRun {
+				id = pendingID
+			}
+			ordered = append(ordered, id)
 			continue
 		}
 		ordered = append(ordered, got.ID)
@@ -360,7 +366,7 @@ func (r *reconciler) syncFirewallPolicies() error {
 		}
 	}
 
-	if err := r.pruneList("firewall policy", base, true, func(yield func(id, name, origin string)) {
+	if err := r.pruneList("firewall policy", base, len(r.want.FirewallPolicies) > 0, func(yield func(id, name, origin string)) {
 		for _, a := range existing {
 			if !seen[a.Spec.Name] {
 				yield(a.ID, a.Spec.Name, a.Origin)
@@ -370,14 +376,38 @@ func (r *reconciler) syncFirewallPolicies() error {
 		return err
 	}
 
-	if len(ordered) > 1 && !r.dryRun {
-		body := map[string]any{"orderedFirewallPolicyIds": map[string]any{
-			"beforeSystemDefined": ordered,
-			"afterSystemDefined":  []string{},
-		}}
-		if err := r.client.do(http.MethodPut, base+"/ordering", body, nil); err != nil {
-			return fmt.Errorf("reorder firewall policies: %w", err)
+	return r.reorderPolicies(base, ordered, existing)
+}
+
+// reorderPolicies puts the managed policies in `order` sequence ahead of the
+// console's system-defined ones. The list endpoint returns policies in
+// evaluation order, so the current sequence is compared first and the write is
+// skipped when it already matches — otherwise every sync would issue one.
+func (r *reconciler) reorderPolicies(base string, ordered []string, existing []actual[apiFirewallPolicy]) error {
+	if len(ordered) < 2 {
+		return nil
+	}
+	managed := map[string]bool{}
+	for _, id := range ordered {
+		managed[id] = true
+	}
+	var current []string
+	for _, a := range existing {
+		if managed[a.ID] {
+			current = append(current, a.ID)
 		}
+	}
+	if slices.Equal(current, ordered) {
+		return nil
+	}
+
+	r.logf("ORDER", "firewall policy", fmt.Sprintf("%d policies", len(ordered)), "")
+	body := map[string]any{"orderedFirewallPolicyIds": map[string]any{
+		"beforeSystemDefined": ordered,
+		"afterSystemDefined":  []string{},
+	}}
+	if err := r.mutate(http.MethodPut, base+"/ordering", body, nil); err != nil {
+		return fmt.Errorf("reorder firewall policies: %w", err)
 	}
 	return nil
 }
@@ -429,7 +459,7 @@ func (r *reconciler) syncDNSPolicies() error {
 			}
 			continue
 		}
-		if reflect.DeepEqual(got.Spec, want) {
+		if reflect.DeepEqual(normalizeDNSPolicy(got.Spec), normalizeDNSPolicy(want)) {
 			r.logf("OK", "dns policy", want.key(), "")
 			continue
 		}
@@ -439,7 +469,7 @@ func (r *reconciler) syncDNSPolicies() error {
 		}
 	}
 
-	return r.pruneList("dns policy", base, true, func(yield func(id, name, origin string)) {
+	return r.pruneList("dns policy", base, len(r.want.DNSPolicies) > 0, func(yield func(id, name, origin string)) {
 		for _, a := range existing {
 			if !seen[a.Spec.key()] {
 				yield(a.ID, a.Spec.key(), a.Origin)
@@ -448,21 +478,31 @@ func (r *reconciler) syncDNSPolicies() error {
 	})
 }
 
+// normalizeDNSPolicy fills in the TTL the API defaults to, so that a record
+// whose instance file omits ttlSeconds does not look changed on every run.
+func normalizeDNSPolicy(d dnsPolicy) dnsPolicy {
+	if d.TTLSeconds == nil {
+		zero := 0
+		d.TTLSeconds = &zero
+	}
+	return d
+}
+
 // ------------------------------------------------------------------ helpers
 
 // pruneList deletes unmatched USER_DEFINED objects when --prune is set.
-// SYSTEM_DEFINED objects are never deleted, prune or not.
-func (r *reconciler) pruneList(kind, base string, enabled bool, each func(func(id, name, origin string))) error {
+//
+// Two safety rules apply. SYSTEM_DEFINED objects are never deleted, prune or
+// not — they are the console's own. And nothing is deleted for a resource type
+// the instance file leaves empty (declared is false): an instance file that
+// simply forgot a list would otherwise wipe every object of that type.
+func (r *reconciler) pruneList(kind, base string, declared bool, each func(func(id, name, origin string))) error {
 	var err error
 	each(func(id, name, origin string) {
-		if err != nil {
+		if err != nil || origin == originSystem {
 			return
 		}
-		if origin == originSystem {
-			// Console-owned; leave it alone even under --prune.
-			return
-		}
-		if !r.prune || !enabled {
+		if !r.prune || !declared {
 			return
 		}
 		r.logf("DELETE", kind, name, "")
