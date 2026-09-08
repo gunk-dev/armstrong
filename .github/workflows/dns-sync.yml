@@ -1,3 +1,4 @@
+---
 name: DNS Sync
 
 on:
@@ -22,17 +23,17 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
         with:
           persist-credentials: false
 
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
         with:
           repository: gunk-dev/armstrong
           path: _armstrong
           persist-credentials: false
 
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5  # v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: _armstrong/go.mod
 

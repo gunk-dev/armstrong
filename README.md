@@ -2,6 +2,91 @@
 
 Platform schema and reusable deploy workflows for the gunk-dev org. Provides shared CUE schemas for Fly.io app configuration and GitHub Actions workflows for staging, production, and preview deployments.
 
+## Consuming from Nix
+
+This repo is a flake, so a consumer gets the CLIs and the CUE schemas from one
+pinned input — no `flake = false`, no hand-maintained `vendorHash`, and no
+`.cue` files vendored into the consumer's git tree.
+
+```nix
+{
+  inputs.armstrong.url = "github:gunk-dev/armstrong";
+  inputs.armstrong.inputs.nixpkgs.follows = "nixpkgs";
+}
+```
+
+Outputs, for `x86_64-linux` and `aarch64-linux`:
+
+| Output | Contents |
+| --- | --- |
+| `packages.<system>.unifi` | the `unifi` CLI (also `packages.<system>.default`) |
+| `packages.<system>.dns` | the `dns` CLI |
+| `packages.<system>.schema` | `schema/*.cue` laid out as a CUE module package path |
+| `devShells.<system>.default` | go, cue, nixfmt, gh |
+| `checks.<system>` | `go vet`, `go test ./...`, `cue vet ./schema`, `nixfmt --check`, and a build of `examples/unifi` against `packages.schema` |
+
+### The CLIs
+
+Run one without installing anything:
+
+```sh
+nix run github:gunk-dev/armstrong#unifi -- --help
+```
+
+Or reference the package — for example from a NixOS systemd timer that syncs a
+UniFi console on the LAN:
+
+```nix
+{ config, pkgs, inputs, ... }:
+{
+  systemd.services.unifi-sync.serviceConfig.ExecStart =
+    "${inputs.armstrong.packages.${pkgs.stdenv.hostPlatform.system}.unifi}/bin/unifi sync --prune";
+}
+```
+
+### The schema
+
+`packages.<system>.schema` is a derivation whose output is already shaped like a
+CUE module's package directory:
+
+```
+$out/cue.mod/pkg/gunk.dev/armstrong/VERSION       # the armstrong git rev, for provenance
+$out/cue.mod/pkg/gunk.dev/armstrong/schema/*.cue
+```
+
+So a consumer assembles its `cue.mod/pkg` at build time and keeps it out of git.
+`cue.mod/module.cue` stays in the consumer repo; only the vendored package tree
+comes from the flake:
+
+```nix
+{ pkgs, inputs, ... }:
+let
+  schema = inputs.armstrong.packages.${pkgs.stdenv.hostPlatform.system}.schema;
+in
+# ./. holds the consumer's cue.mod/module.cue and its ./unifi CUE package.
+pkgs.runCommand "unifi-site.json" { nativeBuildInputs = [ pkgs.cue ]; } ''
+  cp -R ${./.} src && chmod -R u+w src && cd src
+  mkdir -p cue.mod/pkg/gunk.dev
+  ln -s ${schema}/cue.mod/pkg/gunk.dev/armstrong cue.mod/pkg/gunk.dev/armstrong
+  export CUE_CACHE_DIR=$TMPDIR/cue
+  cue export ./unifi --out json -e site > $out
+''
+```
+
+The consumer's `cue.mod/module.cue` must declare a `language: version` — `cue`
+refuses to resolve `cue.mod/pkg` without one.
+
+The consumer's CUE then imports the schemas by module path as usual:
+
+```cue
+import "gunk.dev/armstrong/schema"
+
+site: schema.#Site & { /* ... */ }
+```
+
+Bumping the schemas is `nix flake update armstrong` — the CLIs and the CUE
+definitions move together, and `VERSION` records which rev is in use.
+
 ## CUE Schemas
 
 Import the schemas in your CUE configuration:
