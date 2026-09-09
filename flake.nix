@@ -77,6 +77,16 @@
         }
       );
 
+      # The NixOS actuator for `schema.#Site`: a hardened oneshot that runs
+      # `cue export <instance> -e site | unifi <diff|sync>`, plus a daily drift
+      # timer and a `unifi-plan` wrapper. `self` is threaded in so `package`
+      # and `schema` default to this flake's own outputs, with no `inputs`
+      # argument required of the consumer's module system.
+      nixosModules = {
+        unifi-sync = import ./nix/modules/unifi-sync { armstrong = self; };
+        default = self.nixosModules.unifi-sync;
+      };
+
       checks = forAllSystems (pkgs: {
         inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) unifi dns schema;
 
@@ -112,6 +122,64 @@
               export CUE_CACHE_DIR=$TMPDIR/cue
               cue export . --out json -e site > $out
             '';
+
+        # The module's VM test. It boots a host running the real unit against a
+        # fake console, so it needs KVM: `nix flake check` on a machine or
+        # runner without /dev/kvm cannot build it. GitHub-hosted
+        # `ubuntu-latest` runners do have it.
+        unifi-sync-vm = import ./nix/modules/unifi-sync/test.nix {
+          inherit pkgs;
+          module = self.nixosModules.unifi-sync;
+        };
+
+        # The module imported into a scratch NixOS configuration, so a change
+        # that only breaks on evaluation (a bad option type, a reference to an
+        # `inputs` argument the consumer does not pass) fails here rather than
+        # in the consumer's repository. Cheap: it forces the rendered unit and
+        # the assertions, not a whole system closure.
+        unifi-sync-eval =
+          let
+            scratch = nixpkgs.lib.nixosSystem {
+              modules = [
+                self.nixosModules.unifi-sync
+                {
+                  nixpkgs.hostPlatform = pkgs.stdenv.hostPlatform.system;
+                  system.stateVersion = "25.05";
+                  boot.loader.grub.enable = false;
+                  fileSystems."/" = {
+                    device = "/dev/disk/by-label/nixos";
+                    fsType = "ext4";
+                  };
+
+                  modules.unifi-sync = {
+                    enable = true;
+                    consoleUrl = "https://198.51.100.1";
+                    insecureTls = true;
+                    instance = ./nix/modules/unifi-sync/test-instance;
+                    apiKeyFile = "/run/secrets/unifi-api-key";
+                    secretsFile = "/run/secrets/unifi-wifi.env";
+                    onSuccessOf = [ "nixos-upgrade" ];
+                    mode = "sync";
+                    prune = true;
+                  };
+                }
+              ];
+            };
+            failed = builtins.filter (a: !a.assertion) scratch.config.assertions;
+          in
+          assert nixpkgs.lib.assertMsg (failed == [ ]) (
+            "unifi-sync-eval: " + nixpkgs.lib.concatMapStringsSep "; " (a: a.message) failed
+          );
+          pkgs.runCommand "armstrong-unifi-sync-eval" { } ''
+            unit=${scratch.config.systemd.units."unifi-sync.service".unit}/unifi-sync.service
+            grep -q 'ExecStart=.*/bin/unifi-sync-run' "$unit"
+            grep -q 'DynamicUser=true' "$unit"
+            grep -q 'LoadCredential=api-key:/run/secrets/unifi-api-key' "$unit"
+            # onSuccessOf reached the consumer's own unit.
+            grep -q 'OnSuccess=unifi-sync.service' \
+              ${scratch.config.systemd.units."nixos-upgrade.service".unit}/nixos-upgrade.service
+            cp "$unit" $out
+          '';
 
         nixfmt = pkgs.runCommand "armstrong-nixfmt" { nativeBuildInputs = [ pkgs.nixfmt ]; } ''
           find ${self} -name '*.nix' -print0 | xargs -0 nixfmt --check
