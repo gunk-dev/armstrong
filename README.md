@@ -244,7 +244,7 @@ Available definitions:
 - `#HttpService` — HTTP service settings (port, auto-stop, auto-start, health checks)
 - `#HttpCheck` — HTTP health check configuration
 - `#DNSRecord` — DNS record definition (A, AAAA, CNAME, MX, NS, SRV, TXT)
-- `#Site` — a UniFi Network site (see `schema/unifi.cue`), holding `#Network`, `#FirewallZone`, `#WiFi`, `#FirewallPolicy` and `#DNSPolicy` lists
+- `#Site` — a UniFi Network site (see `schema/unifi.cue`), holding `#Network`, `#FirewallZone`, `#WiFi`, `#FirewallPolicy` and `#DNSPolicy` lists. `#FirewallPolicy` models the full policy: `#TrafficFilter` on either end (networks, IP addresses/subnets, ports, MAC addresses, applications), `#FirewallSchedule`, connection states, protocol and logging
 
 ## DNS Tool
 
@@ -327,7 +327,7 @@ the console to match.
 
 Commands:
 
-- `unifi export` — Dumps the live site as `#Site`-shaped JSON so a consumer repo can bootstrap its instance file from real state. WiFi passphrases are never included; each SSID gets a `passphraseEnv` name instead.
+- `unifi export` — Dumps the live site as `#Site`-shaped JSON so a consumer repo can bootstrap its instance file from real state. WiFi passphrases are never included; each SSID gets a `passphraseEnv` name instead. Objects the schema cannot express faithfully are skipped and named on stderr.
 - `unifi diff` — Reads `#Site` JSON from stdin and prints the plan without changing anything. Exits 2 when a change would be made and 1 on failure, so CI can tell drift apart from a broken run. Pass `--prune` to include deletions in the plan.
 - `unifi sync [--prune] [--dry-run]` — Reads `#Site` JSON from stdin and converges the site. `--prune` deletes `USER_DEFINED` objects absent from the input; `--dry-run` prints the plan without calling the API.
 
@@ -345,8 +345,16 @@ Environment:
 ### Rules
 
 - **Names are the identity.** Ids are server-assigned and must never appear in a
-  consumer repo, so desired and actual objects are matched by `name` (DNS
-  policies, which have no name, are matched by type plus domain).
+  consumer repo, so desired and actual objects are matched by `name`. Two kinds
+  need more: DNS policies have no name and are matched by type plus domain, and
+  firewall policies are matched by **(source zone, destination zone, name)** —
+  a stock console reuses `Allow All Traffic` nineteen times.
+- **Nothing is written back lossily.** Before planning an update, `unifi`
+  re-renders the live object from its own projection and compares. If the
+  console holds a firewall policy using something `#FirewallPolicy` does not
+  model, `diff` and `sync` fail naming the field instead of `PUT`ting the
+  policy back without it, and `export` leaves it out rather than emitting a
+  version that would become that write.
 - **`SYSTEM_DEFINED` objects are never deleted**, not even with `--prune`. Their
   configurable fields are updated when the instance file declares them, so you
   can manage the console's own default LAN.

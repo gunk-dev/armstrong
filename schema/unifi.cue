@@ -5,7 +5,9 @@ package schema
 // These definitions model the official UniFi Network Integration API
 // (https://<console>/proxy/network/integration/v1) as served by UniFi Network
 // 10.x. Objects are matched by NAME, never by id: ids are server-assigned and
-// must not be committed to a consumer repo.
+// must not be committed to a consumer repo. The exceptions are the two object
+// kinds whose name is not unique: DNS policies are keyed by type + domain, and
+// firewall policies by (sourceZone, destinationZone, name).
 //
 // Fields mirror the API's own names and enum values so that `unifi export`
 // output can be pasted straight into an instance file.
@@ -122,43 +124,103 @@ package schema
 // #FirewallPolicy is a zone-based firewall rule. Zones and networks are
 // referenced by name.
 //
-// NOTE: the zone-based firewall endpoints are documented but were not
-// exercised against a live console (the reference console still runs the
-// legacy firewall, so /firewall/zones returns "Zone Based Firewall is not
-// configured"). Treat this section as best-effort until it is confirmed.
+// **Identity is the triple (sourceZone, destinationZone, name)**, not the name
+// alone: the console's own defaults reuse a handful of names across dozens of
+// policies ("Allow All Traffic" appears 19 times on a stock 10.6 console). The
+// triple was verified unique across all 67 policies of the reference console.
+// Two entries sharing it is an error, not a merge.
 #FirewallPolicy: {
-	name:        string & !=""
+	name:         string & !=""
 	description?: string
-	enabled:     bool | *true
+	enabled:      bool | *true
 
 	action: "ALLOW" | "BLOCK" | "REJECT"
 	// Only meaningful for "ALLOW": permit the reply traffic of a matched flow.
 	allowReturnTraffic: bool | *true
 
-	// Names of #FirewallZone entries.
+	// Names of #FirewallZone entries. Zones the instance file does not declare
+	// may still be referenced: they are resolved against the live console.
 	sourceZone:      string & !=""
 	destinationZone: string & !=""
 
+	// What, within the zone, the policy matches. Omit to match the whole zone.
+	source?:      #TrafficFilter
+	destination?: #TrafficFilter
+
 	ipVersion: "IPV4" | "IPV6" | "IPV4_AND_IPV6" | *"IPV4_AND_IPV6"
 
-	// IP protocol name as the API spells it ("tcp", "udp", "tcp_udp", "icmp",
-	// "icmpv6", "gre", "esp", …). Omit to match every protocol.
-	protocol?: string & !=""
-
-	// Restrict the policy to specific member networks (by name) of the zone.
-	sourceNetworks?: [...string]
-	destinationNetworks?: [...string]
-
-	// Port numbers or "start-end" ranges, e.g. "443" or "8000-8100".
-	sourcePorts?: [...#Port]
-	destinationPorts?: [...#Port]
+	// IP protocol as the API spells it, upper-case: "TCP", "UDP", "TCP_UDP",
+	// "ICMP", "ICMPV6", "GRE", "ESP", … Omit to match every protocol.
+	protocol?:             string & !=""
+	protocolMatchOpposite: bool | *false
 
 	connectionStates?: [...("NEW" | "INVALID" | "ESTABLISHED" | "RELATED")]
 	loggingEnabled: bool | *false
 
-	// Relative position among user-defined policies. Lower runs first.
-	// Policies are ordered ahead of the system-defined ones.
-	order: int | *100
+	// When the policy is in force. Omit for "always".
+	schedule?: #FirewallSchedule
+
+	// Relative position among the USER_DEFINED policies that share this
+	// policy's zone pair — the console orders policies per zone pair, not
+	// site-wide. Lower runs first. Omit to leave the policy where it is;
+	// SYSTEM_DEFINED policies are never reordered.
+	order?: int
+}
+
+// #TrafficFilter narrows one end of a policy. `type` names the filter the
+// console treats as primary; the other filters may be set alongside it (the
+// stock "Allow mDNS" policy matches an IP address set *and* a port).
+#TrafficFilter: {
+	type: "NETWORK" | "IP_ADDRESS" | "PORT" | "MAC_ADDRESS" | "APPLICATION"
+
+	// Member networks of the zone, by name.
+	networkFilter?: {
+		networks: [...string]
+		// Match everything except the listed networks.
+		matchOpposite: bool | *false
+	}
+	ipAddressFilter?: {
+		items: [...#IPAddressMatch]
+		matchOpposite: bool | *false
+	}
+	portFilter?: {
+		items: [...#Port]
+		matchOpposite: bool | *false
+	}
+	macAddressFilter?: {
+		macAddresses: [...#MACAddress]
+	}
+	// Numeric application ids as the console's DPI catalogue assigns them.
+	// There is no name lookup in the Integration API, so `unifi export` is
+	// how you find the id of an application you picked in the UI.
+	applicationFilter?: {
+		applicationIds: [...int]
+	}
+}
+
+#IPAddressMatch: {
+	type:  "IP_ADDRESS" | "SUBNET"
+	value: string & !=""
+}
+
+// #MACAddress is colon-separated and lower-case, the form the API returns.
+#MACAddress: string & =~"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$"
+
+// #FirewallSchedule limits when a policy is in force. Only "EVERY_DAY" and
+// "CUSTOM" were seen on the reference console; the other modes are what the
+// console UI offers.
+#FirewallSchedule: {
+	mode: "EVERY_DAY" | "EVERY_WEEK" | "ONE_TIME_ONLY" | "CUSTOM"
+
+	// 24-hour "HH:MM". A stopTime earlier than startTime wraps past midnight.
+	startTime?: string & =~"^([01][0-9]|2[0-3]):[0-5][0-9]$"
+	stopTime?:  string & =~"^([01][0-9]|2[0-3]):[0-5][0-9]$"
+
+	repeatOnDays?: [...("MONDAY" | "TUESDAY" | "WEDNESDAY" | "THURSDAY" | "FRIDAY" | "SATURDAY" | "SUNDAY")]
+
+	// "YYYY-MM-DD".
+	startDate?: string & =~"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+	stopDate?:  string & =~"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
 }
 
 // #Port is a single port or an inclusive "start-end" range, written as a

@@ -1,8 +1,9 @@
 # UniFi Network Integration API — discovery notes
 
 Field names and response shapes below were read from a live UniFi Dream Machine
-Pro running **UniFi Network 10.6.101** (UniFi OS 3.0.1) on 2026-09-07. No
-addresses, ids or keys are recorded here — only the schema.
+Pro running **UniFi Network 10.6.101** (UniFi OS 3.0.1) on 2026-09-07, and
+re-read on 2026-09-09 with the zone-based firewall enabled (6 zones, 67
+policies). No addresses, ids or keys are recorded here — only the schema.
 
 The console also serves interactive docs for its own version at
 Settings → Control Plane → Integrations (`/settings/api-docs` in the UniFi OS
@@ -61,8 +62,15 @@ this is safe, nothing is mutated):
 | `/firewall/policies/ordering` | GET, PUT, PATCH, DELETE |
 | `/acl-rules` | GET, POST |
 | `/devices` | GET, POST |
-| `/clients` | GET |
+| `/clients` | **GET only** |
+| `/clients/{id}` | **GET only** |
 | `/info`, `/sites` | GET |
+
+Read the `Allow` header, not the CORS preflight: `OPTIONS` on *any* path answers
+`204` with a blanket
+`access-control-allow-methods: HEAD, GET, DELETE, PATCH, POST, PUT`, which is
+nginx boilerplate and says nothing about the route. The `405` `Allow` header is
+the route's real method set.
 
 ## Shapes (confirmed live)
 
@@ -138,37 +146,152 @@ type-specific payload field; only `A_RECORD` was present on the reference
 console. **DNS policies have no name**, so the tool keys them by
 `type + domain`.
 
-## Shapes (documented, NOT exercised live)
-
-The reference console still runs the legacy firewall, so both zone-based
-firewall endpoints answer `400 api.firewall.zone-based-firewall-not-configured`.
-`cmd/unifi` implements them against the documented schema and treats exactly
-that error code as "feature unavailable" — any other error is reported, so an
-expired key can never be mistaken for an unconfigured firewall.
+### Firewall zones
 
 ```
-zone:   {id, name, networkIds: [string], metadata: {origin}}
-policy: {id, name, description, enabled, metadata: {origin},
-         action: {type: "ALLOW"|"BLOCK"|"REJECT", allowReturnTraffic},
-         source|destination: {
-           zoneId,
-           trafficFilter: {type: "NETWORK"|"PORT",
-                           networkFilter: {networkIds, matchOpposite},
-                           portFilter: {type: "PORTS", matchOpposite,
-                                        items: [{type: "PORT_NUMBER", port} |
-                                                {type: "PORT_NUMBER_RANGE", startPort, endPort}]}}},
-         ipProtocolScope: {ipVersion: "IPV4"|"IPV6"|"IPV4_AND_IPV6",
-                           protocolFilter: {type: "NAMED", name}},
-         connectionStateFilter: [string], loggingEnabled}
-ordering (PUT /firewall/policies/ordering):
-        {orderedFirewallPolicyIds: {beforeSystemDefined: [id], afterSystemDefined: [id]}}
+{id, name, networkIds: [string], metadata: {origin, configurable}}
 ```
+
+`networkIds` can name networks `GET /networks` does not return. On the
+reference console the `External` zone lists two WAN interfaces, and neither has
+a `/networks` entry, so their ids cannot be turned back into names. Those zones
+are also `configurable: false`. `unifi export` therefore skips a zone whose
+members it cannot name, and says so on stderr — emitting `networks: ["", ""]`
+would round-trip into a `PUT` that empties the zone.
+
+Zones need not be declared to be *referenced*: `unifi` resolves policy zone
+names against the live zone list, so a policy can point at `External` while the
+instance file declares no zones at all.
+
+### Firewall policies
+
+`GET /firewall/policies` returns whole objects (no overview/detail split) in
+**evaluation order**. Confirmed against a console with the zone-based firewall
+enabled: 6 zones, 67 policies (63 `SYSTEM_DEFINED`, 4 `USER_DEFINED`).
+
+```
+id, name, description, enabled, index,
+metadata: {origin, configurable},
+action: {type: "ALLOW"|"BLOCK"|"REJECT", allowReturnTraffic},   // allowReturnTraffic only on ALLOW
+source|destination: {
+  zoneId,
+  trafficFilter: {
+    type: "NETWORK"|"IP_ADDRESS"|"PORT"|"MAC_ADDRESS"|"APPLICATION",
+    networkFilter:     {networkIds: [id], matchOpposite},
+    ipAddressFilter:   {type: "IP_ADDRESSES", matchOpposite,
+                        items: [{type: "IP_ADDRESS"|"SUBNET", value: "224.0.0.251"|"fe80::/10"}]},
+    portFilter:        {type: "PORTS", matchOpposite,
+                        items: [{type: "PORT_NUMBER", value: 5353}]},
+    macAddressFilter:  {macAddresses: ["aa:bb:cc:dd:ee:ff", …]},
+    applicationFilter: {applicationIds: [262392, …]}
+  }
+},
+ipProtocolScope: {ipVersion: "IPV4"|"IPV6"|"IPV4_AND_IPV6",
+                  protocolFilter: {type: "NAMED_PROTOCOL", protocol: {name: "UDP"}, matchOpposite}},
+connectionStateFilter: ["NEW"|"INVALID"|"ESTABLISHED"|"RELATED"],
+loggingEnabled,
+schedule: {mode: "EVERY_DAY"|"CUSTOM"|…,
+           timeFilter: {startTime: "22:00", stopTime: "13:00"},
+           repeatOnDays: ["MONDAY", …], startDate: "2026-03-14", stopDate: "2026-03-21"}
+```
+
+Corrections to what this file previously guessed:
+
+- port items carry **`value`**, not `port` / `startPort` / `endPort`;
+- the protocol filter is `{type: "NAMED_PROTOCOL", protocol: {name}}`, not
+  `{type: "NAMED", name}`, and the name is upper-case (`UDP`, `ICMPV6`);
+- there is an `ipAddressFilter` and an `applicationFilter` and a
+  `macAddressFilter`, and both endpoints of one policy can carry several
+  filters at once (`Allow mDNS` matches an IP set *and* a port);
+- every policy has a server-assigned **`index`** (evaluation order). The
+  observed values were `10000`+ for user policies and `30000`+ /
+  `2147483647` for system ones, and they are **not** unique.
+
+`PORT_NUMBER_RANGE` was not present on the console. `cmd/unifi` renders a
+`"8000-8100"` range as `{"type":"PORT_NUMBER_RANGE","value":"8000-8100"}` by
+analogy with `PORT_NUMBER`; that is still **inferred**.
+
+#### Names are not unique; (source zone, destination zone, name) is
+
+The console's own defaults reuse 14 names across the 67 policies — `Allow All
+Traffic` ×19, `Block All Traffic` ×16, `Allow Return Traffic` ×12, `Block
+Invalid Traffic` ×10. The triple **(source zone name, destination zone name,
+policy name)** was verified unique across all 67, so that is the identity
+`cmd/unifi` matches on. `index` is not usable as a tiebreaker: it repeats.
+
+#### USER_DEFINED policies come back without an `id`
+
+On 10.6.101 the API omits `id` from every `USER_DEFINED` policy — the 63
+system-defined ones all carry one, the 4 user-defined ones carry none. The
+ordering endpoint agrees: it returns `beforeSystemDefined: [null, null, null,
+null]` for that zone pair. There is therefore **no way to address a
+user-created policy** for `PUT`, `PATCH` or `DELETE` through the Integration
+API on this firmware.
+
+`cmd/unifi` can still create policies and can update the system-defined ones.
+Any plan that needs to update, delete or reorder an id-less policy fails with a
+message naming this limitation, rather than issuing a write it cannot target.
+
+#### Ordering is per zone pair
+
+`GET /firewall/policies/ordering` without arguments answers `400
+api.request.error` — "Required request parameter `sourceFirewallZoneId` for
+method parameter type UUID is not present". It takes
+`?sourceFirewallZoneId=…&destinationFirewallZoneId=…` and returns
+`{orderedFirewallPolicyIds: {beforeSystemDefined: [id], afterSystemDefined: [id]}}`
+for that pair alone. A `PUT` therefore has to carry the same query parameters;
+there is no site-wide ordering call.
+
+### Clients — no DHCP reservation write path (issue #13)
+
+`GET /sites/{id}/clients` returns **only currently connected** clients, and
+only these fields:
+
+```
+{id, type: "WIRED"|"WIRELESS", name, macAddress, ipAddress,
+ connectedAt, uplinkDeviceId, access: {type: "DEFAULT"}}
+```
+
+`GET /clients/{id}` returns exactly the same object — there is no detail view
+with more in it. Three independent findings, all from the reference console:
+
+1. **The routes are read-only.** A `405` from `/clients` and from
+   `/clients/{id}` both answer `allow: GET`.
+2. **The object has no fixed-IP field.** A client that *does* hold a DHCP
+   reservation (`use_fixedip: true` with a `fixed_ip` on the private controller
+   API) appears in the Integration API list with the eight fields above and
+   nothing more — the reservation is invisible, not merely unset.
+3. **Disconnected devices are absent.** The console knew 110 clients; the
+   Integration API listed the 30 that were connected. A reservation held by
+   MAC for a device that is currently off cannot even be read.
+
+No reservation-shaped endpoint exists either: `/clients/reservations`,
+`/client-reservations`, `/dhcp`, `/dhcp/reservations`, `/fixed-ip-assignments`,
+`/static-leases`, `/users` and `/user-groups` all answer `404`
+(`/clients/<x>` answers `400 api.request.argument-type-mismatch`, i.e. it is
+parsing `<x>` as a client id). `/acl-rules` exists but is a different feature
+and was empty. There is no `/integration/v2`.
+
+Reservations do exist on the console; they live on the **private** controller
+API (`/proxy/network/api/s/{site}/rest/user`, whose objects carry `mac`,
+`name`, `use_fixedip`, `fixed_ip`, `local_dns_record`, …). `cmd/unifi` speaks
+only the Integration API, so `#Client` is not modelled: a schema field the tool
+could never reconcile would be worse than none. Revisit when a Network release
+adds client writes to `/integration/v1`.
 
 ## Write bodies
 
-No write was performed against the reference console, so create/update payloads
-are **inferred**: they mirror the `GET` detail representation with the
-server-owned keys (`id`, `metadata`, `default`) removed. This matches how the
-rest of the Integration API behaves and is the shape `cmd/unifi/api.go` sends;
-the fake server in `cmd/unifi/unifi_test.go` asserts it, but a live console has
-not yet confirmed it. Run `unifi sync --dry-run` first on a real deployment.
+No write has been performed against the reference console, so create/update
+payloads are **inferred**: they mirror the `GET` detail representation with the
+server-owned keys (`id`, `metadata`, `index`, `default`) removed. This matches
+how the rest of the Integration API behaves and is the shape
+`cmd/unifi/api.go` sends; the fake server in `cmd/unifi/fake_test.go` asserts
+it, but a live console has not yet confirmed it. Run `unifi sync --dry-run`
+first on a real deployment.
+
+For firewall policies the inference is now checked in both directions:
+`cmd/unifi` re-renders every live policy from its own projection and compares
+that against the object the console returned. If they differ — because the
+policy uses something `schema/unifi.cue` does not model — the policy is refused
+rather than written back lossily. That check is what keeps "the write body
+mirrors the read body" from being an assumption.

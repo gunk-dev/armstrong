@@ -76,6 +76,41 @@ site: schema.#Site & {
 			destinationZone: "internal"
 			order:           10
 		},
+		// A policy is identified by (sourceZone, destinationZone, name), so
+		// this one coexists with the block rule above under a name the
+		// console's own defaults also use.
+		{
+			name:            "internal-to-iot-mgmt"
+			action:          "ALLOW"
+			sourceZone:      "internal"
+			destinationZone: "iot"
+			protocol:        "TCP"
+			destination: {
+				type: "PORT"
+				portFilter: items: ["22", "8000-8100"]
+			}
+			connectionStates: ["NEW", "ESTABLISHED", "RELATED"]
+			order: 20
+		},
+		// Filters, applications and schedules are all first-class: this is
+		// "no streaming on the kids' tablets after bedtime".
+		{
+			name:            "iot-curfew"
+			action:          "BLOCK"
+			sourceZone:      "iot"
+			destinationZone: "internal"
+			source: {
+				type: "MAC_ADDRESS"
+				macAddressFilter: macAddresses: ["02:00:5e:10:00:01", "02:00:5e:10:00:02"]
+			}
+			schedule: {
+				mode:      "CUSTOM"
+				startTime: "21:00"
+				stopTime:  "07:00"
+				repeatOnDays: ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "SUNDAY"]
+			}
+			order: 30
+		},
 	]
 
 	dnsPolicies: [

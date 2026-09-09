@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -652,7 +653,18 @@ const exampleSiteFallback = `{
   "firewallPolicies": [
     {"name":"iot-to-internal-block","enabled":true,"action":"BLOCK",
      "allowReturnTraffic":true,"sourceZone":"iot","destinationZone":"internal",
-     "ipVersion":"IPV4_AND_IPV6","loggingEnabled":false,"order":10}
+     "ipVersion":"IPV4_AND_IPV6","loggingEnabled":false,"order":10},
+    {"name":"internal-to-iot-mgmt","enabled":true,"action":"ALLOW",
+     "allowReturnTraffic":true,"sourceZone":"internal","destinationZone":"iot",
+     "protocol":"TCP","destination":{"type":"PORT","portFilter":{"items":["22","8000-8100"],"matchOpposite":false}},
+     "connectionStates":["NEW","ESTABLISHED","RELATED"],
+     "ipVersion":"IPV4_AND_IPV6","loggingEnabled":false,"order":20},
+    {"name":"iot-curfew","enabled":true,"action":"BLOCK",
+     "allowReturnTraffic":true,"sourceZone":"iot","destinationZone":"internal",
+     "source":{"type":"MAC_ADDRESS","macAddressFilter":{"macAddresses":["02:00:5e:10:00:01","02:00:5e:10:00:02"]}},
+     "schedule":{"mode":"CUSTOM","startTime":"21:00","stopTime":"07:00",
+       "repeatOnDays":["MONDAY","TUESDAY","WEDNESDAY","THURSDAY","SUNDAY"]},
+     "ipVersion":"IPV4_AND_IPV6","loggingEnabled":false,"order":30}
   ],
   "dnsPolicies": [
     {"type":"A_RECORD","enabled":true,"domain":"nas.example.internal","ipv4Address":"192.0.2.10","ttlSeconds":0},
@@ -676,10 +688,360 @@ func itoa(i int) string {
 	return string(rune('0'+i/100%10)) + string(rune('0'+i/10%10)) + string(rune('0'+i%10))
 }
 
-// TestFirewallPolicyOrdering exercises the zone-based firewall end to end
-// against the fake — the one resource type no live console could confirm.
-// Policies must be created, ordered by their `order` field, and left alone on
-// a second run.
+// seedFirewall gives the fake a zone-based firewall shaped like a real
+// console's: two user zones plus a system zone, and — crucially — several
+// SYSTEM_DEFINED policies that share the same name, as a stock console has.
+func seedFirewall(f *fakeConsole) (internal, iot, gateway string) {
+	defaultNet := f.objectNamed(collNetworks, "Default")["id"].(string)
+	iotNet := f.objectNamed(collNetworks, "IoT")["id"].(string)
+	internal = f.seed(collZones, originSystem, map[string]any{"name": "internal", "networkIds": []any{defaultNet}})
+	iot = f.seed(collZones, originUser, map[string]any{"name": "iot", "networkIds": []any{iotNet}})
+	gateway = f.seed(collZones, originSystem, map[string]any{"name": "gateway", "networkIds": []any{}})
+
+	// "Allow All Traffic" three times over, on three different zone pairs.
+	for _, pair := range [][2]string{{internal, internal}, {iot, iot}, {internal, gateway}} {
+		f.seed(collPolicies, originSystem, map[string]any{
+			"name": "Allow All Traffic", "enabled": true,
+			"action":          map[string]any{"type": "ALLOW", "allowReturnTraffic": true},
+			"source":          map[string]any{"zoneId": pair[0]},
+			"destination":     map[string]any{"zoneId": pair[1]},
+			"ipProtocolScope": map[string]any{"ipVersion": "IPV4_AND_IPV6"},
+			"loggingEnabled":  false,
+		})
+	}
+	return internal, iot, gateway
+}
+
+// TestPoliciesAreKeyedByZonePairAndName is the fix for the bug that made the
+// firewall unusable: a stock console reuses "Allow All Traffic" across dozens
+// of policies, so name-keyed matching mapped every one of them onto the same
+// live object and the plan never converged. Declaring all three must be a
+// no-op, and changing exactly one must touch exactly that one.
+func TestPoliciesAreKeyedByZonePairAndName(t *testing.T) {
+	f := newFakeConsole(t)
+	seedSite(f)
+	internal, iot, gateway := seedFirewall(f)
+
+	const declared = `{
+	  "networks": [], "wifi": [], "dnsPolicies": [], "firewallZones": [],
+	  "firewallPolicies": [
+	    {"name":"Allow All Traffic","enabled":true,"action":"ALLOW","allowReturnTraffic":true,
+	     "sourceZone":"internal","destinationZone":"internal","ipVersion":"IPV4_AND_IPV6","loggingEnabled":false},
+	    {"name":"Allow All Traffic","enabled":true,"action":"ALLOW","allowReturnTraffic":true,
+	     "sourceZone":"iot","destinationZone":"iot","ipVersion":"IPV4_AND_IPV6","loggingEnabled":%s},
+	    {"name":"Allow All Traffic","enabled":true,"action":"ALLOW","allowReturnTraffic":true,
+	     "sourceZone":"internal","destinationZone":"gateway","ipVersion":"IPV4_AND_IPV6","loggingEnabled":false}
+	  ]
+	}`
+
+	// All three declared as they are: nothing to do.
+	stdout, _, code := run(t, f, fmt.Sprintf(declared, "false"), nil, "diff")
+	if code != 0 {
+		t.Fatalf("three same-named policies did not converge (exit %d):\n%s", code, stdout)
+	}
+	if n := strings.Count(stdout, "OK     firewall policy"); n != 3 {
+		t.Errorf("want three matched policies, got %d:\n%s", n, stdout)
+	}
+
+	// Flip logging on the iot->iot one only.
+	stdout = mustRun(t, f, fmt.Sprintf(declared, "true"), nil, "sync")
+	if n := strings.Count(stdout, "UPDATE"); n != 1 {
+		t.Fatalf("want exactly one update, got:\n%s", stdout)
+	}
+	if got := f.policyNamed("Allow All Traffic", iot, iot); got["loggingEnabled"] != true {
+		t.Errorf("the iot->iot policy was not updated: %v", got)
+	}
+	for _, pair := range [][2]string{{internal, internal}, {internal, gateway}} {
+		if got := f.policyNamed("Allow All Traffic", pair[0], pair[1]); got["loggingEnabled"] != false {
+			t.Errorf("a same-named policy on another zone pair was disturbed: %v", got)
+		}
+	}
+}
+
+// TestDuplicatePolicyIdentityIsRejected: since the identity is a triple, two
+// entries sharing it are ambiguous. Silently reconciling the last one would
+// leave the first permanently unapplied.
+func TestDuplicatePolicyIdentityIsRejected(t *testing.T) {
+	f := newFakeConsole(t)
+	seedSite(f)
+	seedFirewall(f)
+
+	desired := `{
+	  "networks": [], "wifi": [], "dnsPolicies": [], "firewallZones": [],
+	  "firewallPolicies": [
+	    {"name":"dup","enabled":true,"action":"BLOCK","allowReturnTraffic":true,
+	     "sourceZone":"iot","destinationZone":"internal","ipVersion":"IPV4","loggingEnabled":false},
+	    {"name":"dup","enabled":false,"action":"ALLOW","allowReturnTraffic":true,
+	     "sourceZone":"iot","destinationZone":"internal","ipVersion":"IPV4","loggingEnabled":true}
+	  ]
+	}`
+	_, stderr, code := run(t, f, desired, nil, "sync")
+	if code == 0 {
+		t.Fatal("two policies with the same identity were accepted")
+	}
+	if !strings.Contains(stderr, "share the identity") {
+		t.Errorf("error does not explain the clash: %s", stderr)
+	}
+	for _, m := range f.recorded() {
+		if strings.HasPrefix(m.Path, collPolicies) {
+			t.Errorf("a policy was written despite the ambiguity: %+v", m)
+		}
+	}
+}
+
+// TestUnmodelledPolicyFieldsAreRefused is the safety rule that made issue #11
+// urgent: `diff` compares only modelled fields, so a policy carrying a filter
+// the schema does not know about looked like a clean no-op while `sync` would
+// PUT it back stripped — turning "block one app for fifteen devices in the
+// evening" into "block the whole LAN". Neither command may plan that write.
+func TestUnmodelledPolicyFieldsAreRefused(t *testing.T) {
+	f := newFakeConsole(t)
+	seedSite(f)
+	_, iot, _ := seedFirewall(f)
+
+	// A live policy with a filter cmd/unifi cannot express.
+	f.seed(collPolicies, originUser, map[string]any{
+		"name": "block-the-app", "enabled": true,
+		"action": map[string]any{"type": "BLOCK"},
+		"source": map[string]any{"zoneId": iot},
+		"destination": map[string]any{"zoneId": iot, "trafficFilter": map[string]any{
+			"type":            "WEB_DOMAIN",
+			"webDomainFilter": map[string]any{"domains": []any{"example.invalid"}},
+		}},
+		"ipProtocolScope": map[string]any{"ipVersion": "IPV4_AND_IPV6"},
+		"loggingEnabled":  false,
+	})
+
+	desired := `{
+	  "networks": [], "wifi": [], "dnsPolicies": [], "firewallZones": [],
+	  "firewallPolicies": [
+	    {"name":"block-the-app","enabled":true,"action":"BLOCK","allowReturnTraffic":true,
+	     "sourceZone":"iot","destinationZone":"iot","ipVersion":"IPV4_AND_IPV6","loggingEnabled":false}
+	  ]
+	}`
+
+	for _, cmd := range []string{"diff", "sync"} {
+		t.Run(cmd, func(t *testing.T) {
+			_, stderr, code := run(t, f, desired, nil, cmd)
+			if code != 1 {
+				t.Fatalf("%s exited %d; an unmodelled field must be a hard failure, not drift or a no-op", cmd, code)
+			}
+			if !strings.Contains(stderr, "does not model") || !strings.Contains(stderr, "webDomainFilter") {
+				t.Errorf("error does not name the field that would be lost: %s", stderr)
+			}
+		})
+	}
+	for _, m := range f.recorded() {
+		if strings.HasPrefix(m.Path, collPolicies) {
+			t.Errorf("a lossy write was issued: %+v", m)
+		}
+	}
+
+	// And `export` leaves it out rather than emitting a version that would
+	// become that same lossy PUT.
+	stdout, stderr, code := run(t, f, "", nil, "export")
+	if code != 0 {
+		t.Fatalf("export failed: %s", stderr)
+	}
+	if strings.Contains(stdout, "block-the-app") {
+		t.Errorf("export emitted a policy it cannot round-trip:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "block-the-app") {
+		t.Errorf("export skipped a policy without saying so: %s", stderr)
+	}
+}
+
+// TestExportRoundTripsEveryPolicy is the acceptance criterion from issue #11:
+// a console's full policy set — every filter kind, a schedule, duplicate names
+// — must export and diff back as a no-op.
+func TestExportRoundTripsEveryPolicy(t *testing.T) {
+	f := newFakeConsole(t)
+	seedSite(f)
+	internal, iot, gateway := seedFirewall(f)
+
+	f.seed(collPolicies, originSystem, map[string]any{
+		"name": "Allow mDNS", "enabled": true,
+		"action": map[string]any{"type": "ALLOW", "allowReturnTraffic": true},
+		"source": map[string]any{"zoneId": internal, "trafficFilter": map[string]any{
+			"type": "PORT",
+			"portFilter": map[string]any{"type": "PORTS", "matchOpposite": false,
+				"items": []any{map[string]any{"type": "PORT_NUMBER", "value": 5353}}},
+		}},
+		"destination": map[string]any{"zoneId": gateway, "trafficFilter": map[string]any{
+			"type": "IP_ADDRESS",
+			"ipAddressFilter": map[string]any{"type": "IP_ADDRESSES", "matchOpposite": false,
+				"items": []any{
+					map[string]any{"type": "IP_ADDRESS", "value": "224.0.0.251"},
+					map[string]any{"type": "SUBNET", "value": "fe80::/10"},
+				}},
+			"portFilter": map[string]any{"type": "PORTS", "matchOpposite": false,
+				"items": []any{map[string]any{"type": "PORT_NUMBER", "value": 5353}}},
+		}},
+		"ipProtocolScope": map[string]any{"ipVersion": "IPV4_AND_IPV6",
+			"protocolFilter": map[string]any{"type": "NAMED_PROTOCOL", "matchOpposite": false,
+				"protocol": map[string]any{"name": "UDP"}}},
+		"connectionStateFilter": []any{"RELATED", "ESTABLISHED"},
+		"loggingEnabled":        true,
+	})
+	f.seed(collPolicies, originUser, map[string]any{
+		"name": "curfew", "enabled": true,
+		"action": map[string]any{"type": "BLOCK"},
+		"source": map[string]any{"zoneId": iot, "trafficFilter": map[string]any{
+			"type":             "MAC_ADDRESS",
+			"macAddressFilter": map[string]any{"macAddresses": []any{"02:00:5e:10:00:01", "02:00:5e:10:00:02"}},
+		}},
+		"destination": map[string]any{"zoneId": gateway, "trafficFilter": map[string]any{
+			"type":              "APPLICATION",
+			"applicationFilter": map[string]any{"applicationIds": []any{262392, 262256}},
+		}},
+		"ipProtocolScope": map[string]any{"ipVersion": "IPV4_AND_IPV6"},
+		"loggingEnabled":  false,
+		"schedule": map[string]any{"mode": "CUSTOM",
+			"timeFilter":   map[string]any{"startTime": "23:00", "stopTime": "07:00"},
+			"repeatOnDays": []any{"MONDAY", "SUNDAY"},
+			"startDate":    "2026-03-14", "stopDate": "2026-03-21"},
+	})
+
+	exported, stderr, code := run(t, f, "", nil, "export")
+	if code != 0 {
+		t.Fatalf("export failed: %s", stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("export could not represent everything: %s", stderr)
+	}
+	var doc site
+	if err := json.Unmarshal([]byte(exported), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.FirewallPolicies) != 5 {
+		t.Fatalf("export returned %d policies, want 5:\n%s", len(doc.FirewallPolicies), exported)
+	}
+	// The MAC/application/schedule policy must survive with its detail intact.
+	var curfew *firewallPolicy
+	for i := range doc.FirewallPolicies {
+		if doc.FirewallPolicies[i].Name == "curfew" {
+			curfew = &doc.FirewallPolicies[i]
+		}
+	}
+	if curfew == nil {
+		t.Fatalf("export lost the scheduled policy:\n%s", exported)
+	}
+	if curfew.Source == nil || curfew.Source.MACAddressFilter == nil ||
+		len(curfew.Source.MACAddressFilter.MACAddresses) != 2 {
+		t.Errorf("export dropped the MAC filter: %+v", curfew.Source)
+	}
+	if curfew.Schedule == nil || curfew.Schedule.StopDate != "2026-03-21" {
+		t.Errorf("export dropped the schedule: %+v", curfew.Schedule)
+	}
+	if curfew.Order == nil {
+		t.Error("export gave a USER_DEFINED policy no order")
+	}
+
+	env := []string{"UNIFI_WIFI_EXAMPLE_MAIN=super-secret-passphrase"}
+	stdout, _, code := run(t, f, exported, env, "diff")
+	if code != 0 {
+		t.Fatalf("diff of exported state wanted exit 0, got %d:\n%s", code, stdout)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+		if line != "" && !strings.HasPrefix(line, "OK") && !strings.HasPrefix(line, "DRY RUN") {
+			t.Errorf("export→diff round trip is not a no-op: %q", line)
+		}
+	}
+	if muts := f.recorded(); len(muts) != 0 {
+		t.Errorf("export and diff mutated the console: %+v", muts)
+	}
+}
+
+// TestIdlessPolicyCannotBeWritten pins the firmware limitation from
+// docs/unifi-api-notes.md: UniFi Network 10.6 returns USER_DEFINED policies
+// without an id, so there is no URL to PUT or DELETE against. The tool has to
+// say so rather than guess.
+func TestIdlessPolicyCannotBeWritten(t *testing.T) {
+	f := newFakeConsole(t)
+	f.omitUserPolicyIDs = true
+	seedSite(f)
+	_, iot, _ := seedFirewall(f)
+	f.seed(collPolicies, originUser, map[string]any{
+		"name": "night-owls", "enabled": true,
+		"action":          map[string]any{"type": "BLOCK"},
+		"source":          map[string]any{"zoneId": iot},
+		"destination":     map[string]any{"zoneId": iot},
+		"ipProtocolScope": map[string]any{"ipVersion": "IPV4"},
+		"loggingEnabled":  false,
+	})
+
+	const desired = `{
+	  "networks": [], "wifi": [], "dnsPolicies": [], "firewallZones": [],
+	  "firewallPolicies": [
+	    {"name":"night-owls","enabled":%s,"action":"BLOCK","allowReturnTraffic":true,
+	     "sourceZone":"iot","destinationZone":"iot","ipVersion":"IPV4","loggingEnabled":false}
+	  ]
+	}`
+
+	// Unchanged: an id-less policy still reads cleanly.
+	if stdout, stderr, code := run(t, f, fmt.Sprintf(desired, "true"), nil, "diff"); code != 0 {
+		t.Fatalf("an unchanged id-less policy must still diff clean (exit %d)\n%s\n%s", code, stdout, stderr)
+	}
+
+	// Changed: the update is impossible and must be reported, not skipped.
+	_, stderr, code := run(t, f, fmt.Sprintf(desired, "false"), nil, "sync")
+	if code == 0 {
+		t.Fatal("an update to an id-less policy was silently accepted")
+	}
+	if !strings.Contains(stderr, "without an id") {
+		t.Errorf("error does not explain the missing id: %s", stderr)
+	}
+
+	// So is deleting one.
+	empty := `{"networks":[],"wifi":[],"dnsPolicies":[],"firewallZones":[],
+	  "firewallPolicies":[{"name":"other","enabled":true,"action":"BLOCK","allowReturnTraffic":true,
+	    "sourceZone":"iot","destinationZone":"internal","ipVersion":"IPV4","loggingEnabled":false}]}`
+	if _, stderr, code := run(t, f, empty, nil, "sync", "--prune"); code == 0 || !strings.Contains(stderr, "without an id") {
+		t.Errorf("deleting an id-less policy exited %d: %s", code, stderr)
+	}
+}
+
+// TestZoneWithUnnameableMembersIsRefused covers the console's `External` zone,
+// whose members are WAN interfaces that GET /networks does not return. Writing
+// it back would empty it, so export leaves it out and sync refuses to change it.
+func TestZoneWithUnnameableMembersIsRefused(t *testing.T) {
+	f := newFakeConsole(t)
+	seedSite(f)
+	f.seed(collZones, originSystem, map[string]any{
+		"name": "External", "networkIds": []any{"wan-1", "wan-2"},
+	})
+
+	stdout, stderr, code := run(t, f, "", nil, "export")
+	if code != 0 {
+		t.Fatalf("export failed: %s", stderr)
+	}
+	var doc site
+	if err := json.Unmarshal([]byte(stdout), &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, z := range doc.FirewallZones {
+		if z.Name == "External" {
+			t.Errorf(`export emitted External as %v; a zone whose members cannot be named must be skipped`, z.Networks)
+		}
+	}
+	if !strings.Contains(stderr, "External") {
+		t.Errorf("export skipped a zone without saying so: %s", stderr)
+	}
+
+	desired := `{"networks":[],"wifi":[],"dnsPolicies":[],"firewallPolicies":[],
+	  "firewallZones":[{"name":"External","networks":[]}]}`
+	_, stderr, code = run(t, f, desired, nil, "sync")
+	if code == 0 {
+		t.Fatal("declaring External with no members was accepted; that PUT would empty the zone")
+	}
+	if !strings.Contains(stderr, "WAN") {
+		t.Errorf("error does not explain why: %s", stderr)
+	}
+}
+
+// TestFirewallPolicyOrdering exercises ordering end to end. The console orders
+// policies per zone pair, so the write has to carry the pair and must only
+// move that pair's policies.
 func TestFirewallPolicyOrdering(t *testing.T) {
 	f := newFakeConsole(t)
 	seedSite(f)
@@ -694,38 +1056,38 @@ func TestFirewallPolicyOrdering(t *testing.T) {
 	    {"name":"alpha-runs-last","enabled":true,"action":"BLOCK","allowReturnTraffic":true,
 	     "sourceZone":"iot","destinationZone":"internal","ipVersion":"IPV4",
 	     "loggingEnabled":false,"order":30},
-	    {"name":"zulu-runs-first","enabled":true,"action":"ALLOW","allowReturnTraffic":true,
-	     "sourceZone":"internal","destinationZone":"iot","ipVersion":"IPV4",
-	     "protocol":"tcp","destinationPorts":["443","8000-8100"],
+	    {"name":"zulu-runs-first","enabled":true,"action":"BLOCK","allowReturnTraffic":true,
+	     "sourceZone":"iot","destinationZone":"internal","ipVersion":"IPV4",
+	     "protocol":"TCP","destination":{"type":"PORT","portFilter":{"items":["443","8000-8100"],"matchOpposite":false}},
 	     "loggingEnabled":false,"order":10},
 	    {"name":"mike-runs-second","enabled":true,"action":"REJECT","allowReturnTraffic":false,
-	     "sourceZone":"iot","destinationZone":"iot","ipVersion":"IPV4",
+	     "sourceZone":"iot","destinationZone":"internal","ipVersion":"IPV4",
 	     "loggingEnabled":true,"order":20}
 	  ]
 	}`
 
 	mustRun(t, f, desired, nil, "sync")
 
-	// The ordering call must list the policies in `order` sequence — which here
-	// is neither the order they appear in the document nor alphabetical, so
-	// sorting on the wrong key is visible.
-	var ordering []string
+	if want := []string{"zulu-runs-first", "mike-runs-second", "alpha-runs-last"}; !equalStrings(f.policyOrder(), want) {
+		t.Errorf("policies ordered %v, want %v", f.policyOrder(), want)
+	}
+	// The ordering call must name the zone pair; without the query parameters
+	// a live console answers 400.
+	var orderings int
 	for _, m := range f.recorded() {
 		if m.Path == collPolicies+"/ordering" {
-			ids, _ := m.Body["orderedFirewallPolicyIds"].(map[string]any)
-			before, _ := ids["beforeSystemDefined"].([]any)
-			for _, v := range before {
-				ordering = append(ordering, f.get(collPolicies, v.(string))["name"].(string))
-			}
+			orderings++
 		}
 	}
-	if want := []string{"zulu-runs-first", "mike-runs-second", "alpha-runs-last"}; !equalStrings(ordering, want) {
-		t.Errorf("policies ordered %v, want %v", ordering, want)
+	if orderings != 1 {
+		t.Errorf("want one ordering call, got %d", orderings)
 	}
 
 	// "443" and "8000-8100" must reach the API as the two different item
-	// shapes it distinguishes, not as two of the same.
-	policy := f.objectNamed(collPolicies, "zulu-runs-first")
+	// shapes it distinguishes, both under `value`.
+	iotZone := f.objectNamed(collZones, "iot")["id"].(string)
+	internalZone := f.objectNamed(collZones, "internal")["id"].(string)
+	policy := f.policyNamed("zulu-runs-first", iotZone, internalZone)
 	dst, _ := policy["destination"].(map[string]any)
 	tf, _ := dst["trafficFilter"].(map[string]any)
 	pf, _ := tf["portFilter"].(map[string]any)
@@ -734,11 +1096,11 @@ func TestFirewallPolicyOrdering(t *testing.T) {
 		t.Fatalf("destination ports rendered as %v", pf)
 	}
 	single, _ := items[0].(map[string]any)
-	if single["type"] != "PORT_NUMBER" || single["port"] != float64(443) {
+	if single["type"] != "PORT_NUMBER" || single["value"] != float64(443) {
 		t.Errorf("port 443 rendered as %v", single)
 	}
 	ranged, _ := items[1].(map[string]any)
-	if ranged["type"] != "PORT_NUMBER_RANGE" || ranged["startPort"] != float64(8000) || ranged["endPort"] != float64(8100) {
+	if ranged["type"] != "PORT_NUMBER_RANGE" || ranged["value"] != "8000-8100" {
 		t.Errorf("port range 8000-8100 rendered as %v", ranged)
 	}
 
@@ -766,7 +1128,8 @@ func TestInvalidPortIsRejected(t *testing.T) {
 			  "firewallPolicies": [
 			    {"name":"p","enabled":true,"action":"ALLOW","allowReturnTraffic":true,
 			     "sourceZone":"internal","destinationZone":"internal","ipVersion":"IPV4",
-			     "loggingEnabled":false,"order":10,"destinationPorts":["` + port + `"]}
+			     "loggingEnabled":false,"order":10,
+			     "destination":{"type":"PORT","portFilter":{"items":["` + port + `"],"matchOpposite":false}}}
 			  ]
 			}`
 			stdout, stderr, code := run(t, f, desired, nil, "sync")

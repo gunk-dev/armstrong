@@ -52,14 +52,20 @@ func newExportCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "export",
 		Short: "Print the live site as #Site-shaped JSON",
-		Long:  "Dumps networks, firewall zones, wifi, firewall policies and DNS policies as a\n#Site-shaped JSON document, so a consumer repo can bootstrap its instance file\nfrom real state. WiFi passphrases are never included.",
-		Args:  cobra.NoArgs,
+		Long: "Dumps networks, firewall zones, wifi, firewall policies and DNS policies as a\n" +
+			"#Site-shaped JSON document, so a consumer repo can bootstrap its instance file\n" +
+			"from real state. WiFi passphrases are never included.\n\n" +
+			"Objects the schema cannot express faithfully — a firewall zone whose members are\n" +
+			"WAN interfaces, a firewall policy using a field #FirewallPolicy does not model —\n" +
+			"are left out and named on stderr, so that feeding the output back into `diff`\n" +
+			"stays a no-op instead of planning a lossy write.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			c, siteID, err := connect()
 			if err != nil {
 				return err
 			}
-			return exportSite(c, siteID, cmd.OutOrStdout())
+			return exportSite(c, siteID, cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},
 	}
 }

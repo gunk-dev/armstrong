@@ -96,10 +96,10 @@ func TestPortItems(t *testing.T) {
 	if len(items) != 2 {
 		t.Fatalf("got %d items, want 2", len(items))
 	}
-	if items[0]["type"] != "PORT_NUMBER" || items[0]["port"] != 443 {
+	if items[0]["type"] != "PORT_NUMBER" || items[0]["value"] != 443 {
 		t.Errorf("single port rendered as %v", items[0])
 	}
-	if items[1]["type"] != "PORT_NUMBER_RANGE" || items[1]["startPort"] != 8000 || items[1]["endPort"] != 8100 {
+	if items[1]["type"] != "PORT_NUMBER_RANGE" || items[1]["value"] != "8000-8100" {
 		t.Errorf("port range rendered as %v", items[1])
 	}
 }
