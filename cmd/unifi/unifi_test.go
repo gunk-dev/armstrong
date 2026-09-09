@@ -789,6 +789,55 @@ func TestDuplicatePolicyIdentityIsRejected(t *testing.T) {
 	}
 }
 
+// TestAmbiguousLivePolicyBlocksOnlyItself: an operator can hand-make two
+// console policies that share the identity triple. Those two cannot be
+// reconciled, but every other policy still can — an unrelated clash must not
+// take the whole site down.
+func TestAmbiguousLivePolicyBlocksOnlyItself(t *testing.T) {
+	f := newFakeConsole(t)
+	seedSite(f)
+	_, iot, _ := seedFirewall(f)
+	for range 2 {
+		f.seed(collPolicies, originUser, map[string]any{
+			"name": "hand-made", "enabled": true,
+			"action":          map[string]any{"type": "BLOCK"},
+			"source":          map[string]any{"zoneId": iot},
+			"destination":     map[string]any{"zoneId": iot},
+			"ipProtocolScope": map[string]any{"ipVersion": "IPV4"},
+			"loggingEnabled":  false,
+		})
+	}
+
+	// Declaring an unrelated policy is unaffected.
+	unrelated := `{
+	  "networks": [], "wifi": [], "dnsPolicies": [], "firewallZones": [],
+	  "firewallPolicies": [
+	    {"name":"Allow All Traffic","enabled":true,"action":"ALLOW","allowReturnTraffic":true,
+	     "sourceZone":"iot","destinationZone":"iot","ipVersion":"IPV4_AND_IPV6","loggingEnabled":false}
+	  ]
+	}`
+	if stdout, stderr, code := run(t, f, unrelated, nil, "diff"); code != 0 {
+		t.Errorf("an unrelated clash blocked the whole plan (exit %d)\n%s\n%s", code, stdout, stderr)
+	}
+
+	// Declaring the ambiguous one is refused.
+	desired := `{
+	  "networks": [], "wifi": [], "dnsPolicies": [], "firewallZones": [],
+	  "firewallPolicies": [
+	    {"name":"hand-made","enabled":true,"action":"BLOCK","allowReturnTraffic":true,
+	     "sourceZone":"iot","destinationZone":"iot","ipVersion":"IPV4","loggingEnabled":false}
+	  ]
+	}`
+	if _, stderr, code := run(t, f, desired, nil, "sync"); code == 0 || !strings.Contains(stderr, "cannot tell them apart") {
+		t.Errorf("reconciling an ambiguous policy exited %d: %s", code, stderr)
+	}
+
+	// And so is pruning it: --prune must not pick one of the two to delete.
+	if _, stderr, code := run(t, f, unrelated, nil, "sync", "--prune"); code == 0 || !strings.Contains(stderr, "cannot tell them apart") {
+		t.Errorf("prune with an ambiguous policy exited %d: %s", code, stderr)
+	}
+}
+
 // TestUnmodelledPolicyFieldsAreRefused is the safety rule that made issue #11
 // urgent: `diff` compares only modelled fields, so a policy carrying a filter
 // the schema does not know about looked like a clean no-op while `sync` would

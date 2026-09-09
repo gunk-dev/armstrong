@@ -340,18 +340,22 @@ func (r *reconciler) syncFirewallPolicies() error {
 		netNames[id] = name
 	}
 
+	if err := checkDuplicatePolicyKeys(r.want.FirewallPolicies); err != nil {
+		return err
+	}
+
+	// A console *should* never hold two policies with the same identity — the
+	// triple was unique across all 67 of a stock 10.6 install — but an operator
+	// can hand-make a pair. Record the clash instead of failing outright, so
+	// that it only blocks the policies it actually makes ambiguous.
 	byKey := map[string]actual[apiFirewallPolicy]{}
+	ambiguous := map[string]bool{}
 	for _, a := range existing {
 		k := a.Spec.spec(zoneNames, netNames).key()
 		if _, dup := byKey[k]; dup {
-			return fmt.Errorf("the console holds two firewall policies with the same identity (%s); "+
-				"cmd/unifi cannot tell them apart — rename one in the console first", k)
+			ambiguous[k] = true
 		}
 		byKey[k] = a
-	}
-
-	if err := checkDuplicatePolicyKeys(r.want.FirewallPolicies); err != nil {
-		return err
 	}
 
 	seen := map[string]bool{}
@@ -366,6 +370,9 @@ func (r *reconciler) syncFirewallPolicies() error {
 			return fmt.Errorf("firewall policy %q: %w", want.key(), err)
 		}
 
+		if ambiguous[want.key()] {
+			return errAmbiguousPolicy(want.key())
+		}
 		got, ok := byKey[want.key()]
 		if !ok {
 			r.logf("CREATE", "firewall policy", want.key(), "%s", want.Action)
@@ -411,7 +418,7 @@ func (r *reconciler) syncFirewallPolicies() error {
 		}
 	}
 
-	if err := r.prunePolicies(base, existing, seen, zoneNames, netNames); err != nil {
+	if err := r.prunePolicies(base, existing, seen, ambiguous, zoneNames, netNames); err != nil {
 		return err
 	}
 
@@ -439,6 +446,11 @@ func errNoPolicyID(key, verb string) error {
 		"cmd/unifi owns it — see docs/unifi-api-notes.md", verb, key)
 }
 
+func errAmbiguousPolicy(key string) error {
+	return fmt.Errorf("the console holds two firewall policies with the identity (%s); cmd/unifi "+
+		"cannot tell them apart — rename one in the console first", key)
+}
+
 func checkDuplicatePolicyKeys(policies []firewallPolicy) error {
 	seen := map[string]bool{}
 	for _, p := range policies {
@@ -454,7 +466,7 @@ func checkDuplicatePolicyKeys(policies []firewallPolicy) error {
 // prunePolicies deletes undeclared USER_DEFINED policies. It cannot use
 // pruneList: policies are keyed by a triple rather than by name, and an
 // id-less policy has to fail loudly rather than be skipped.
-func (r *reconciler) prunePolicies(base string, existing []actual[apiFirewallPolicy], seen map[string]bool, zoneNames, netNames nameLookup) error {
+func (r *reconciler) prunePolicies(base string, existing []actual[apiFirewallPolicy], seen, ambiguous map[string]bool, zoneNames, netNames nameLookup) error {
 	if !r.prune || len(r.want.FirewallPolicies) == 0 {
 		return nil
 	}
@@ -462,6 +474,9 @@ func (r *reconciler) prunePolicies(base string, existing []actual[apiFirewallPol
 		key := a.Spec.spec(zoneNames, netNames).key()
 		if seen[key] || a.Origin == originSystem {
 			continue
+		}
+		if ambiguous[key] {
+			return errAmbiguousPolicy(key)
 		}
 		if a.ID == "" {
 			return errNoPolicyID(key, "delete")
