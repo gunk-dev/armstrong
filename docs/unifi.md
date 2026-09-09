@@ -104,10 +104,13 @@ will not remove it, so a mistake in the instance file cannot delete the LAN out
 from under you.
 
 **`--prune` only acts on resource types the instance file declares.** If
-`wifi` is an empty list, no SSID is deleted. This is deliberate: an instance
-file that simply forgot a section would otherwise wipe every object of that
-type on the first sync. To actually delete everything of one kind, remove the
-entries individually rather than dropping the list.
+`wifi` is missing from the input entirely, no SSID is deleted — that is what
+protects an instance file that simply forgot a section from wiping every
+object of that type on the first sync. But a section the file *does* declare,
+even as an empty list (`"wifi": []`), is fair game: every `USER_DEFINED`
+object of that type is deleted. `cue export` always emits every key, so a
+hand-maintained instance file is the only place this distinction matters —
+omit a key to leave a resource type alone, or set it to `[]` to clear it out.
 
 **Secrets stay out of git.** `#WiFiSecurity` carries `passphraseEnv` — the
 *name* of an environment variable — never the passphrase. `unifi export`
