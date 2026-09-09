@@ -119,7 +119,7 @@ func (r *reconciler) syncNetworks() error {
 		}
 	}
 
-	return r.pruneList("network", base, len(r.want.Networks) > 0, func(yield func(id, name, origin string)) {
+	return r.pruneList("network", base, r.want.Networks != nil, func(yield func(id, name, origin string)) {
 		for _, a := range existing {
 			if !seen[a.Spec.Name] {
 				yield(a.ID, a.Spec.Name, a.Origin)
@@ -209,7 +209,7 @@ func (r *reconciler) syncZones() error {
 		}
 	}
 
-	return r.pruneList("firewall zone", base, len(r.want.FirewallZones) > 0, func(yield func(id, name, origin string)) {
+	return r.pruneList("firewall zone", base, r.want.FirewallZones != nil, func(yield func(id, name, origin string)) {
 		for _, a := range existing {
 			if !seen[a.Spec.Name] {
 				yield(a.ID, a.Spec.Name, a.Origin)
@@ -272,7 +272,7 @@ func (r *reconciler) syncWiFi() error {
 		}
 	}
 
-	return r.pruneList("wifi", base, len(r.want.WiFi) > 0, func(yield func(id, name, origin string)) {
+	return r.pruneList("wifi", base, r.want.WiFi != nil, func(yield func(id, name, origin string)) {
 		for _, a := range existing {
 			if !seen[a.Spec.Name] {
 				yield(a.ID, a.Spec.Name, a.Origin)
@@ -467,7 +467,7 @@ func checkDuplicatePolicyKeys(policies []firewallPolicy) error {
 // pruneList: policies are keyed by a triple rather than by name, and an
 // id-less policy has to fail loudly rather than be skipped.
 func (r *reconciler) prunePolicies(base string, existing []actual[apiFirewallPolicy], seen, ambiguous map[string]bool, zoneNames, netNames nameLookup) error {
-	if !r.prune || len(r.want.FirewallPolicies) == 0 {
+	if !r.prune || r.want.FirewallPolicies == nil {
 		return nil
 	}
 	for _, a := range existing {
@@ -654,7 +654,7 @@ func (r *reconciler) syncDNSPolicies() error {
 		}
 	}
 
-	return r.pruneList("dns policy", base, len(r.want.DNSPolicies) > 0, func(yield func(id, name, origin string)) {
+	return r.pruneList("dns policy", base, r.want.DNSPolicies != nil, func(yield func(id, name, origin string)) {
 		for _, a := range existing {
 			if !seen[a.Spec.key()] {
 				yield(a.ID, a.Spec.key(), a.Origin)
@@ -679,8 +679,15 @@ func normalizeDNSPolicy(d dnsPolicy) dnsPolicy {
 //
 // Two safety rules apply. SYSTEM_DEFINED objects are never deleted, prune or
 // not — they are the console's own. And nothing is deleted for a resource type
-// the instance file leaves empty (declared is false): an instance file that
-// simply forgot a list would otherwise wipe every object of that type.
+// absent from the instance file (declared is false): an instance file that
+// simply forgot a list must not wipe every object of that type. A section the
+// instance file declares but leaves empty (e.g. "dnsPolicies": []) is
+// different from an absent one — declared is true for it, so every
+// USER_DEFINED object of that type is pruned. Callers signal "declared" with
+// want.Section != nil rather than len(want.Section) > 0: encoding/json only
+// allocates a slice when the key is present in the input, so a nil slice
+// means the key was missing and a non-nil-but-empty slice means it was there
+// as [].
 func (r *reconciler) pruneList(kind, base string, declared bool, each func(func(id, name, origin string))) error {
 	var err error
 	each(func(id, name, origin string) {

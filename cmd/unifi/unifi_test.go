@@ -296,37 +296,99 @@ func TestPruneSkipsSystemDefined(t *testing.T) {
 	if got, want := f.names(collWiFi), []string{"example-main"}; !equalStrings(got, want) {
 		t.Errorf("wifi after prune = %v, want %v", got, want)
 	}
-	// dnsPolicies is empty in the input, so the undeclared record is left alone.
-	if f.objectNamed(collDNS, "") == nil && len(f.names(collDNS)) != 0 {
-		t.Error("unexpected dns state")
+	// dnsPolicies is declared empty in the input, so the USER_DEFINED record
+	// seeded by seedSite is pruned.
+	if got := f.coll[collDNS].list(); len(got) != 0 {
+		t.Errorf("dns policies after prune = %v, want none (declared-empty section must prune)", got)
+	}
+}
+
+// TestPruneLeavesAbsentTypesAlone guards the "absent" half of the prune rule:
+// an instance file that simply omits a resource type must not wipe it, even
+// with --prune. This is different from declaring the section an empty list,
+// which does prune — see TestPruneEmptySectionDeletesUserDefined.
+func TestPruneLeavesAbsentTypesAlone(t *testing.T) {
+	f := newFakeConsole(t)
+	seedSite(f)
+
+	// No keys at all — as opposed to every key present and empty.
+	mustRun(t, f, `{}`, nil, "sync", "--prune")
+
+	if got, want := f.names(collNetworks), []string{"Default", "IoT"}; !equalStrings(got, want) {
+		t.Errorf("networks = %v, want %v; an absent section must not prune", got, want)
+	}
+	if got, want := f.names(collWiFi), []string{"example-main"}; !equalStrings(got, want) {
+		t.Errorf("wifi = %v, want %v; an absent section must not prune", got, want)
+	}
+	if got := f.coll[collDNS].list(); len(got) != 1 {
+		t.Errorf("dns policies = %v, want the one seeded record; an absent section must not prune", got)
 	}
 	for _, m := range f.recorded() {
-		if m.Method == "DELETE" && strings.HasPrefix(m.Path, collDNS) {
-			t.Errorf("pruned a dns policy even though the input declared none: %+v", m)
+		if m.Method == "DELETE" {
+			t.Errorf("absent input deleted something: %+v", m)
 		}
 	}
 }
 
-// TestPruneLeavesUndeclaredTypesAlone guards the second prune rule: an
-// instance file that simply omits a resource type must not wipe it.
-func TestPruneLeavesUndeclaredTypesAlone(t *testing.T) {
+// TestPruneEmptySectionDeletesUserDefined is the fix for #15: a section the
+// instance file declares but leaves empty must prune every USER_DEFINED
+// object of that type, the same as if each had been removed individually.
+// Before the fix, --prune was gated on len(want) > 0, so a declared-empty
+// section behaved exactly like an absent one and nothing was ever pruned to
+// zero.
+func TestPruneEmptySectionDeletesUserDefined(t *testing.T) {
 	f := newFakeConsole(t)
 	seedSite(f)
 
-	// Every list empty — as an instance file that forgot them would export.
-	empty := `{"networks":[],"firewallZones":[],"wifi":[],"firewallPolicies":[],"dnsPolicies":[]}`
-	mustRun(t, f, empty, nil, "sync", "--prune")
+	// Every section other than dnsPolicies matches the console exactly, so
+	// only the DNS record is at stake.
+	desired := `{
+	  "networks": [
+	    {"name":"Default","management":"GATEWAY","enabled":true,"vlanId":1,
+	     "isolationEnabled":false,"internetAccessEnabled":true,
+	     "cellularBackupEnabled":false,"mdnsForwardingEnabled":false,
+	     "ipv4":{"hostIpAddress":"192.0.2.1","prefixLength":24,"autoScaleEnabled":false,
+	       "dhcp":{"mode":"SERVER","rangeStart":"192.0.2.100","rangeStop":"192.0.2.199","leaseTimeSeconds":86400}}},
+	    {"name":"IoT","management":"GATEWAY","enabled":true,"vlanId":20,
+	     "isolationEnabled":true,"internetAccessEnabled":true,
+	     "cellularBackupEnabled":false,"mdnsForwardingEnabled":false,
+	     "ipv4":{"hostIpAddress":"198.51.100.1","prefixLength":24,"autoScaleEnabled":false,
+	       "dhcp":{"mode":"SERVER","rangeStart":"198.51.100.100","rangeStop":"198.51.100.199","leaseTimeSeconds":3600}}}
+	  ],
+	  "firewallZones": [],
+	  "wifi": [{"name":"example-main","enabled":true,"network":"NATIVE",
+	    "security":{"type":"WPA2_PERSONAL","passphraseEnv":"UNIFI_WIFI_MAIN"},
+	    "bands":[2.4,5],"clientIsolationEnabled":false,"hideName":false,
+	    "multicastToUnicastConversionEnabled":true,"uapsdEnabled":false}],
+	  "firewallPolicies": [],
+	  "dnsPolicies": []
+	}`
 
+	stdout, _, code := run(t, f, desired, []string{"UNIFI_WIFI_MAIN=super-secret-passphrase"}, "sync", "--prune", "--dry-run")
+	if code != 0 {
+		t.Fatalf("dry run sync exited %d:\n%s", code, stdout)
+	}
+	if !strings.Contains(stdout, "DELETE") {
+		t.Errorf("dry run did not plan the dns policy deletion:\n%s", stdout)
+	}
+	if muts := f.recorded(); len(muts) != 0 {
+		t.Fatalf("--dry-run wrote to the console: %+v", muts)
+	}
+	if got := f.coll[collDNS].list(); len(got) != 1 {
+		t.Fatalf("dry run deleted the dns policy for real: %v", got)
+	}
+
+	mustRun(t, f, desired, []string{"UNIFI_WIFI_MAIN=super-secret-passphrase"}, "sync", "--prune")
+
+	if got := f.coll[collDNS].list(); len(got) != 0 {
+		t.Errorf("dns policies after prune = %v, want none: declaring dnsPolicies empty must prune every USER_DEFINED record", got)
+	}
+	// Sections declared non-empty and otherwise unaffected are untouched.
 	if got, want := f.names(collNetworks), []string{"Default", "IoT"}; !equalStrings(got, want) {
-		t.Errorf("networks = %v, want %v; an empty list must not prune", got, want)
+		t.Errorf("networks after prune = %v, want %v", got, want)
 	}
 	if got, want := f.names(collWiFi), []string{"example-main"}; !equalStrings(got, want) {
-		t.Errorf("wifi = %v, want %v; an empty list must not prune", got, want)
-	}
-	for _, m := range f.recorded() {
-		if m.Method == "DELETE" {
-			t.Errorf("empty input deleted something: %+v", m)
-		}
+		t.Errorf("wifi after prune = %v, want %v", got, want)
 	}
 }
 

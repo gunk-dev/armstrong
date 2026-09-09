@@ -105,7 +105,7 @@ func newSyncCmd() *cobra.Command {
 			return err
 		},
 	}
-	cmd.Flags().BoolVar(&prune, "prune", false, "Delete USER_DEFINED objects absent from the input. SYSTEM_DEFINED objects are never deleted, and resource types the input leaves empty are never pruned")
+	cmd.Flags().BoolVar(&prune, "prune", false, "Delete USER_DEFINED objects not declared in the input. SYSTEM_DEFINED objects are never deleted, and a resource type the input omits entirely is never pruned — but one it declares empty (e.g. \"dnsPolicies\": []) has every USER_DEFINED object of that type deleted")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Print the planned changes without calling the API")
 	return cmd
 }
