@@ -3,7 +3,9 @@ package main
 import (
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"reflect"
 	"slices"
@@ -154,6 +156,11 @@ func (r *reconciler) syncZones() error {
 		return nil
 	}
 
+	netNames := nameLookup{}
+	for name, id := range r.networkIDs {
+		netNames[id] = name
+	}
+
 	byName := map[string]actual[apiZone]{}
 	for _, a := range existing {
 		byName[a.Spec.Name] = a
@@ -183,6 +190,18 @@ func (r *reconciler) syncZones() error {
 		if sameStringSet(got.Spec.NetworkIDs, ids) {
 			r.logf("OK", "firewall zone", want.Name, "")
 			continue
+		}
+		// A zone whose members GET /networks does not return (the console's
+		// `External` zone lists WAN interfaces) cannot be written back: the
+		// PUT would carry only the members the tool could name.
+		if _, ok := zoneNetworkNames(got.Spec, netNames); !ok {
+			return fmt.Errorf("firewall zone %q has member networks that GET /networks does not "+
+				"return (WAN interfaces); updating it would drop them. Remove it from the "+
+				"instance file — policies can reference it by name without declaring it", want.Name)
+		}
+		if !got.Configurable {
+			return fmt.Errorf("firewall zone %q is reported as not configurable by the console; "+
+				"it cannot be changed", want.Name)
 		}
 		r.logf("UPDATE", "firewall zone", want.Name, "member networks changed")
 		if err := r.mutate(http.MethodPut, base+"/"+got.ID, body, nil); err != nil {
@@ -312,129 +331,293 @@ func (r *reconciler) syncFirewallPolicies() error {
 		return nil
 	}
 
-	byName := map[string]actual[apiFirewallPolicy]{}
-	for _, a := range existing {
-		byName[a.Spec.Name] = a
+	zoneNames := nameLookup{}
+	for name, id := range r.zoneIDs {
+		zoneNames[id] = name
+	}
+	netNames := nameLookup{}
+	for name, id := range r.networkIDs {
+		netNames[id] = name
 	}
 
-	// Desired policies run in `order` sequence, ahead of the system-defined ones.
-	wanted := append([]firewallPolicy(nil), r.want.FirewallPolicies...)
-	sort.SliceStable(wanted, func(i, j int) bool { return wanted[i].Order < wanted[j].Order })
-
-	seen := map[string]bool{}
-	base := "/sites/" + r.siteID + "/firewall/policies"
-	var ordered []string
-	for _, want := range wanted {
-		seen[want.Name] = true
-		srcZone, ok := r.zoneIDs[want.SourceZone]
-		if !ok {
-			return fmt.Errorf("firewall policy %q references unknown zone %q", want.Name, want.SourceZone)
-		}
-		dstZone, ok := r.zoneIDs[want.DestinationZone]
-		if !ok {
-			return fmt.Errorf("firewall policy %q references unknown zone %q", want.Name, want.DestinationZone)
-		}
-		srcNets, err := r.resolveNetworks(want.SourceNetworks)
-		if err != nil {
-			return fmt.Errorf("firewall policy %q: %w", want.Name, err)
-		}
-		dstNets, err := r.resolveNetworks(want.DestinationNetworks)
-		if err != nil {
-			return fmt.Errorf("firewall policy %q: %w", want.Name, err)
-		}
-		body, err := want.body(srcZone, dstZone, srcNets, dstNets)
-		if err != nil {
-			return fmt.Errorf("firewall policy %q: %w", want.Name, err)
-		}
-
-		got, ok := byName[want.Name]
-		if !ok {
-			r.logf("CREATE", "firewall policy", want.Name, "%s %s -> %s", want.Action, want.SourceZone, want.DestinationZone)
-			var created apiFirewallPolicy
-			if err := r.mutate(http.MethodPost, base, body, &created); err != nil {
-				return fmt.Errorf("create firewall policy %q: %w", want.Name, err)
-			}
-			ordered = append(ordered, newID(created.ID, r.dryRun))
-			continue
-		}
-		ordered = append(ordered, got.ID)
-		if policyMatches(got.Spec, want, srcZone, dstZone) {
-			r.logf("OK", "firewall policy", want.Name, "")
-			continue
-		}
-		r.logf("UPDATE", "firewall policy", want.Name, "%s %s -> %s", want.Action, want.SourceZone, want.DestinationZone)
-		if err := r.mutate(http.MethodPut, base+"/"+got.ID, body, nil); err != nil {
-			return fmt.Errorf("update firewall policy %q: %w", want.Name, err)
-		}
-	}
-
-	if err := r.pruneList("firewall policy", base, len(r.want.FirewallPolicies) > 0, func(yield func(id, name, origin string)) {
-		for _, a := range existing {
-			if !seen[a.Spec.Name] {
-				yield(a.ID, a.Spec.Name, a.Origin)
-			}
-		}
-	}); err != nil {
+	if err := checkDuplicatePolicyKeys(r.want.FirewallPolicies); err != nil {
 		return err
 	}
 
-	return r.reorderPolicies(base, ordered, existing)
-}
-
-// reorderPolicies puts the managed policies in `order` sequence ahead of the
-// console's system-defined ones. The list endpoint returns policies in
-// evaluation order, so the current sequence is compared first and the write is
-// skipped when it already matches — otherwise every sync would issue one.
-func (r *reconciler) reorderPolicies(base string, ordered []string, existing []actual[apiFirewallPolicy]) error {
-	if len(ordered) < 2 {
-		return nil
-	}
-	managed := map[string]bool{}
-	for _, id := range ordered {
-		managed[id] = true
-	}
-	var current []string
+	// A console *should* never hold two policies with the same identity — the
+	// triple was unique across all 67 of a stock 10.6 install — but an operator
+	// can hand-make a pair. Record the clash instead of failing outright, so
+	// that it only blocks the policies it actually makes ambiguous.
+	byKey := map[string]actual[apiFirewallPolicy]{}
+	ambiguous := map[string]bool{}
 	for _, a := range existing {
-		if managed[a.ID] {
-			current = append(current, a.ID)
+		k := a.Spec.spec(zoneNames, netNames).key()
+		if _, dup := byKey[k]; dup {
+			ambiguous[k] = true
+		}
+		byKey[k] = a
+	}
+
+	seen := map[string]bool{}
+	base := "/sites/" + r.siteID + "/firewall/policies"
+	// managed records, per zone pair, the policies this run is responsible for
+	// ordering.
+	managed := map[string][]managedPolicy{}
+	for _, want := range r.want.FirewallPolicies {
+		seen[want.key()] = true
+		body, err := want.body(r.resolveZone, r.resolveNetwork)
+		if err != nil {
+			return fmt.Errorf("firewall policy %q: %w", want.key(), err)
+		}
+
+		if ambiguous[want.key()] {
+			return errAmbiguousPolicy(want.key())
+		}
+		got, ok := byKey[want.key()]
+		if !ok {
+			r.logf("CREATE", "firewall policy", want.key(), "%s", want.Action)
+			var created apiFirewallPolicy
+			if err := r.mutate(http.MethodPost, base, body, &created); err != nil {
+				return fmt.Errorf("create firewall policy %q: %w", want.key(), err)
+			}
+			managed[want.zonePair()] = append(managed[want.zonePair()], managedPolicy{
+				key: want.key(), id: newID(created.ID, r.dryRun),
+				srcZone: want.SourceZone, dstZone: want.DestinationZone,
+				order: want.Order, system: false,
+			})
+			continue
+		}
+		managed[want.zonePair()] = append(managed[want.zonePair()], managedPolicy{
+			key: want.key(), id: got.ID,
+			srcZone: want.SourceZone, dstZone: want.DestinationZone,
+			order: want.Order, system: got.IsSystem,
+		})
+
+		// Never plan a write against a live object the schema cannot express:
+		// the PUT would drop whatever it failed to read.
+		if lossy := policyUnmodelledFields(got, zoneNames, netNames); len(lossy) > 0 {
+			return fmt.Errorf("firewall policy %q uses fields schema/unifi.cue does not model (%s); "+
+				"managing it would rewrite the policy without them. Remove it from the instance "+
+				"file, or extend #FirewallPolicy — see docs/unifi-api-notes.md",
+				want.key(), strings.Join(lossy, ", "))
+		}
+		if policyMatches(got.Spec.spec(zoneNames, netNames), want) {
+			r.logf("OK", "firewall policy", want.key(), "")
+			continue
+		}
+		if got.IsSystem && !got.Configurable {
+			return fmt.Errorf("firewall policy %q is SYSTEM_DEFINED and the console reports it as "+
+				"not configurable; it cannot be changed", want.key())
+		}
+		if got.ID == "" {
+			return errNoPolicyID(want.key(), "update")
+		}
+		r.logf("UPDATE", "firewall policy", want.key(), "%s", policyChanges(got.Spec.spec(zoneNames, netNames), want))
+		if err := r.mutate(http.MethodPut, base+"/"+got.ID, body, nil); err != nil {
+			return fmt.Errorf("update firewall policy %q: %w", want.key(), err)
 		}
 	}
-	if slices.Equal(current, ordered) {
-		return nil
+
+	if err := r.prunePolicies(base, existing, seen, ambiguous, zoneNames, netNames); err != nil {
+		return err
 	}
 
-	r.logf("ORDER", "firewall policy", fmt.Sprintf("%d policies", len(ordered)), "")
-	body := map[string]any{"orderedFirewallPolicyIds": map[string]any{
-		"beforeSystemDefined": ordered,
-		"afterSystemDefined":  []string{},
-	}}
-	if err := r.mutate(http.MethodPut, base+"/ordering", body, nil); err != nil {
-		return fmt.Errorf("reorder firewall policies: %w", err)
+	return r.reorderPolicies(base, managed, existing, zoneNames, netNames)
+}
+
+// managedPolicy is one policy this run owns, with everything the ordering step
+// needs to decide whether the console already agrees.
+type managedPolicy struct {
+	key     string
+	id      string
+	srcZone string
+	dstZone string
+	order   *int
+	system  bool
+}
+
+// errNoPolicyID explains the firmware limitation that makes a write
+// impossible: UniFi Network 10.6 omits `id` from USER_DEFINED firewall
+// policies, so there is no URL to address them at.
+func errNoPolicyID(key, verb string) error {
+	return fmt.Errorf("cannot %s firewall policy %q: the console returned it without an id, which "+
+		"UniFi Network 10.6 does for every USER_DEFINED policy, so there is no endpoint to "+
+		"address it at. Change it in the console UI, or delete and re-create it so that "+
+		"cmd/unifi owns it — see docs/unifi-api-notes.md", verb, key)
+}
+
+func errAmbiguousPolicy(key string) error {
+	return fmt.Errorf("the console holds two firewall policies with the identity (%s); cmd/unifi "+
+		"cannot tell them apart — rename one in the console first", key)
+}
+
+func checkDuplicatePolicyKeys(policies []firewallPolicy) error {
+	seen := map[string]bool{}
+	for _, p := range policies {
+		if seen[p.key()] {
+			return fmt.Errorf("two firewall policies share the identity (%s); a policy is keyed by "+
+				"source zone, destination zone and name, so these cannot both be reconciled", p.key())
+		}
+		seen[p.key()] = true
 	}
 	return nil
 }
 
-func policyMatches(got apiFirewallPolicy, want firewallPolicy, srcZone, dstZone string) bool {
-	if got.Enabled != want.Enabled || got.Action.Type != want.Action || got.LoggingEnabled != want.LoggingEnabled {
-		return false
+// prunePolicies deletes undeclared USER_DEFINED policies. It cannot use
+// pruneList: policies are keyed by a triple rather than by name, and an
+// id-less policy has to fail loudly rather than be skipped.
+func (r *reconciler) prunePolicies(base string, existing []actual[apiFirewallPolicy], seen, ambiguous map[string]bool, zoneNames, netNames nameLookup) error {
+	if !r.prune || len(r.want.FirewallPolicies) == 0 {
+		return nil
 	}
-	if want.Action == "ALLOW" && got.Action.AllowReturnTraffic != want.AllowReturnTraffic {
-		return false
+	for _, a := range existing {
+		key := a.Spec.spec(zoneNames, netNames).key()
+		if seen[key] || a.Origin == originSystem {
+			continue
+		}
+		if ambiguous[key] {
+			return errAmbiguousPolicy(key)
+		}
+		if a.ID == "" {
+			return errNoPolicyID(key, "delete")
+		}
+		r.logf("DELETE", "firewall policy", key, "")
+		if err := r.mutate(http.MethodDelete, base+"/"+a.ID, nil, nil); err != nil {
+			return fmt.Errorf("delete firewall policy %q: %w", key, err)
+		}
 	}
-	if got.Source.ZoneID != srcZone || got.Destination.ZoneID != dstZone {
-		return false
+	return nil
+}
+
+// reorderPolicies puts the managed USER_DEFINED policies of each zone pair in
+// `order` sequence. The console orders policies per zone pair, so the ordering
+// endpoint takes the pair as query parameters and there is no site-wide call.
+//
+// The current sequence is compared first and the write skipped when it already
+// matches — otherwise every sync would issue one. The comparison is by policy
+// key rather than by id, because a USER_DEFINED policy has no id to compare.
+func (r *reconciler) reorderPolicies(base string, managed map[string][]managedPolicy, existing []actual[apiFirewallPolicy], zoneNames, netNames nameLookup) error {
+	for _, pair := range sortedKeys(managed) {
+		policies := managed[pair]
+		// Only USER_DEFINED policies move; the console pins its own.
+		var movable []managedPolicy
+		ordered := false
+		for _, p := range policies {
+			if p.system {
+				continue
+			}
+			movable = append(movable, p)
+			ordered = ordered || p.order != nil
+		}
+		if !ordered || len(movable) < 2 {
+			continue
+		}
+		sort.SliceStable(movable, func(i, j int) bool {
+			return orderOf(movable[i].order) < orderOf(movable[j].order)
+		})
+
+		wantKeys := make([]string, 0, len(movable))
+		for _, p := range movable {
+			wantKeys = append(wantKeys, p.key)
+		}
+		inPair := map[string]bool{}
+		for _, k := range wantKeys {
+			inPair[k] = true
+		}
+		// existing is in evaluation order, so filtering it yields the console's
+		// current sequence for this pair.
+		var currentKeys []string
+		for _, a := range existing {
+			if k := a.Spec.spec(zoneNames, netNames).key(); inPair[k] {
+				currentKeys = append(currentKeys, k)
+			}
+		}
+		if slices.Equal(currentKeys, wantKeys) {
+			continue
+		}
+
+		ids := make([]string, 0, len(movable))
+		for _, p := range movable {
+			if p.id == "" {
+				return errNoPolicyID(p.key, "reorder")
+			}
+			ids = append(ids, p.id)
+		}
+		r.logf("ORDER", "firewall policy", pair, "%d policies", len(ids))
+
+		srcZone, err := r.resolveZone(movable[0].srcZone)
+		if err != nil {
+			return err
+		}
+		dstZone, err := r.resolveZone(movable[0].dstZone)
+		if err != nil {
+			return err
+		}
+		body := map[string]any{"orderedFirewallPolicyIds": map[string]any{
+			"beforeSystemDefined": ids,
+			"afterSystemDefined":  []string{},
+		}}
+		path := fmt.Sprintf("%s/ordering?sourceFirewallZoneId=%s&destinationFirewallZoneId=%s",
+			base, url.QueryEscape(srcZone), url.QueryEscape(dstZone))
+		if err := r.mutate(http.MethodPut, path, body, nil); err != nil {
+			return fmt.Errorf("reorder firewall policies %s: %w", pair, err)
+		}
 	}
-	if got.IPProtocolScope.IPVersion != want.IPVersion {
-		return false
+	return nil
+}
+
+// orderOf sorts unordered policies after ordered ones, keeping their relative
+// position among themselves.
+func orderOf(o *int) int {
+	if o == nil {
+		return math.MaxInt
 	}
-	gotProtocol := ""
-	if f := got.IPProtocolScope.ProtocolFilter; f != nil {
-		gotProtocol = f.Name
+	return *o
+}
+
+// policyMatches compares a live policy's projection against the desired one.
+// `order` is deliberately excluded: position is reconciled separately, by the
+// ordering endpoint.
+func policyMatches(got, want firewallPolicy) bool {
+	return reflect.DeepEqual(normalizePolicy(got), normalizePolicy(want))
+}
+
+// normalizePolicy drops the differences that are not differences: the position
+// (reconciled by the ordering endpoint), the order of a set-valued list, and
+// allowReturnTraffic on an action that has no reply traffic to allow — the API
+// neither stores nor returns it there, so the schema default must not read as
+// drift on every run.
+func normalizePolicy(p firewallPolicy) firewallPolicy {
+	p.Order = nil
+	p.ConnectionStates = sortedCopy(p.ConnectionStates)
+	if p.Action != "ALLOW" {
+		p.AllowReturnTraffic = false
 	}
-	if gotProtocol != want.Protocol {
-		return false
+	return p
+}
+
+// policyChanges names the parts of the policy that differ, for the plan output.
+func policyChanges(got, want firewallPolicy) string {
+	var fields []string
+	add := func(cond bool, field string) {
+		if cond {
+			fields = append(fields, field)
+		}
 	}
-	return sameStringSet(got.ConnectionStateFilter, want.ConnectionStates)
+	add(got.Enabled != want.Enabled, "enabled")
+	add(got.Description != want.Description, "description")
+	add(got.Action != want.Action || normalizePolicy(got).AllowReturnTraffic != normalizePolicy(want).AllowReturnTraffic, "action")
+	add(!reflect.DeepEqual(got.Source, want.Source), "source")
+	add(!reflect.DeepEqual(got.Destination, want.Destination), "destination")
+	add(got.IPVersion != want.IPVersion, "ipVersion")
+	add(got.Protocol != want.Protocol || got.ProtocolMatchOpposite != want.ProtocolMatchOpposite, "protocol")
+	add(!sameStringSet(got.ConnectionStates, want.ConnectionStates), "connectionStates")
+	add(got.LoggingEnabled != want.LoggingEnabled, "loggingEnabled")
+	add(!reflect.DeepEqual(got.Schedule, want.Schedule), "schedule")
+	if len(fields) == 0 {
+		return "changed"
+	}
+	return strings.Join(fields, ", ")
 }
 
 // -------------------------------------------------------------- dns policies
@@ -513,6 +696,43 @@ func (r *reconciler) pruneList(kind, base string, declared bool, each func(func(
 		}
 	})
 	return err
+}
+
+// resolveZone turns a zone name into the id the API wants. Zones are resolved
+// against the live console, so a policy may reference a zone the instance file
+// does not declare.
+func (r *reconciler) resolveZone(name string) (string, error) {
+	id, ok := r.zoneIDs[name]
+	if !ok {
+		return "", fmt.Errorf("unknown firewall zone %q", name)
+	}
+	return id, nil
+}
+
+func (r *reconciler) resolveNetwork(name string) (string, error) {
+	id, ok := r.networkIDs[name]
+	if !ok {
+		return "", fmt.Errorf("unknown network %q", name)
+	}
+	return id, nil
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedCopy(s []string) []string {
+	if len(s) == 0 {
+		return nil
+	}
+	out := append([]string(nil), s...)
+	sort.Strings(out)
+	return out
 }
 
 func (r *reconciler) resolveNetworks(names []string) ([]string, error) {

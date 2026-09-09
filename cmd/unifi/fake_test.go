@@ -36,6 +36,13 @@ type fakeConsole struct {
 	// body back, the way a validating API does — so the response contains the
 	// passphrase that was just sent.
 	wifiPutFault bool
+	// omitUserPolicyIDs reproduces what UniFi Network 10.6.101 actually does:
+	// it returns every USER_DEFINED firewall policy without an `id`, leaving
+	// nothing to PUT or DELETE against. The fake does not do this by default —
+	// the documented contract is that ids are returned, and the rest of the
+	// policy write path would be untestable otherwise — so the tests that care
+	// switch it on explicitly.
+	omitUserPolicyIDs bool
 
 	mu   sync.Mutex
 	coll map[string]*collection
@@ -115,6 +122,11 @@ func (f *fakeConsole) insert(coll, origin string, obj map[string]any) string {
 	}
 	stored["id"] = id
 	stored["metadata"] = map[string]any{"origin": origin}
+	if coll == collPolicies {
+		// Every policy carries a server-assigned evaluation index.
+		stored["index"] = 10000 + f.nextID
+		stored["metadata"] = map[string]any{"origin": origin, "configurable": origin == originSystem}
+	}
 	c := f.coll[coll]
 	c.order = append(c.order, id)
 	c.byID[id] = stored
@@ -137,6 +149,29 @@ func (f *fakeConsole) objectNamed(coll, name string) map[string]any {
 		}
 	}
 	return nil
+}
+
+// policyNamed returns the policy with this name and zone pair, or nil.
+func (f *fakeConsole) policyNamed(name, srcZoneID, dstZoneID string) map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, obj := range f.coll[collPolicies].byID {
+		if obj["name"] == name && endpointZone(obj, "source") == srcZoneID && endpointZone(obj, "destination") == dstZoneID {
+			return obj
+		}
+	}
+	return nil
+}
+
+// policyOrder lists the policy names in evaluation order.
+func (f *fakeConsole) policyOrder() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, obj := range f.coll[collPolicies].list() {
+		out = append(out, obj["name"].(string))
+	}
+	return out
 }
 
 func (f *fakeConsole) names(coll string) []string {
@@ -256,7 +291,7 @@ func (f *fakeConsole) handleCollection(w http.ResponseWriter, r *http.Request, r
 	case r.Method == http.MethodGet && id == "":
 		items := make([]map[string]any, 0, len(c.order))
 		for _, obj := range c.list() {
-			items = append(items, overview(coll, obj))
+			items = append(items, overview(coll, f.visible(coll, obj)))
 		}
 		f.writePageLocked(w, r, items)
 
@@ -266,7 +301,7 @@ func (f *fakeConsole) handleCollection(w http.ResponseWriter, r *http.Request, r
 			f.fail(w, http.StatusNotFound, "api.not-found", "no such object")
 			return
 		}
-		writeJSON(w, obj)
+		writeJSON(w, f.visible(coll, obj))
 
 	case r.Method == http.MethodPost:
 		body, err := decodeBody(raw)
@@ -327,6 +362,15 @@ func (f *fakeConsole) handleOrdering(w http.ResponseWriter, r *http.Request, raw
 		f.fail(w, http.StatusMethodNotAllowed, "api.method-not-allowed", r.Method)
 		return
 	}
+	// The console orders policies per zone pair and rejects the call without
+	// both zone ids.
+	srcZone := r.URL.Query().Get("sourceFirewallZoneId")
+	dstZone := r.URL.Query().Get("destinationFirewallZoneId")
+	if srcZone == "" || dstZone == "" {
+		f.fail(w, http.StatusBadRequest, "api.request.error",
+			"Required request parameter 'sourceFirewallZoneId' for method parameter type UUID is not present")
+		return
+	}
 	f.record(r, raw, collPolicies, "ordering")
 
 	body, err := decodeBody(raw)
@@ -343,19 +387,69 @@ func (f *fakeConsole) handleOrdering(w http.ResponseWriter, r *http.Request, raw
 	var reordered []string
 	for _, v := range before {
 		id, _ := v.(string)
-		if _, ok := c.byID[id]; !ok {
+		obj, ok := c.byID[id]
+		if !ok {
 			f.fail(w, http.StatusBadRequest, "api.invalid-payload", "unknown policy id")
+			return
+		}
+		if endpointZone(obj, "source") != srcZone || endpointZone(obj, "destination") != dstZone {
+			f.fail(w, http.StatusBadRequest, "api.invalid-payload", "policy is not in this zone pair")
 			return
 		}
 		reordered = append(reordered, id)
 	}
+	// The reordered policies take the slots their zone pair already occupied,
+	// leaving every other policy where it was.
+	inPair := map[string]bool{}
+	for _, id := range reordered {
+		inPair[id] = true
+	}
+	var slots []int
+	for i, id := range c.order {
+		obj := c.byID[id]
+		if endpointZone(obj, "source") == srcZone && endpointZone(obj, "destination") == dstZone {
+			slots = append(slots, i)
+			inPair[id] = true
+		}
+	}
 	for _, id := range c.order {
-		if !contains(reordered, id) {
+		if inPair[id] && !contains(reordered, id) {
 			reordered = append(reordered, id)
 		}
 	}
-	c.order = reordered
+	next := append([]string(nil), c.order...)
+	for i, slot := range slots {
+		if i < len(reordered) {
+			next[slot] = reordered[i]
+		}
+	}
+	c.order = next
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func endpointZone(obj map[string]any, end string) string {
+	ep, _ := obj[end].(map[string]any)
+	id, _ := ep["zoneId"].(string)
+	return id
+}
+
+// visible applies the response-shaping quirks of a real console that are not
+// about the overview/detail split.
+func (f *fakeConsole) visible(coll string, obj map[string]any) map[string]any {
+	if !f.omitUserPolicyIDs || coll != collPolicies {
+		return obj
+	}
+	meta, _ := obj["metadata"].(map[string]any)
+	if meta["origin"] == originSystem {
+		return obj
+	}
+	out := map[string]any{}
+	for k, v := range obj {
+		if k != "id" {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // overview strips the fields the real API omits from list responses, so the
