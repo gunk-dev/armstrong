@@ -392,6 +392,62 @@ func TestPruneEmptySectionDeletesUserDefined(t *testing.T) {
 	}
 }
 
+// TestPruneFirewallPoliciesRespectsAbsentVsDeclaredEmpty is the incident that
+// motivated making every #Site section optional with no default (see
+// schema/unifi.cue): a console can hold dozens of USER_DEFINED firewall
+// policies, and an instance file that simply has not gotten around to
+// declaring firewallPolicies must not have every one of them planned for
+// deletion — only a section declared empty on purpose does that.
+func TestPruneFirewallPoliciesRespectsAbsentVsDeclaredEmpty(t *testing.T) {
+	const numPolicies = 67
+	f := newFakeConsole(t)
+	seedSite(f)
+	internal, _, _ := seedFirewall(f)
+	for i := range numPolicies {
+		f.seed(collPolicies, originUser, map[string]any{
+			"name": fmt.Sprintf("user-policy-%03d", i), "enabled": true,
+			"action":          map[string]any{"type": "ALLOW", "allowReturnTraffic": true},
+			"source":          map[string]any{"zoneId": internal},
+			"destination":     map[string]any{"zoneId": internal},
+			"ipProtocolScope": map[string]any{"ipVersion": "IPV4_AND_IPV6"},
+			"loggingEnabled":  false,
+		})
+	}
+	totalBefore := len(f.coll[collPolicies].list())
+
+	// Every other section is left absent too, in both cases below, so the
+	// only thing at stake is whether firewallPolicies itself is declared.
+	absent := `{}`
+	stdout, _, code := run(t, f, absent, nil, "sync", "--prune", "--dry-run")
+	if code != 0 {
+		t.Fatalf("dry run exited %d:\n%s", code, stdout)
+	}
+	if strings.Contains(stdout, "DELETE") {
+		t.Errorf("omitted firewallPolicies planned a delete:\n%s", stdout)
+	}
+	if got := len(f.coll[collPolicies].list()); got != totalBefore {
+		t.Fatalf("dry run touched policies for real: have %d, want %d", got, totalBefore)
+	}
+
+	// Declared empty: every USER_DEFINED policy is planned for deletion, and
+	// the SYSTEM_DEFINED "Allow All Traffic" trio seeded by seedFirewall
+	// survives — the loud summary line names exactly the user total.
+	declaredEmpty := `{"firewallPolicies":[]}`
+	stdout, _, code = run(t, f, declaredEmpty, nil, "sync", "--prune", "--dry-run")
+	if code != 0 {
+		t.Fatalf("dry run exited %d:\n%s", code, stdout)
+	}
+	if n := strings.Count(stdout, "DELETE firewall policy"); n != numPolicies {
+		t.Errorf("declared-empty firewallPolicies planned %d deletes, want %d:\n%s", n, numPolicies, stdout)
+	}
+	if want := fmt.Sprintf("would DELETE %d object(s)", numPolicies); !strings.Contains(stdout, want) {
+		t.Errorf("plan is missing the loud summary line %q:\n%s", want, stdout)
+	}
+	if got := len(f.coll[collPolicies].list()); got != totalBefore {
+		t.Fatalf("dry run deleted policies for real: have %d, want %d", got, totalBefore)
+	}
+}
+
 // TestUpdateTargetsTheRightID checks name-keyed matching: an update must PUT to
 // the id of the object with that name, not to whichever came back first.
 func TestUpdateTargetsTheRightID(t *testing.T) {
@@ -649,6 +705,39 @@ func TestPagingIsFollowed(t *testing.T) {
 	}
 	if len(doc.DNSPolicies) != total {
 		t.Errorf("export returned %d dns policies, want %d — paging is not followed", len(doc.DNSPolicies), total)
+	}
+}
+
+// TestCueExportOmitsUndeclaredSection is the schema-side half of the fix for
+// #15/#17: `cue export` of an instance file that never mentions
+// firewallPolicies must not print a "firewallPolicies" key at all, so that
+// --prune's absent/declared-empty distinction (see
+// TestPruneFirewallPoliciesRespectsAbsentVsDeclaredEmpty) is something an
+// instance file that simply hasn't declared a section yet can actually rely
+// on. Before every #Site section became optional with no default (see
+// schema/unifi.cue), an omitted section still exported as "[]" — identical to
+// one emptied on purpose.
+func TestCueExportOmitsUndeclaredSection(t *testing.T) {
+	if _, err := exec.LookPath("cue"); err != nil {
+		t.Skip("cue not installed")
+	}
+	cmd := exec.Command("cue", "export", "./cmd/unifi/testdata/omits-firewall-policies", "--out", "json", "-e", "site")
+	cmd.Dir = "../.."
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("cue export: %v", err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("cue export produced invalid JSON: %v\n%s", err, out)
+	}
+	if _, ok := doc["firewallPolicies"]; ok {
+		t.Errorf("cue export emitted a firewallPolicies key for a section the instance file never declared:\n%s", out)
+	}
+	for _, section := range []string{"networks", "firewallZones", "wifi", "dnsPolicies"} {
+		if _, ok := doc[section]; !ok {
+			t.Errorf("cue export dropped the declared section %q:\n%s", section, out)
+		}
 	}
 }
 

@@ -28,6 +28,7 @@ type reconciler struct {
 
 	networkIDs map[string]string // network name -> id
 	zoneIDs    map[string]string // zone name -> id
+	deletes    int
 }
 
 // pendingID stands in for an id that would only exist after an earlier create
@@ -47,6 +48,9 @@ func newID(created string, dryRun bool) string {
 func (r *reconciler) logf(verb, kind, name, format string, args ...any) {
 	if verb != "OK" {
 		r.changed = true
+	}
+	if verb == "DELETE" {
+		r.deletes++
 	}
 	detail := fmt.Sprintf(format, args...)
 	if detail != "" {
@@ -77,6 +81,16 @@ func (r *reconciler) run() error {
 		if err := step(); err != nil {
 			return err
 		}
+	}
+	// A loud, impossible-to-miss line: --prune's failure mode is silent data
+	// loss, so a plan that deletes anything says so once more, in one place,
+	// after the per-object lines above have already named what and why.
+	if r.deletes > 0 {
+		verb := "would DELETE"
+		if !r.dryRun {
+			verb = "DELETED"
+		}
+		fmt.Fprintf(r.out, "\n*** %s %d object(s) ***\n", verb, r.deletes)
 	}
 	return nil
 }

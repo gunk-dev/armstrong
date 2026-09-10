@@ -108,9 +108,21 @@ from under you.
 protects an instance file that simply forgot a section from wiping every
 object of that type on the first sync. But a section the file *does* declare,
 even as an empty list (`"wifi": []`), is fair game: every `USER_DEFINED`
-object of that type is deleted. `cue export` always emits every key, so a
-hand-maintained instance file is the only place this distinction matters —
-omit a key to leave a resource type alone, or set it to `[]` to clear it out.
+object of that type is deleted. **Absent = not managed, never pruned; `[]` =
+managed and empty, pruned to zero.**
+
+Every section of `#Site` is `?`-optional with no default for exactly this
+reason: an instance file that omits `firewallPolicies` produces JSON with no
+`firewallPolicies` key at all, and an instance file that writes
+`firewallPolicies: []` produces `"firewallPolicies": []`. Before this, every
+section had a default of `[...#T]`, so `cue export` filled in `[]` for a
+section the instance file never mentioned — meaning an instance file that
+simply hadn't gotten around to declaring, say, firewall policies would have
+every one of them deleted the first time someone ran `--prune`. `cue export`
+now emits a key only for a section the instance file actually set, so this
+distinction is real rather than something only a hand-maintained instance
+file could exploit — set a section to `[]` on purpose to clear it out, and
+leave it out to leave that resource type alone.
 
 **Secrets stay out of git.** `#WiFiSecurity` carries `passphraseEnv` — the
 *name* of an environment variable — never the passphrase. `unifi export`

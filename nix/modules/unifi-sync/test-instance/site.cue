@@ -55,7 +55,9 @@ site: schema.#Site & {
 		},
 	]
 
-	// Left empty so the test covers that path: an empty list must never prune.
+	// Declared empty (not omitted) so drift detection still covers firewall
+	// policies. This test only ever runs `diff`, never `--prune`, so an empty
+	// declared section here has no destructive side effect either way.
 	firewallPolicies: []
 
 	dnsPolicies: [
