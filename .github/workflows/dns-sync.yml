@@ -53,12 +53,13 @@ jobs:
           # zone object. Flat layout (all .cue files directly in dns/) exports a
           # single zone object; both are accepted by `dns-tool sync`.
           mapfile -t zones < <(find dns -mindepth 1 -maxdepth 1 -type d | sort)
+          # Trailing slash is required: without it cue treats dns/<name>.dev as a file ("unknown file extension").
           if [ ${#zones[@]} -gt 0 ]; then
             for zone in "${zones[@]}"; do
-              cue vet "./$zone"
+              cue vet "./$zone/"
             done
             for zone in "${zones[@]}"; do
-              cue export "./$zone" --out json
+              cue export "./$zone/" --out json
             done | jq -s . > zones.json
           else
             cue vet ./dns
