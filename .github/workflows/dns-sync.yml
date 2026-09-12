@@ -47,7 +47,24 @@ jobs:
           sudo mv cue /usr/local/bin/
 
       - name: Sync DNS records
-        run: cue export ./dns --out json | ./_armstrong/dns-tool sync --prune${{ inputs.dry_run && ' --dry-run' || '' }}
+        run: |
+          set -euo pipefail
+          # Per-zone layout: each dns/<zone>/ is its own CUE package exporting one
+          # zone object. Flat layout (all .cue files directly in dns/) exports a
+          # single zone object; both are accepted by `dns-tool sync`.
+          mapfile -t zones < <(find dns -mindepth 1 -maxdepth 1 -type d | sort)
+          if [ ${#zones[@]} -gt 0 ]; then
+            for zone in "${zones[@]}"; do
+              cue vet "./$zone"
+            done
+            for zone in "${zones[@]}"; do
+              cue export "./$zone" --out json
+            done | jq -s . > zones.json
+          else
+            cue vet ./dns
+            cue export ./dns --out json > zones.json
+          fi
+          ./_armstrong/dns-tool sync --prune${{ inputs.dry_run && ' --dry-run' || '' }} < zones.json
         env:
           PORKBUN_API_KEY: ${{ secrets.PORKBUN_API_KEY }}
           PORKBUN_SECRET_KEY: ${{ secrets.PORKBUN_SECRET_KEY }}

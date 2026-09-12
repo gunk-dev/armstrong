@@ -248,21 +248,45 @@ Available definitions:
 
 ## DNS Tool
 
-A CLI tool (`cmd/dns/`) that manages DNS records for gunk.dev via the Porkbun API.
+A CLI tool (`cmd/dns/`) that manages DNS records via the Porkbun API. It can manage one or several zones.
 
 Commands:
 
 - `dns sync` — Reads a JSON DNS definition from stdin and converges Porkbun records to match. Use `--prune` to delete records not in the definition (skips NS, SOA, and preview-* records). Pass `--dry-run` to print the planned changes without calling the Porkbun API.
-- `dns preview create <app> <pr-number>` — Creates a preview CNAME record for PR environments.
+- `dns preview create <app> <pr-number>` — Creates a preview CNAME record for PR environments (gunk.dev only).
 - `dns preview delete <app> <pr-number>` — Deletes a preview CNAME record.
 
-Requires `PORKBUN_API_KEY` and `PORKBUN_SECRET_KEY` environment variables.
+`dns sync` accepts either a single zone object:
+
+```json
+{"domain": "gunk.dev", "records": [{"type": "A", "name": "www", "content": "1.2.3.4", "ttl": 600}]}
+```
+
+or a JSON array of those objects, one per zone:
+
+```json
+[
+  {"domain": "gunk.dev", "records": [...]},
+  {"domain": "broken.dev", "records": [...]}
+]
+```
+
+Zones are synced in the order given, each preceded by a `== <domain> ==` header, and the run stops at the first zone that fails.
+
+Domains must be unique across the input (compared case-insensitively and ignoring a trailing dot): a duplicate — or an empty `domain` — fails the run before any change is made, since with `--prune` each entry would delete the records declared only by the other.
+
+Requires `PORKBUN_API_KEY` and `PORKBUN_SECRET_KEY` environment variables. `PORKBUN_API_BASE` overrides the API endpoint (used by tests).
 
 ## Reusable Workflows
 
 ### dns-sync.yml
 
-Syncs DNS records from a CUE definition to Porkbun. Checks out the caller repo and armstrong, builds the DNS tool, then runs the sync.
+Syncs DNS records from a CUE definition to Porkbun. Checks out the caller repo and armstrong, builds the DNS tool, vets the CUE, then runs the sync.
+
+The caller repo holds its zones under `dns/`, in either layout:
+
+- **Per zone directory** (use this for more than one domain): `dns/<zone>/` — each directory is its own CUE package `dns` declaring `domain` and `records`, e.g. `dns/gunk.dev/` and `dns/broken.dev/`. The workflow vets and exports each directory in sorted order and syncs them all in one run.
+- **Flat** (single zone): `.cue` files directly in `dns/`, all unifying into one `domain` + `records` struct. Still supported.
 
 ```yaml
 jobs:
