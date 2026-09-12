@@ -73,7 +73,8 @@ func runSync(prune, dryRun bool, stdin io.Reader, out io.Writer) error {
 }
 
 // parseZones accepts either a single zone object (one domain) or a JSON array
-// of them, so a caller repo can manage several domains from one CUE tree.
+// of them, so a caller repo can manage several domains from one CUE tree. The
+// zones it returns are guaranteed to have non-empty, mutually distinct domains.
 func parseZones(data []byte) ([]dnsInput, error) {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 {
@@ -89,16 +90,50 @@ func parseZones(data []byte) ([]dnsInput, error) {
 		if len(zones) == 0 {
 			return nil, fmt.Errorf("no zones in input")
 		}
+		if err := validateZones(zones); err != nil {
+			return nil, err
+		}
 		return zones, nil
 	case '{':
 		var zone dnsInput
 		if err := json.Unmarshal(trimmed, &zone); err != nil {
 			return nil, fmt.Errorf("parse input: %w", err)
 		}
-		return []dnsInput{zone}, nil
+		zones := []dnsInput{zone}
+		if err := validateZones(zones); err != nil {
+			return nil, err
+		}
+		return zones, nil
 	default:
 		return nil, fmt.Errorf("parse input: expected a JSON object or array of objects, got %q", trimmed[0])
 	}
+}
+
+// validateZones rejects input that syncZones cannot sync coherently. Two
+// entries for the same domain (a copied dns/<zone>/ directory whose domain was
+// not updated) both pass CUE validation, but with --prune each pass would
+// delete the records declared only by the other, so the whole run is refused
+// before any API call. An empty domain is rejected too: it would otherwise be
+// sent to the API as a malformed URL.
+func validateZones(zones []dnsInput) error {
+	seen := map[string]bool{}
+	for _, zone := range zones {
+		domain := normalizeDomain(zone.Domain)
+		if domain == "" {
+			return fmt.Errorf("zone with empty domain in input")
+		}
+		if seen[domain] {
+			return fmt.Errorf("duplicate zone %q in input", domain)
+		}
+		seen[domain] = true
+	}
+	return nil
+}
+
+// normalizeDomain canonicalizes a domain for comparison: DNS names are
+// case-insensitive and "gunk.dev." names the same zone as "gunk.dev".
+func normalizeDomain(domain string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
 }
 
 // syncZones syncs each zone in order, stopping at the first failure.

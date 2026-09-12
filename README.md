@@ -273,6 +273,8 @@ or a JSON array of those objects, one per zone:
 
 Zones are synced in the order given, each preceded by a `== <domain> ==` header, and the run stops at the first zone that fails.
 
+Domains must be unique across the input (compared case-insensitively and ignoring a trailing dot): a duplicate — or an empty `domain` — fails the run before any change is made, since with `--prune` each entry would delete the records declared only by the other.
+
 Requires `PORKBUN_API_KEY` and `PORKBUN_SECRET_KEY` environment variables. `PORKBUN_API_BASE` overrides the API endpoint (used by tests).
 
 ## Reusable Workflows

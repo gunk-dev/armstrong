@@ -13,14 +13,18 @@ import (
 
 // fakePorkbunAPI is a stand-in for the Porkbun HTTP API. It serves the records
 // it is seeded with per domain and records every mutating request, so a test
-// can drive the real cobra command end to end.
+// can drive the real cobra command end to end. requests counts every request,
+// mutating or not, so a test can assert the API was never contacted at all.
 type fakePorkbunAPI struct {
-	records map[string][]porkbunRecord
-	calls   []string
+	records  map[string][]porkbunRecord
+	calls    []string
+	requests int
 }
 
 func (f *fakePorkbunAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Porkbun authenticates with credentials in the JSON body, not headers.
+	f.requests++
+
 	var auth authBody
 	body, _ := readAllAndDecode(r, &auth)
 	if auth.APIKey != "test-key" || auth.SecretAPIKey != "test-secret" {
@@ -142,5 +146,72 @@ func TestSyncCmd_BadInput_EndToEnd(t *testing.T) {
 	}
 	if _, err := runSyncCmd(t, srv, `"gunk.dev"`); err == nil {
 		t.Error("scalar input: got nil error, want failure")
+	}
+}
+
+// TestSyncCmd_DuplicateZones_EndToEnd covers the copied-directory mistake: two
+// entries naming the same domain, each declaring only half the records. With
+// --prune each pass would delete the other's records, so the command must fail
+// before it touches the API at all.
+func TestSyncCmd_DuplicateZones_EndToEnd(t *testing.T) {
+	tests := []struct {
+		name         string
+		firstDomain  string
+		secondDomain string
+		wantErr      string
+	}{
+		{"identical", "gunk.dev", "gunk.dev", `duplicate zone "gunk.dev" in input`},
+		{"case and trailing dot", "Gunk.dev", "gunk.dev.", `duplicate zone "gunk.dev" in input`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			api := &fakePorkbunAPI{records: map[string][]porkbunRecord{
+				"gunk.dev": {
+					{ID: "1", Name: "www.gunk.dev", Type: "A", Content: "1.2.3.4", TTL: "600"},
+					{ID: "2", Name: "mail.gunk.dev", Type: "A", Content: "5.6.7.8", TTL: "600"},
+				},
+			}}
+			srv := httptest.NewServer(api)
+			defer srv.Close()
+
+			input := fmt.Sprintf(`[
+  {"domain": %q, "records": [{"type": "A", "name": "www",  "content": "1.2.3.4", "ttl": 600}]},
+  {"domain": %q, "records": [{"type": "A", "name": "mail", "content": "5.6.7.8", "ttl": 600}]}
+]`, tt.firstDomain, tt.secondDomain)
+
+			out, err := runSyncCmd(t, srv, input, "--prune")
+			if err == nil {
+				t.Fatalf("got nil error, want duplicate-zone failure; output:\n%s", out)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %v; want it to mention %s", err, tt.wantErr)
+			}
+			if api.requests != 0 || len(api.calls) != 0 {
+				t.Errorf("contacted the API despite invalid input: %d requests, calls %v", api.requests, api.calls)
+			}
+		})
+	}
+}
+
+func TestSyncCmd_EmptyDomain_EndToEnd(t *testing.T) {
+	api := &fakePorkbunAPI{records: map[string][]porkbunRecord{}}
+	srv := httptest.NewServer(api)
+	defer srv.Close()
+
+	for _, input := range []string{
+		`{"domain": "", "records": [{"type": "A", "name": "www", "content": "1.2.3.4", "ttl": 600}]}`,
+		`[{"domain": "gunk.dev", "records": []}, {"domain": "  ", "records": []}]`,
+	} {
+		out, err := runSyncCmd(t, srv, input, "--prune")
+		if err == nil {
+			t.Fatalf("got nil error for %s, want empty-domain failure; output:\n%s", input, out)
+		}
+		if !strings.Contains(err.Error(), "empty domain") {
+			t.Errorf("error = %v; want it to mention an empty domain", err)
+		}
+		if api.requests != 0 || len(api.calls) != 0 {
+			t.Errorf("contacted the API despite empty domain: %d requests, calls %v", api.requests, api.calls)
+		}
 	}
 }
