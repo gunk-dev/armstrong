@@ -1,11 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 
@@ -41,9 +41,10 @@ func newSyncCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "Sync DNS records from CUE definition to Porkbun",
-		Long:  "Reads JSON from stdin (pipe from: cue export ./dns --out json) and converges Porkbun records to match.",
+		Long: "Reads JSON from stdin (pipe from: cue export ./dns --out json) and converges Porkbun records to match.\n" +
+			"Accepts either a single zone object or a JSON array of zone objects, which are synced in order.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runSync(prune, dryRun)
+			return runSync(prune, dryRun, cmd.InOrStdin(), cmd.OutOrStdout())
 		},
 	}
 
@@ -52,15 +53,15 @@ func newSyncCmd() *cobra.Command {
 	return cmd
 }
 
-func runSync(prune, dryRun bool) error {
-	data, err := io.ReadAll(os.Stdin)
+func runSync(prune, dryRun bool, stdin io.Reader, out io.Writer) error {
+	data, err := io.ReadAll(stdin)
 	if err != nil {
 		return fmt.Errorf("read stdin: %w", err)
 	}
 
-	var input dnsInput
-	if err := json.Unmarshal(data, &input); err != nil {
-		return fmt.Errorf("parse input: %w", err)
+	zones, err := parseZones(data)
+	if err != nil {
+		return err
 	}
 
 	client, err := newPorkbunClient()
@@ -68,7 +69,47 @@ func runSync(prune, dryRun bool) error {
 		return err
 	}
 
-	return syncRecords(client, input, prune, dryRun, os.Stdout)
+	return syncZones(client, zones, prune, dryRun, out)
+}
+
+// parseZones accepts either a single zone object (one domain) or a JSON array
+// of them, so a caller repo can manage several domains from one CUE tree.
+func parseZones(data []byte) ([]dnsInput, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("parse input: empty input")
+	}
+
+	switch trimmed[0] {
+	case '[':
+		var zones []dnsInput
+		if err := json.Unmarshal(trimmed, &zones); err != nil {
+			return nil, fmt.Errorf("parse input: %w", err)
+		}
+		if len(zones) == 0 {
+			return nil, fmt.Errorf("no zones in input")
+		}
+		return zones, nil
+	case '{':
+		var zone dnsInput
+		if err := json.Unmarshal(trimmed, &zone); err != nil {
+			return nil, fmt.Errorf("parse input: %w", err)
+		}
+		return []dnsInput{zone}, nil
+	default:
+		return nil, fmt.Errorf("parse input: expected a JSON object or array of objects, got %q", trimmed[0])
+	}
+}
+
+// syncZones syncs each zone in order, stopping at the first failure.
+func syncZones(client porkbunMutator, zones []dnsInput, prune, dryRun bool, out io.Writer) error {
+	for _, zone := range zones {
+		fmt.Fprintf(out, "== %s ==\n", zone.Domain)
+		if err := syncRecords(client, zone, prune, dryRun, out); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func syncRecords(client porkbunMutator, input dnsInput, prune, dryRun bool, out io.Writer) error {

@@ -10,7 +10,7 @@ import (
 func main() {
 	root := &cobra.Command{
 		Use:   "dns",
-		Short: "Manage DNS records for gunk.dev via Porkbun API",
+		Short: "Manage DNS records via the Porkbun API",
 	}
 
 	root.AddCommand(newSyncCmd())
