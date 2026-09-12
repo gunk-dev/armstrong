@@ -13,12 +13,20 @@ package schema
 // output can be pasted straight into an instance file.
 
 // #Site is the top-level document consumed by `unifi diff` / `unifi sync`.
+//
+// Every section is optional and carries no default. Omitting a section means
+// "not managed by this instance file": `sync --prune` leaves every object of
+// that type alone, however many the console holds. Declaring a section, even
+// as an empty list, means "managed": `--prune` then deletes every
+// USER_DEFINED object of that type the instance file does not list. An
+// instance file must set a section to `[]` on purpose to clear it out — see
+// docs/unifi.md.
 #Site: {
-	networks: [...#Network]
-	firewallZones: [...#FirewallZone]
-	wifi: [...#WiFi]
-	firewallPolicies: [...#FirewallPolicy]
-	dnsPolicies: [...#DNSPolicy]
+	networks?:         [...#Network]
+	firewallZones?:    [...#FirewallZone]
+	wifi?:             [...#WiFi]
+	firewallPolicies?: [...#FirewallPolicy]
+	dnsPolicies?:      [...#DNSPolicy]
 }
 
 // #Network is a gateway-managed L3 network (a VLAN with an IPv4 subnet and,
