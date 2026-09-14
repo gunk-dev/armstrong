@@ -18,17 +18,29 @@ import (
 // are handled in dependency order: networks, then firewall zones (which
 // reference networks), then wifi / firewall policies / DNS policies.
 type reconciler struct {
-	client  *client
-	siteID  string
-	want    site
-	prune   bool
-	dryRun  bool
-	out     io.Writer
-	changed bool
+	client *client
+	siteID string
+	want   site
+	prune  bool
+	dryRun bool
+	// force deletes prune candidates the instance file's `deletions` does not
+	// list. Only a human at a shell sets it.
+	force bool
+	// planning marks the silent first pass of a real sync, whose output is
+	// only shown if a guard refuses the run.
+	planning bool
+	out      io.Writer
+	changed  bool
 
 	networkIDs map[string]string // network name -> id
 	zoneIDs    map[string]string // zone name -> id
 	deletes    int
+	updates    int
+	writes     int
+	// candidates holds the key of every object --prune would delete, listed
+	// or not; unlisted the ones `deletions` does not approve.
+	candidates map[string]bool
+	unlisted   []string
 }
 
 // pendingID stands in for an id that would only exist after an earlier create
@@ -49,8 +61,15 @@ func (r *reconciler) logf(verb, kind, name, format string, args ...any) {
 	if verb != "OK" {
 		r.changed = true
 	}
-	if verb == "DELETE" {
+	switch verb {
+	case "DELETE":
 		r.deletes++
+		r.writes++
+	case "UPDATE":
+		r.updates++
+		r.writes++
+	case "CREATE", "ORDER":
+		r.writes++
 	}
 	detail := fmt.Sprintf(format, args...)
 	if detail != "" {
@@ -68,9 +87,10 @@ func (r *reconciler) mutate(method, path string, body any, out any) error {
 }
 
 func (r *reconciler) run() error {
-	if r.dryRun {
+	if r.dryRun && !r.planning {
 		fmt.Fprintln(r.out, "DRY RUN — no changes will be made")
 	}
+	r.candidates = map[string]bool{}
 	for _, step := range []func() error{
 		r.syncNetworks,
 		r.syncZones,
@@ -91,6 +111,76 @@ func (r *reconciler) run() error {
 			verb = "DELETED"
 		}
 		fmt.Fprintf(r.out, "\n*** %s %d object(s) ***\n", verb, r.deletes)
+	}
+	r.warnStaleDeletions()
+	return nil
+}
+
+// deletionKey is how `deletions` names an object: the kind and the identity,
+// as the plan line prints them, joined by a single space.
+func deletionKey(kind, name string) string { return kind + " " + name }
+
+// warnStaleDeletions names the `deletions` entries that matched no prune
+// candidate. They are harmless — typically the object is already gone — so
+// this only warns, and the entry can be dropped from the instance file.
+func (r *reconciler) warnStaleDeletions() {
+	if !r.prune {
+		return
+	}
+	for _, key := range r.want.Deletions {
+		if !r.candidates[key] {
+			fmt.Fprintf(r.out, "%-6s %-14s %q matches nothing this run would delete; remove it from the list\n", "WARN", "deletions", key)
+		}
+	}
+}
+
+// refusals lists why a sync with this plan must not be applied: prune
+// candidates the instance file does not list, and more deletes and updates
+// than maxChanges allows. Creates never count — they destroy nothing. force
+// overrides both.
+func (r *reconciler) refusals(maxChanges int) []string {
+	if r.force {
+		return nil
+	}
+	var out []string
+	if len(r.unlisted) > 0 {
+		var b strings.Builder
+		fmt.Fprintf(&b, "--prune would delete %d object(s) that the instance file's `deletions` does not list. "+
+			"To approve, add to deletions:", len(r.unlisted))
+		for _, key := range r.unlisted {
+			fmt.Fprintf(&b, "\n    %q", key)
+		}
+		out = append(out, b.String())
+	}
+	if n := r.deletes + r.updates; n > maxChanges {
+		out = append(out, fmt.Sprintf("the plan deletes or updates %d object(s), more than --max-changes %d; "+
+			"review the plan above and re-run with --force (or a higher --max-changes) to apply it", n, maxChanges))
+	}
+	return out
+}
+
+// deleteCandidate handles one object --prune would remove. A key the instance
+// file's `deletions` lists is deleted. An unlisted one is recorded and
+// skipped while planning; if one turns up on the writing pass anyway (the
+// console changed in between) the run stops rather than delete it.
+func (r *reconciler) deleteCandidate(kind, name, path string) error {
+	key := deletionKey(kind, name)
+	r.candidates[key] = true
+	listed := slices.Contains(r.want.Deletions, key)
+	switch {
+	case listed:
+		r.logf("DELETE", kind, name, "listed in deletions")
+	case r.force:
+		r.logf("DELETE", kind, name, "not listed in deletions; --force")
+	case r.dryRun:
+		r.unlisted = append(r.unlisted, key)
+		r.logf("DELETE", kind, name, "NOT listed in deletions")
+		return nil
+	default:
+		return fmt.Errorf("refusing to delete %s: %q is not listed in deletions", kind, key)
+	}
+	if err := r.mutate(http.MethodDelete, path, nil, nil); err != nil {
+		return fmt.Errorf("delete %s %q: %w", kind, name, err)
 	}
 	return nil
 }
@@ -495,9 +585,8 @@ func (r *reconciler) prunePolicies(base string, existing []actual[apiFirewallPol
 		if a.ID == "" {
 			return errNoPolicyID(key, "delete")
 		}
-		r.logf("DELETE", "firewall policy", key, "")
-		if err := r.mutate(http.MethodDelete, base+"/"+a.ID, nil, nil); err != nil {
-			return fmt.Errorf("delete firewall policy %q: %w", key, err)
+		if err := r.deleteCandidate("firewall policy", key, base+"/"+a.ID); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -691,7 +780,8 @@ func normalizeDNSPolicy(d dnsPolicy) dnsPolicy {
 
 // pruneList deletes unmatched USER_DEFINED objects when --prune is set.
 //
-// Two safety rules apply. SYSTEM_DEFINED objects are never deleted, prune or
+// Three safety rules apply. Every deletion must be approved by the instance
+// file's `deletions` (see deleteCandidate). SYSTEM_DEFINED objects are never deleted, prune or
 // not — they are the console's own. And nothing is deleted for a resource type
 // absent from the instance file (declared is false): an instance file that
 // simply forgot a list must not wipe every object of that type. A section the
@@ -711,10 +801,7 @@ func (r *reconciler) pruneList(kind, base string, declared bool, each func(func(
 		if !r.prune || !declared {
 			return
 		}
-		r.logf("DELETE", kind, name, "")
-		if derr := r.mutate(http.MethodDelete, base+"/"+id, nil, nil); derr != nil {
-			err = fmt.Errorf("delete %s %q: %w", kind, name, derr)
-		}
+		err = r.deleteCandidate(kind, name, base+"/"+id)
 	})
 	return err
 }

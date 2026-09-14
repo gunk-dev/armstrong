@@ -174,6 +174,8 @@
             unit=${scratch.config.systemd.units."unifi-sync.service".unit}/unifi-sync.service
             grep -q 'ExecStart=.*/bin/unifi-sync-run' "$unit"
             grep -q 'DynamicUser=true' "$unit"
+            # sync mode writes its pre-apply snapshots under the state directory.
+            grep -q 'StateDirectory=unifi-sync' "$unit"
             grep -q 'LoadCredential=api-key:/run/secrets/unifi-api-key' "$unit"
             # onSuccessOf reached the consumer's own unit.
             grep -q 'OnSuccess=unifi-sync.service' \

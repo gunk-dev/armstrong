@@ -14,11 +14,22 @@ import (
 // feeds straight back into `diff` as a no-op, and a lossy entry would instead
 // become a destructive `PUT`.
 func exportSite(c *client, siteID string, out, warn io.Writer) error {
+	doc, err := buildExport(c, siteID, warn)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(doc)
+}
+
+// buildExport reads the live site into a #Site document; see exportSite.
+func buildExport(c *client, siteID string, warn io.Writer) (site, error) {
 	var doc site
 
 	nets, err := c.networks(siteID)
 	if err != nil {
-		return err
+		return doc, err
 	}
 	netNames := nameLookup{}
 	for _, a := range nets {
@@ -28,7 +39,7 @@ func exportSite(c *client, siteID string, out, warn io.Writer) error {
 
 	zones, zonesAvailable, err := c.zones(siteID)
 	if err != nil {
-		return err
+		return doc, err
 	}
 	zoneNames := nameLookup{}
 	for _, a := range zones {
@@ -45,7 +56,7 @@ func exportSite(c *client, siteID string, out, warn io.Writer) error {
 
 	wifis, err := c.wifis(siteID)
 	if err != nil {
-		return err
+		return doc, err
 	}
 	for _, a := range wifis {
 		w := a.Spec
@@ -79,7 +90,7 @@ func exportSite(c *client, siteID string, out, warn io.Writer) error {
 	if zonesAvailable {
 		policies, available, err := c.firewallPolicies(siteID)
 		if err != nil {
-			return err
+			return doc, err
 		}
 		if available {
 			doc.FirewallPolicies = exportPolicies(policies, zoneNames, netNames, warn)
@@ -88,7 +99,7 @@ func exportSite(c *client, siteID string, out, warn io.Writer) error {
 
 	dns, err := c.dnsPolicies(siteID)
 	if err != nil {
-		return err
+		return doc, err
 	}
 	for _, a := range dns {
 		doc.DNSPolicies = append(doc.DNSPolicies, a.Spec)
@@ -111,9 +122,7 @@ func exportSite(c *client, siteID string, out, warn io.Writer) error {
 		doc.DNSPolicies = []dnsPolicy{}
 	}
 
-	enc := json.NewEncoder(out)
-	enc.SetIndent("", "  ")
-	return enc.Encode(doc)
+	return doc, nil
 }
 
 // exportPolicies renders the live policies. `order` is emitted only for

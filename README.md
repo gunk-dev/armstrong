@@ -353,7 +353,8 @@ Commands:
 
 - `unifi export` — Dumps the live site as `#Site`-shaped JSON so a consumer repo can bootstrap its instance file from real state. WiFi passphrases are never included; each SSID gets a `passphraseEnv` name instead. Objects the schema cannot express faithfully are skipped and named on stderr.
 - `unifi diff` — Reads `#Site` JSON from stdin and prints the plan without changing anything. Exits 2 when a change would be made and 1 on failure, so CI can tell drift apart from a broken run. Pass `--prune` to include deletions in the plan.
-- `unifi sync [--prune] [--dry-run]` — Reads `#Site` JSON from stdin and converges the site. `--prune` deletes `USER_DEFINED` objects absent from the input; `--dry-run` prints the plan without calling the API.
+- `unifi sync [--prune] [--dry-run] [--force] [--max-changes N] [--snapshot-dir DIR] [--snapshot-keep K]` — Reads `#Site` JSON from stdin and converges the site. `--prune` deletes `USER_DEFINED` objects absent from the input, but only those the input's `deletions` lists; `--dry-run` prints the plan without calling the API. See [Guards, snapshots and restore](#guards-snapshots-and-restore).
+- `unifi restore [--dry-run] [--prune --force] <snapshot.json>` — Converges the site back to a snapshot `sync` wrote, through the same reconciler and guards.
 
 Environment:
 
@@ -403,6 +404,72 @@ cue export ./unifi --out json -e site | unifi sync --prune
 
 On NixOS, `nixosModules.unifi-sync` runs exactly that pipeline as a hardened
 oneshot on a timer — see [NixOS module](#nixos-module).
+
+### Guards, snapshots and restore
+
+`sync` runs unattended after every converge, so a wrong plan has to fail
+closed and be undoable. `sync` works out the whole plan before it writes
+anything, and refuses the run (exit 1, plan printed, **nothing written** — not
+even the creates) when either guard trips:
+
+- **Undeclared deletions.** `--prune` deletes an object only if the instance
+  file lists its key in `deletions`. The key is the kind and identity exactly
+  as the plan prints them, joined by one space:
+
+  ```cue
+  site: schema.#Site & {
+    dnsPolicies: [ /* overseerr.esplanade removed */ ]
+    deletions: [
+      "dns policy A_RECORD overseerr.esplanade",
+      "firewall policy Internal -> External / Block TikTok",
+    ]
+  }
+  ```
+
+  The refusal names each unlisted key, ready to paste in. `diff --prune` marks
+  every delete as `(listed in deletions)` or `(NOT listed in deletions)`. A
+  listed key that matches nothing — typically an object already deleted — only
+  prints a `WARN`, so the list can be emptied at leisure.
+- **Mass change.** A plan that deletes or updates more than `--max-changes`
+  objects (default 10) is refused. Creates do not count.
+
+`--force` overrides both. It is for a human at a shell; the NixOS module never
+passes it.
+
+**Snapshots.** With `--snapshot-dir`, a `sync` that is about to write first
+saves the live site there as `snapshot-<UTC timestamp>.json` — the same
+document `unifi export` prints — prints the path, and keeps the newest
+`--snapshot-keep` (default 10). A run with nothing to write takes no snapshot.
+A snapshot never holds a passphrase: each SSID carries a `passphraseEnv` (the
+instance file's own name for it where the instance file declares the SSID,
+otherwise export's generated `UNIFI_WIFI_<SSID>`).
+
+**The review workflow:**
+
+1. Edit the CUE instance. Anything removed from a declared section is a prune
+   candidate; add its key to `deletions` (the `diff --prune` output, or a
+   refused run, names it).
+2. Open a PR. The `deletions` list is in the diff, so reviewing and merging it
+   *is* the acknowledgement of each deletion.
+3. Merge; the host converges and `unifi-sync` runs.
+4. `sync` plans, checks the guards, snapshots the live site, then applies.
+
+**Restoring.** `unifi restore <snapshot.json>` applies a snapshot as the
+desired state through the same reconciler and guards — objects matched by
+identity, `SYSTEM_DEFINED` objects never deleted. Set each SSID's
+`passphraseEnv` in the environment, as for `sync`. Start with `--dry-run`. A
+snapshot lists no deletions, so removing objects created since it was taken
+needs `--prune --force`:
+
+```sh
+unifi restore --dry-run /var/lib/unifi-sync/snapshots/snapshot-20260914T182700.000000000Z.json
+unifi restore --prune --force /var/lib/unifi-sync/snapshots/snapshot-20260914T182700.000000000Z.json
+```
+
+On a NixOS host, `sudo unifi-restore …` does the same with the module's
+console settings, API key and secrets file already loaded. Restoring puts the
+console back, not the instance file: revert the PR too, or the next converge
+applies the change again.
 
 See `examples/unifi/site.cue` for a complete example instance (RFC 5737
 documentation addresses), `docs/unifi.md` for the full guide, and
