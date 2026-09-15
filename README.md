@@ -347,13 +347,15 @@ A CLI tool (`cmd/unifi/`) that manages a UniFi Network site via the official
 **Integration API** served by the console at
 `https://<console>/proxy/network/integration/v1`. It is the sibling of the DNS
 tool: it reads a JSON document on stdin (pipe from `cue export`) and converges
-the console to match.
+the console to match. DHCP reservations, which the Integration API does not
+expose, go through the console's legacy controller API
+(`/proxy/network/api/s/<site>/rest/user`) with the same API key.
 
 Commands:
 
 - `unifi export` — Dumps the live site as `#Site`-shaped JSON so a consumer repo can bootstrap its instance file from real state. WiFi passphrases are never included; each SSID gets a `passphraseEnv` name instead. Objects the schema cannot express faithfully are skipped and named on stderr.
 - `unifi diff` — Reads `#Site` JSON from stdin and prints the plan without changing anything. Exits 2 when a change would be made and 1 on failure, so CI can tell drift apart from a broken run. Pass `--prune` to include deletions in the plan.
-- `unifi sync [--prune] [--dry-run] [--force] [--max-changes N] [--snapshot-dir DIR] [--snapshot-keep K]` — Reads `#Site` JSON from stdin and converges the site. `--prune` deletes `USER_DEFINED` objects absent from the input, but only those the input's `deletions` lists; `--dry-run` prints the plan without calling the API. See [Guards, snapshots and restore](#guards-snapshots-and-restore).
+- `unifi sync [--prune] [--dry-run] [--force] [--max-changes N] [--snapshot-dir DIR] [--snapshot-keep K]` — Reads `#Site` JSON from stdin and converges the site. `--prune` deletes `USER_DEFINED` objects absent from the input and clears undeclared DHCP reservations (the client record is kept), but only those the input's `deletions` lists; `--dry-run` prints the plan without calling the API. See [Guards, snapshots and restore](#guards-snapshots-and-restore).
 - `unifi restore [--dry-run] [--prune --force] <snapshot.json>` — Converges the site back to a snapshot `sync` wrote, through the same reconciler and guards.
 
 Environment:
@@ -362,7 +364,7 @@ Environment:
 | --- | --- |
 | `UNIFI_URL` | Console base URL, e.g. `https://unifi.lan` |
 | `UNIFI_API_KEY` | Integration API key (Settings → Control Plane → Integrations). Never printed. |
-| `UNIFI_SITE` | Site name, default `Default` |
+| `UNIFI_SITE` | Site name, default `Default`. The legacy API uses the site's `internalReference` (e.g. `default`), read from `GET /sites` |
 | `UNIFI_CA_FILE` | PEM bundle for the console's self-signed certificate |
 | `UNIFI_INSECURE_TLS` | Set to `1` to skip certificate verification instead |
 | `UNIFI_WIFI_*` | Whatever `passphraseEnv` names your `#WiFi` entries reference |
@@ -373,7 +375,8 @@ Environment:
   consumer repo, so desired and actual objects are matched by `name`. Two kinds
   need more: DNS policies have no name and are matched by type plus domain, and
   firewall policies are matched by **(source zone, destination zone, name)** —
-  a stock console reuses `Allow All Traffic` nineteen times.
+  a stock console reuses `Allow All Traffic` nineteen times. DHCP reservations
+  are matched by MAC address.
 - **Nothing is written back lossily.** Before planning an update, `unifi`
   re-renders the live object from its own projection and compares. If the
   console holds a firewall policy using something `#FirewallPolicy` does not
@@ -389,8 +392,14 @@ Environment:
 - **Secrets stay out of git.** `#WiFiSecurity` carries `passphraseEnv` — the name
   of an environment variable — not the passphrase. Passphrases and the API key
   are redacted from all output, including API error responses.
+- **DHCP reservations** (`reservations: [...#Reservation]`, each
+  `{mac, name?, fixedIp, network}`) exist only where `use_fixedip` is true; a
+  `fixed_ip` left on a client with `use_fixedip: false` is not a reservation.
+  Networks are joined by name, since legacy and Integration API ids differ.
+  `--prune` clears a reservation with `use_fixedip: false` (once `deletions`
+  lists `reservation <mac>`) and never forgets the client.
 - Resources are reconciled in dependency order: networks → firewall zones →
-  wifi, firewall policies, DNS policies.
+  wifi, firewall policies, DNS policies, DHCP reservations.
 
 ### Running it
 
@@ -422,6 +431,7 @@ even the creates) when either guard trips:
     deletions: [
       "dns policy A_RECORD overseerr.esplanade",
       "firewall policy Internal -> External / Block TikTok",
+      "reservation 02:00:5e:10:00:11",
     ]
   }
   ```
@@ -429,9 +439,11 @@ even the creates) when either guard trips:
   The refusal names each unlisted key, ready to paste in. `diff --prune` marks
   every delete as `(listed in deletions)` or `(NOT listed in deletions)`. A
   listed key that matches nothing — typically an object already deleted — only
-  prints a `WARN`, so the list can be emptied at leisure.
+  prints a `WARN`, so the list can be emptied at leisure. Clearing a DHCP
+  reservation is a deletion too, keyed `reservation <mac>` (lower-case MAC).
 - **Mass change.** A plan that deletes or updates more than `--max-changes`
-  objects (default 10) is refused. Creates do not count.
+  objects (default 10) is refused. Creates do not count. DHCP reservation
+  updates and clears count like any other; reservation creates do not.
   Reorders do: every firewall policy whose position changes counts as one,
   and the plan shows it as `ORDER firewall policy <pair> (N moved)`.
 
@@ -444,7 +456,10 @@ document `unifi export` prints — prints the path, and keeps the newest
 `--snapshot-keep` (default 10). A run with nothing to write takes no snapshot.
 A snapshot never holds a passphrase: each SSID carries a `passphraseEnv` (the
 instance file's own name for it where the instance file declares the SSID,
-otherwise export's generated `UNIFI_WIFI_<SSID>`).
+otherwise export's generated `UNIFI_WIFI_<SSID>`). When the instance file
+declares `reservations`, the snapshot holds them too, by MAC and network name,
+so `restore` can recreate, change back or clear them; without that section the
+run cannot touch reservations and the snapshot leaves them out.
 
 **The review workflow:**
 

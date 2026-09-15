@@ -70,18 +70,32 @@ func newClient() (*client, error) {
 // do issues a request against the Integration API. body may be nil; out may be
 // nil to discard the response.
 func (c *client) do(method, path string, body, out any) error {
+	data, err := c.send(method, apiPrefix, path, body)
+	if err != nil || out == nil {
+		return err
+	}
+	if err := json.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("%s %s: parse response: %w", method, path, err)
+	}
+	return nil
+}
+
+// send issues an authenticated request at base+prefix+path and returns the
+// response body, or an *apiError for a non-2xx status. prefix selects the API
+// surface; only path appears in error messages.
+func (c *client) send(method, prefix, path string, body any) ([]byte, error) {
 	var rdr io.Reader
 	if body != nil {
 		buf, err := json.Marshal(body)
 		if err != nil {
-			return fmt.Errorf("encode request: %w", err)
+			return nil, fmt.Errorf("encode request: %w", err)
 		}
 		rdr = bytes.NewReader(buf)
 	}
 
-	req, err := http.NewRequest(method, c.base+apiPrefix+path, rdr)
+	req, err := http.NewRequest(method, c.base+prefix+path, rdr)
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("X-API-KEY", c.apiKey)
 	req.Header.Set("Accept", "application/json")
@@ -93,16 +107,16 @@ func (c *client) do(method, path string, body, out any) error {
 	if err != nil {
 		// Error strings from net/http can embed the URL but never headers,
 		// so the API key cannot leak here.
-		return fmt.Errorf("%s %s: %w", method, path, err)
+		return nil, fmt.Errorf("%s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("%s %s: read response: %w", method, path, err)
+		return nil, fmt.Errorf("%s %s: read response: %w", method, path, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &apiError{
+		return nil, &apiError{
 			Method: method,
 			Path:   path,
 			Status: resp.Status,
@@ -110,13 +124,7 @@ func (c *client) do(method, path string, body, out any) error {
 			Body:   redact(string(data)),
 		}
 	}
-	if out == nil {
-		return nil
-	}
-	if err := json.Unmarshal(data, out); err != nil {
-		return fmt.Errorf("%s %s: parse response: %w", method, path, err)
-	}
-	return nil
+	return data, nil
 }
 
 // apiError is a non-2xx response. The API reports application-level failures
@@ -187,26 +195,30 @@ func (c *client) list(path string) ([]json.RawMessage, error) {
 type siteRef struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+	// InternalReference is the site's name on the legacy controller API
+	// ("default" for the first site), which addresses sites by it rather than
+	// by id.
+	InternalReference string `json:"internalReference"`
 }
 
-// siteID resolves a site name (UNIFI_SITE, default "Default") to its id.
-func (c *client) siteID(name string) (string, error) {
+// site resolves a site name (UNIFI_SITE, default "Default").
+func (c *client) site(name string) (siteRef, error) {
 	raws, err := c.list("/sites")
 	if err != nil {
-		return "", fmt.Errorf("list sites: %w", err)
+		return siteRef{}, fmt.Errorf("list sites: %w", err)
 	}
 	var names []string
 	for _, raw := range raws {
 		var s siteRef
 		if err := json.Unmarshal(raw, &s); err != nil {
-			return "", fmt.Errorf("parse site: %w", err)
+			return siteRef{}, fmt.Errorf("parse site: %w", err)
 		}
 		if s.Name == name {
-			return s.ID, nil
+			return s, nil
 		}
 		names = append(names, s.Name)
 	}
-	return "", fmt.Errorf("site %q not found (have: %s)", name, strings.Join(names, ", "))
+	return siteRef{}, fmt.Errorf("site %q not found (have: %s)", name, strings.Join(names, ", "))
 }
 
 func siteName() string {

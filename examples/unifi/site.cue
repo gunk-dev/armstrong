@@ -117,4 +117,9 @@ site: schema.#Site & {
 		{type: "A_RECORD", domain: "nas.example.internal", ipv4Address: "192.0.2.10"},
 		{type: "CNAME_RECORD", domain: "files.example.internal", targetDomain: "nas.example.internal"},
 	]
+
+	// DHCP reservations, keyed by MAC. The network is named, as everywhere.
+	reservations: [
+		{mac: "02:00:5e:10:00:10", name: "nas", fixedIp: "192.0.2.10", network: "Default"},
+	]
 }

@@ -41,8 +41,10 @@ func newRootCmd() *cobra.Command {
 			"  UNIFI_SITE          site name (default \"Default\")\n" +
 			"  UNIFI_CA_FILE       PEM bundle for the console's self-signed certificate\n" +
 			"  UNIFI_INSECURE_TLS  set to 1 to skip certificate verification instead\n\n" +
-			"Objects are matched by name; SYSTEM_DEFINED objects are updated in place\n" +
-			"but never deleted, even with --prune. Passphrases live in the environment,\n" +
+			"Objects are matched by name (DHCP reservations by MAC); SYSTEM_DEFINED objects are updated in place\n" +
+			"but never deleted, even with --prune. DHCP reservations are read and written\n" +
+			"through the legacy controller API with the same key, since the Integration\n" +
+			"API has none. Passphrases live in the environment,\n" +
 			"named by each SSID's passphraseEnv, and are redacted from all output.",
 		SilenceUsage: true,
 	}
@@ -54,7 +56,8 @@ func newExportCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "export",
 		Short: "Print the live site as #Site-shaped JSON",
-		Long: "Dumps networks, firewall zones, wifi, firewall policies and DNS policies as a\n" +
+		Long: "Dumps networks, firewall zones, wifi, firewall policies, DNS policies and DHCP\n" +
+			"reservations as a\n" +
 			"#Site-shaped JSON document, so a consumer repo can bootstrap its instance file\n" +
 			"from real state. WiFi passphrases are never included.\n\n" +
 			"Objects the schema cannot express faithfully — a firewall zone whose members are\n" +
@@ -63,11 +66,11 @@ func newExportCmd() *cobra.Command {
 			"stays a no-op instead of planning a lossy write.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			c, siteID, err := connect()
+			c, s, err := connect()
 			if err != nil {
 				return err
 			}
-			return exportSite(c, siteID, cmd.OutOrStdout(), cmd.ErrOrStderr())
+			return exportSite(c, s, cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},
 	}
 }
@@ -119,7 +122,7 @@ func newSyncCmd() *cobra.Command {
 			return err
 		},
 	}
-	cmd.Flags().BoolVar(&opts.prune, "prune", false, "Delete USER_DEFINED objects not declared in the input, if the input's `deletions` lists them. SYSTEM_DEFINED objects are never deleted, and a resource type the input omits entirely is never pruned — but one it declares empty (e.g. \"dnsPolicies\": []) has every USER_DEFINED object of that type as a candidate")
+	cmd.Flags().BoolVar(&opts.prune, "prune", false, "Delete USER_DEFINED objects not declared in the input, and clear DHCP reservations it does not declare (the client record is kept), if the input's `deletions` lists them. SYSTEM_DEFINED objects are never deleted, and a resource type the input omits entirely is never pruned — but one it declares empty (e.g. \"dnsPolicies\": []) has every USER_DEFINED object of that type as a candidate")
 	addWriteFlags(cmd, &opts)
 	return cmd
 }
@@ -174,16 +177,16 @@ type options struct {
 // change is planned. It is never printed: the plan itself is the output.
 var errChangesPending = errors.New("changes required")
 
-func connect() (*client, string, error) {
+func connect() (*client, siteRef, error) {
 	c, err := newClient()
 	if err != nil {
-		return nil, "", err
+		return nil, siteRef{}, err
 	}
-	id, err := c.siteID(siteName())
+	s, err := c.site(siteName())
 	if err != nil {
-		return nil, "", err
+		return nil, siteRef{}, err
 	}
-	return c, id, nil
+	return c, s, nil
 }
 
 // reconcile converges the site to the #Site document read from in.
@@ -203,12 +206,12 @@ func reconcile(in io.Reader, out, errOut io.Writer, opts options) (bool, error) 
 		return false, fmt.Errorf("parse input: %w", err)
 	}
 
-	c, siteID, err := connect()
+	c, s, err := connect()
 	if err != nil {
 		return false, err
 	}
 	newReconciler := func(dryRun bool, w io.Writer) *reconciler {
-		return &reconciler{client: c, siteID: siteID, want: want, prune: opts.prune, force: opts.force, dryRun: dryRun, out: w}
+		return &reconciler{client: c, siteID: s.ID, legacySite: s.InternalReference, want: want, prune: opts.prune, force: opts.force, dryRun: dryRun, out: w}
 	}
 
 	if opts.dryRun {
@@ -241,7 +244,7 @@ func reconcile(in io.Reader, out, errOut io.Writer, opts options) (bool, error) 
 	}
 
 	if opts.snapshotDir != "" {
-		path, err := writeSnapshot(c, siteID, want, opts.snapshotDir, opts.snapshotKeep, errOut)
+		path, err := writeSnapshot(c, s, want, opts.snapshotDir, opts.snapshotKeep, errOut)
 		if err != nil {
 			return false, err
 		}
