@@ -49,6 +49,17 @@ type fakeConsole struct {
 
 	mu   sync.Mutex
 	coll map[string]*collection
+	// The legacy controller API, which cmd/unifi uses for DHCP reservations
+	// only. users is `rest/user` by `_id`, in insertion order; stations is
+	// `stat/sta` as MAC -> legacy network id. `rest/networkconf` is derived
+	// from the networks collection, with ids deliberately unlike the
+	// Integration API's, as on a real console.
+	users     map[string]map[string]any
+	userOrder []string
+	stations  map[string]string
+	// legacyRequests records every legacy request, reads included, so a test
+	// can assert that an absent section never reached the legacy API.
+	legacyRequests []string
 	// mutations records every non-GET request, so a test can assert that a
 	// dry run touched nothing.
 	mutations []mutation
@@ -99,6 +110,8 @@ func newFakeConsole(t *testing.T) *fakeConsole {
 		siteID:        "site-0001",
 		zbfConfigured: true,
 		coll:          map[string]*collection{},
+		users:         map[string]map[string]any{},
+		stations:      map[string]string{},
 	}
 	for _, name := range []string{collNetworks, collWiFi, collDNS, collZones, collPolicies} {
 		f.coll[name] = &collection{byID: map[string]map[string]any{}}
@@ -221,6 +234,10 @@ func (f *fakeConsole) handle(w http.ResponseWriter, r *http.Request) {
 		// Auth failures use a different envelope from application errors.
 		w.WriteHeader(http.StatusUnauthorized)
 		writeJSON(w, map[string]any{"error": map[string]any{"code": 401, "message": "Unauthorized"}})
+		return
+	}
+	if rest, ok := strings.CutPrefix(r.URL.Path, legacyPrefix+"default/"); ok {
+		f.handleLegacy(w, r, raw, rest)
 		return
 	}
 	path, ok := strings.CutPrefix(r.URL.Path, apiPrefix)
@@ -491,6 +508,151 @@ func (f *fakeConsole) record(r *http.Request, raw []byte, coll, id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.mutations = append(f.mutations, m)
+}
+
+// ------------------------------------------------------------ legacy API
+
+// legacyNetworkID is the `rest/networkconf` id of the network with this name.
+func legacyNetworkID(integrationID string) string { return "legacy-" + integrationID }
+
+func (f *fakeConsole) legacyNetworkIDNamed(name string) string {
+	return legacyNetworkID(f.objectNamed(collNetworks, name)["id"].(string))
+}
+
+// seedUser inserts a `rest/user` entry directly and returns its `_id`.
+func (f *fakeConsole) seedUser(obj map[string]any) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.insertUser(obj)
+}
+
+func (f *fakeConsole) insertUser(obj map[string]any) string {
+	f.nextID++
+	id := fmt.Sprintf("user-%03d", f.nextID)
+	stored := map[string]any{"_id": id}
+	for k, v := range obj {
+		stored[k] = v
+	}
+	f.users[id] = stored
+	f.userOrder = append(f.userOrder, id)
+	return id
+}
+
+func (f *fakeConsole) user(id string) map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.users[id]
+}
+
+func (f *fakeConsole) userByMAC(mac string) map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, u := range f.users {
+		if u["mac"] == mac {
+			return u
+		}
+	}
+	return nil
+}
+
+func (f *fakeConsole) legacyRequestLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.legacyRequests...)
+}
+
+// handleLegacy serves the legacy controller API under /api/s/default/. Every
+// response uses the {"meta":{"rc"},"data":[…]} envelope. A PUT merges into
+// the stored entry rather than replacing it, which is what a live console
+// was seen to do: `PUT {"use_fixedip":false}` keeps fixed_ip and network_id.
+func (f *fakeConsole) handleLegacy(w http.ResponseWriter, r *http.Request, raw []byte, rest string) {
+	f.mu.Lock()
+	f.legacyRequests = append(f.legacyRequests, r.Method+" "+rest)
+	f.mu.Unlock()
+	if r.Method != http.MethodGet {
+		f.record(r, raw, "legacy/"+rest, "")
+	}
+	body, err := decodeBody(raw)
+	if err != nil {
+		legacyFail(w, http.StatusBadRequest, "api.err.InvalidPayload")
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ok := func(data []map[string]any) {
+		writeJSON(w, map[string]any{"meta": map[string]any{"rc": "ok"}, "data": data})
+	}
+
+	switch id, isItem := strings.CutPrefix(rest, "rest/user/"); {
+	case rest == "rest/user" && r.Method == http.MethodGet:
+		data := []map[string]any{}
+		for _, id := range f.userOrder {
+			data = append(data, f.users[id])
+		}
+		ok(data)
+
+	case rest == "rest/user" && r.Method == http.MethodPost:
+		mac, _ := body["mac"].(string)
+		if mac == "" {
+			legacyFail(w, http.StatusBadRequest, "api.err.InvalidMac")
+			return
+		}
+		for _, u := range f.users {
+			if u["mac"] == mac {
+				legacyFail(w, http.StatusBadRequest, "api.err.MacUsed")
+				return
+			}
+		}
+		ok([]map[string]any{f.users[f.insertUser(body)]})
+
+	case isItem && (r.Method == http.MethodGet || r.Method == http.MethodPut):
+		u, found := f.users[id]
+		if !found {
+			legacyFail(w, http.StatusNotFound, "api.err.NotFound")
+			return
+		}
+		for k, v := range body {
+			u[k] = v
+		}
+		ok([]map[string]any{u})
+
+	case rest == "rest/networkconf" && r.Method == http.MethodGet:
+		data := []map[string]any{}
+		for _, n := range f.coll[collNetworks].list() {
+			data = append(data, map[string]any{"_id": legacyNetworkID(n["id"].(string)), "name": n["name"]})
+		}
+		ok(data)
+
+	case rest == "stat/sta" && r.Method == http.MethodGet:
+		data := []map[string]any{}
+		for mac, net := range f.stations {
+			data = append(data, map[string]any{"mac": mac, "network_id": net})
+		}
+		ok(data)
+
+	case rest == "cmd/stamgr" && r.Method == http.MethodPost:
+		if body["cmd"] == "forget-sta" {
+			macs, _ := body["macs"].([]any)
+			for _, m := range macs {
+				for id, u := range f.users {
+					if u["mac"] == m {
+						delete(f.users, id)
+						f.userOrder = remove(f.userOrder, id)
+					}
+				}
+			}
+		}
+		ok([]map[string]any{})
+
+	default:
+		legacyFail(w, http.StatusNotFound, "api.err.NotFound")
+	}
+}
+
+func legacyFail(w http.ResponseWriter, status int, msg string) {
+	w.WriteHeader(status)
+	writeJSON(w, map[string]any{"meta": map[string]any{"rc": "error", "msg": msg}, "data": []any{}})
 }
 
 // ------------------------------------------------------------------ helpers

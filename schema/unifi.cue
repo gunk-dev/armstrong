@@ -7,7 +7,12 @@ package schema
 // 10.x. Objects are matched by NAME, never by id: ids are server-assigned and
 // must not be committed to a consumer repo. The exceptions are the two object
 // kinds whose name is not unique: DNS policies are keyed by type + domain, and
-// firewall policies by (sourceZone, destinationZone, name).
+// firewall policies by (sourceZone, destinationZone, name). DHCP reservations
+// are keyed by MAC address.
+//
+// DHCP reservations are the one object type the Integration API does not
+// expose; `unifi` manages them through the console's legacy controller API
+// (/proxy/network/api/s/{site}/rest/user) with the same API key.
 //
 // Fields mirror the API's own names and enum values so that `unifi export`
 // output can be pasted straight into an instance file.
@@ -27,13 +32,16 @@ package schema
 	wifi?:             [...#WiFi]
 	firewallPolicies?: [...#FirewallPolicy]
 	dnsPolicies?:      [...#DNSPolicy]
+	reservations?:     [...#Reservation]
 
 	// The deletions this instance file approves. `sync --prune` deletes an
 	// object only if its key is listed here, and refuses the whole run —
 	// before writing anything — when a prune candidate is not. A key is the
 	// kind and identity exactly as the plan prints them, e.g.
 	// "dns policy A_RECORD nas.example.internal" or
-	// "firewall policy internal -> iot / block-cameras". `unifi diff --prune`
+	// "firewall policy internal -> iot / block-cameras"; clearing a DHCP
+	// reservation is keyed by its lower-case MAC, e.g.
+	// "reservation 02:00:5e:10:00:11". `unifi diff --prune`
 	// marks every candidate as listed or NOT listed. An entry that matches
 	// nothing is only warned about, so the list can be cleaned up after the
 	// deletion has landed.
@@ -221,6 +229,27 @@ package schema
 	type:  "IP_ADDRESS" | "SUBNET"
 	value: string & !=""
 }
+
+// #Reservation is a DHCP reservation: the client with this MAC address is
+// always handed fixedIp on the named network. **Identity is the MAC address.**
+//
+// The console may know the client already (connected now or seen before) or
+// not at all; either way the reservation is set before the device next asks
+// for a lease. `--prune` on a declared section clears reservations the
+// instance file does not list, and keeps the client record itself.
+#Reservation: {
+	mac: #MACAddress
+	// Display name for the client in the console. Omit to leave the console's
+	// name alone.
+	name?: string & !=""
+	// Should lie inside the network's subnet; the console decides whether an
+	// address inside the DHCP range is acceptable.
+	fixedIp: #IPv4Address
+	// NAME of the network the reservation applies on.
+	network: string & !=""
+}
+
+#IPv4Address: string & =~"^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$"
 
 // #MACAddress is colon-separated and lower-case, the form the API returns.
 #MACAddress: string & =~"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$"

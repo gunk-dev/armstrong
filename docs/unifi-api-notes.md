@@ -242,7 +242,7 @@ method parameter type UUID is not present". It takes
 for that pair alone. A `PUT` therefore has to carry the same query parameters;
 there is no site-wide ordering call.
 
-### Clients — no DHCP reservation write path (issue #13)
+### Clients — no DHCP reservation surface (issue #13)
 
 `GET /sites/{id}/clients` returns **only currently connected** clients, and
 only these fields:
@@ -272,12 +272,45 @@ No reservation-shaped endpoint exists either: `/clients/reservations`,
 parsing `<x>` as a client id). `/acl-rules` exists but is a different feature
 and was empty. There is no `/integration/v2`.
 
-Reservations do exist on the console; they live on the **private** controller
-API (`/proxy/network/api/s/{site}/rest/user`, whose objects carry `mac`,
-`name`, `use_fixedip`, `fixed_ip`, `local_dns_record`, …). `cmd/unifi` speaks
-only the Integration API, so `#Client` is not modelled: a schema field the tool
-could never reconcile would be worse than none. Revisit when a Network release
-adds client writes to `/integration/v1`.
+Reservations live on the legacy controller API instead, which is where
+`cmd/unifi` manages them — see the next section.
+
+### Legacy controller API — DHCP reservations (issue #13)
+
+Base `https://<console>/proxy/network/api/s/<site>/`, where `<site>` is the
+Integration API site's `internalReference` (`default`). The same `X-API-KEY`
+authenticates reads and writes; no session cookie or CSRF token is needed.
+Without the key, `401`. Every response is wrapped as
+`{"meta":{"rc":"ok"|"error","msg"?},"data":[…]}`, and there is no paging.
+
+- `GET rest/user` lists every client the console knows, offline ones included
+  (112 on the reference console, against 29 connected). Entries carry `_id`,
+  `mac`, `name`, `hostname`, `use_fixedip`, `fixed_ip`, `network_id`,
+  `last_connection_network_id`, `last_ip`, `local_dns_record`, … An unset
+  field is absent, not `null`.
+- `use_fixedip` is what makes a reservation. The console keeps `fixed_ip` after
+  a reservation is switched off, so `use_fixedip:false` with a `fixed_ip` is
+  seen for real and is not a reservation.
+- `network_id` is stored only when set explicitly. A reservation without one
+  applies on the client's current network; `stat/sta` reports that as
+  `network_id` for connected clients, and `rest/user` has
+  `last_connection_network_id`.
+- Network ids do not match between the APIs: `rest/networkconf` `_id` is a
+  Mongo ObjectId, the Integration API network `id` a UUID. Name is the join.
+
+Writes, confirmed on 10.6 with a throwaway locally-administered MAC:
+
+| Request | Response |
+| --- | --- |
+| `POST rest/user` `{mac, name, use_fixedip:true, fixed_ip, network_id}` for an unknown MAC | `200`, `rc:"ok"`, the new entry with its `_id` |
+| `GET rest/user/{_id}` | `200`, the entry as written |
+| `PUT rest/user/{_id}` `{use_fixedip:false}` | `200`, `use_fixedip:false`; `fixed_ip`, `network_id` and `name` unchanged |
+| `POST cmd/stamgr` `{cmd:"forget-sta", macs:[…]}` | `200`; the entry is gone from `rest/user` |
+
+`PUT` merges into the entry rather than replacing it, so a body carrying only
+the reservation fields leaves everything else on the client alone.
+`forget-sta` deletes the whole client record, not just its reservation, which
+is why `cmd/unifi` never calls it.
 
 ## Write bodies
 

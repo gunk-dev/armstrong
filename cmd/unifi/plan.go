@@ -16,13 +16,15 @@ import (
 
 // reconciler converges one site to the desired #Site document. Resource types
 // are handled in dependency order: networks, then firewall zones (which
-// reference networks), then wifi / firewall policies / DNS policies.
+// reference networks), then wifi / firewall policies / DNS policies / DHCP
+// reservations.
 type reconciler struct {
-	client *client
-	siteID string
-	want   site
-	prune  bool
-	dryRun bool
+	client     *client
+	siteID     string
+	legacySite string // the site's name on the legacy controller API
+	want       site
+	prune      bool
+	dryRun     bool
 	// force deletes prune candidates the instance file's `deletions` does not
 	// list. Only a human at a shell sets it.
 	force bool
@@ -101,6 +103,7 @@ func (r *reconciler) run() error {
 		r.syncWiFi,
 		r.syncFirewallPolicies,
 		r.syncDNSPolicies,
+		r.syncReservations,
 	} {
 		if err := step(); err != nil {
 			return err
@@ -169,25 +172,41 @@ func (r *reconciler) refusals(maxChanges int) []string {
 // skipped while planning; if one turns up on the writing pass anyway (the
 // console changed in between) the run stops rather than delete it.
 func (r *reconciler) deleteCandidate(kind, name, path string) error {
-	key := deletionKey(kind, name)
-	r.candidates[key] = true
-	listed := slices.Contains(r.want.Deletions, key)
-	switch {
-	case listed:
-		r.logf("DELETE", kind, name, "listed in deletions")
-	case r.force:
-		r.logf("DELETE", kind, name, "not listed in deletions; --force")
-	case r.dryRun:
-		r.unlisted = append(r.unlisted, key)
-		r.logf("DELETE", kind, name, "NOT listed in deletions")
-		return nil
-	default:
-		return fmt.Errorf("refusing to delete %s: %q is not listed in deletions", kind, key)
+	ok, err := r.approveDeletion(kind, name, "")
+	if !ok || err != nil {
+		return err
 	}
 	if err := r.mutate(http.MethodDelete, path, nil, nil); err != nil {
 		return fmt.Errorf("delete %s %q: %w", kind, name, err)
 	}
 	return nil
+}
+
+// approveDeletion records a prune candidate, prints its DELETE line (detail,
+// if any, goes before the listing note) and reports whether the caller should
+// go on to make the write. See deleteCandidate for the rules; it is split out
+// for deletions that are not an Integration API DELETE, such as clearing a
+// DHCP reservation.
+func (r *reconciler) approveDeletion(kind, name, detail string) (bool, error) {
+	key := deletionKey(kind, name)
+	r.candidates[key] = true
+	if detail != "" {
+		detail += "; "
+	}
+	listed := slices.Contains(r.want.Deletions, key)
+	switch {
+	case listed:
+		r.logf("DELETE", kind, name, "%slisted in deletions", detail)
+	case r.force:
+		r.logf("DELETE", kind, name, "%snot listed in deletions; --force", detail)
+	case r.dryRun:
+		r.unlisted = append(r.unlisted, key)
+		r.logf("DELETE", kind, name, "%sNOT listed in deletions", detail)
+		return false, nil
+	default:
+		return false, fmt.Errorf("refusing to delete %s: %q is not listed in deletions", kind, key)
+	}
+	return true, nil
 }
 
 // ---------------------------------------------------------------- networks

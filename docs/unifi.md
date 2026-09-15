@@ -2,8 +2,9 @@
 
 `unifi` is the sibling of the DNS tool: it reads a JSON `#Site` document on
 stdin — pipe it from `cue export` — and converges a UniFi Network site to
-match. It talks to the official **Integration API** served by the console, not
-the private controller API.
+match. It talks to the official **Integration API** served by the console for
+everything except DHCP reservations, which only the legacy controller API
+exposes (see [DHCP reservations](#dhcp-reservations)).
 
 The exact request and response shapes, and which of them are confirmed against
 a live console, are recorded separately in
@@ -15,7 +16,7 @@ a live console, are recorded separately in
 | --- | --- |
 | `UNIFI_URL` | Console base URL, e.g. `https://unifi.lan` |
 | `UNIFI_API_KEY` | Integration API key, from Settings → Control Plane → Integrations |
-| `UNIFI_SITE` | Site name; defaults to `Default` |
+| `UNIFI_SITE` | Site name; defaults to `Default`. The legacy API addresses the same site by its `internalReference` (`default`), which `unifi` reads from `GET /sites` |
 | `UNIFI_CA_FILE` | PEM bundle for the console's self-signed certificate |
 | `UNIFI_INSECURE_TLS` | Set to `1` to skip certificate verification instead |
 | `UNIFI_WIFI_*` | One variable per SSID, named by its `passphraseEnv` |
@@ -56,6 +57,7 @@ Two kinds need a composite key, because their name is not unique:
 | --- | --- |
 | DNS policy | `type` + `domain` (a DNS policy has no name at all) |
 | Firewall policy | `sourceZone` + `destinationZone` + `name` |
+| DHCP reservation | `mac` (lower-case) |
 
 The firewall rule is not a guess. A stock UniFi Network 10.6 console ships 63
 `SYSTEM_DEFINED` policies that reuse 14 names between them — `Allow All
@@ -114,11 +116,13 @@ managed and empty, pruned to zero.**
 **Every deletion is declared.** A prune candidate is deleted only if the
 instance file's `deletions` lists its key (`"wifi guest"`,
 `"dns policy A_RECORD nas.example.internal"`,
-`"firewall policy iot -> internal / block-cameras"`). Otherwise `sync` refuses
+`"firewall policy iot -> internal / block-cameras"`,
+`"reservation 02:00:5e:10:00:11"`). Otherwise `sync` refuses
 the whole run before its first write, and it does the same for a plan that
-deletes, updates or moves (reorders) more than `--max-changes` objects. With `--snapshot-dir`,
-every writing run first saves the live site, and `unifi restore` applies such
-a snapshot. The README's "Guards, snapshots and restore" section has the
+deletes, updates or moves (reorders) more than `--max-changes` objects —
+DHCP reservation updates and clears included, creates never. With `--snapshot-dir`,
+every writing run first saves the live site (DHCP reservations too, when the
+instance file declares them), and `unifi restore` applies such a snapshot. The README's "Guards, snapshots and restore" section has the
 workflow.
 
 Every section of `#Site` is `?`-optional with no default for exactly this
@@ -147,8 +151,9 @@ string regex cannot express. A port it cannot parse fails the sync rather than
 being sent as 0.
 
 **Reconciliation runs in dependency order:** networks → firewall zones → wifi,
-firewall policies and DNS policies. Zones reference networks by name, and
-policies reference zones by name, so the ids exist by the time they are needed.
+firewall policies, DNS policies and DHCP reservations. Zones reference networks
+by name, and policies reference zones by name, so the ids exist by the time
+they are needed.
 
 A policy may reference a zone the instance file does not declare: zone names
 are resolved against the live console, not against `firewallZones`.
@@ -228,19 +233,74 @@ clean no-op over all 67. **No write has been made against a live console**, so
 create/update payloads remain inferred and are exercised only against the test
 fake. Run `--dry-run` first.
 
-## DHCP reservations are not modelled
+## DHCP reservations
 
-A client's fixed IP cannot be managed through the Integration API on Network
-10.6: `/sites/{id}/clients` and `/sites/{id}/clients/{id}` are both `GET`-only,
-the client object has no fixed-IP field even for a client that holds a
-reservation, and only currently-connected clients are listed at all — so a
-reservation held by MAC for a device that is switched off is not even readable.
-No reservation-shaped endpoint exists elsewhere under `/integration/v1`.
+```cue
+reservations: [
+	{mac: "02:00:5e:10:00:10", name: "nas", fixedIp: "192.0.2.10", network: "Default"},
+]
+```
 
-Reservations do live on the console, but on the private controller API, which
-this tool deliberately does not speak. `#Client` is therefore absent from
-`schema/unifi.cue` rather than present and inert. The full evidence is in
-[`unifi-api-notes.md`](./unifi-api-notes.md#clients--no-dhcp-reservation-write-path-issue-13).
+A `#Reservation` gives the client with that MAC address a fixed IPv4 address
+on the named network. `name` is optional; when set, it is also the client's
+display name in the console, and when omitted the console's name is left alone.
+
+**Transport.** The Integration API has no reservation surface: its `/clients`
+routes are `GET`-only, list only connected clients and carry no fixed-IP field.
+Reservations are therefore read and written through the console's legacy
+controller API, under `/proxy/network/api/s/<site>/`, with the same
+`X-API-KEY`. This is the only object type on that API. It is undocumented and
+can change without notice; the code that speaks it is confined to
+`cmd/unifi/legacy.go`.
+
+| Request | Used for |
+| --- | --- |
+| `GET rest/user` | every client the console knows, connected or not |
+| `GET rest/networkconf` | legacy network `_id` → name |
+| `GET stat/sta` | the network each connected client is on now |
+| `POST rest/user` `{mac, name?, use_fixedip: true, fixed_ip, network_id}` | reserve for a MAC the console has never seen |
+| `PUT rest/user/{_id}` `{use_fixedip: true, fixed_ip, network_id, name?}` | reserve for a known client, or change a reservation |
+| `PUT rest/user/{_id}` `{use_fixedip: false}` | clear a reservation (`--prune`) |
+
+**What counts as a reservation.** A `rest/user` entry holds a reservation only
+when `use_fixedip` is `true`. The console keeps `fixed_ip` after a reservation
+is switched off, so an entry with a `fixed_ip` and `use_fixedip: false` is
+treated as having no reservation, by `export` and by the plan alike.
+
+**Networks are joined by name.** The legacy API's network ids do not match the
+Integration API's, so `network` is resolved through `rest/networkconf`. An
+entry may also store no `network_id` at all, which the console reads as "the
+client's current network". `unifi` then takes the network from `stat/sta` if
+the client is connected, or from the entry's last-seen network if not. When
+that matches the declared `network`, the reservation is `OK`; otherwise the
+plan updates it and sets `network_id` explicitly.
+
+**Plan lines** name the reservation, its address and its network:
+
+```
+CREATE reservation    nas 02:00:5e:10:00:10 -> 192.0.2.10 (Default)
+UPDATE reservation    nas 02:00:5e:10:00:10 -> 192.0.2.11 (Default; fixedIp 192.0.2.10 -> 192.0.2.11)
+OK     reservation    nas 02:00:5e:10:00:10 -> 192.0.2.10 (Default)
+DELETE reservation    02:00:5e:10:00:11 (tv -> 192.0.2.30 on Default; listed in deletions)
+```
+
+A `DELETE` line leads with the bare MAC because that is the key `deletions`
+lists: `"reservation 02:00:5e:10:00:11"`.
+
+**Pruning clears, never forgets.** With `--prune` and a declared
+`reservations` section, a reservation the instance file does not list is
+cleared with `PUT use_fixedip: false` — if `deletions` lists
+`reservation <mac>`; otherwise `sync` refuses the run, as for any other
+unlisted deletion. The client record, with its name and
+history, stays. `unifi` never calls `cmd/stamgr forget-sta`, which would delete
+the whole client. As for every other section, an absent `reservations` key is
+not managed (the legacy API is not even contacted), and `reservations: []`
+with `--prune` clears every reservation on the site.
+
+`export` emits every reservation with its network named, so
+`unifi export | unifi diff` is a no-op. A reservation that stores no network
+for a client never seen on one cannot be named; `export` leaves it out and
+says so on stderr.
 
 ## Running it
 

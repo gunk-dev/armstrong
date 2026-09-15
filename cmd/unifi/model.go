@@ -1,5 +1,7 @@
 package main
 
+import "strings"
+
 // Desired state, shaped exactly like `cue export` output of schema.#Site.
 // Objects are identified by name; ids are server-assigned and never appear in
 // an instance file.
@@ -10,6 +12,7 @@ type site struct {
 	WiFi             []wifi           `json:"wifi"`
 	FirewallPolicies []firewallPolicy `json:"firewallPolicies"`
 	DNSPolicies      []dnsPolicy      `json:"dnsPolicies"`
+	Reservations     []reservation    `json:"reservations"`
 
 	// Deletions are the prune candidates the instance file approves, by the
 	// key the plan prints: kind, a space, then the object's identity (e.g.
@@ -186,3 +189,17 @@ type dnsPolicy struct {
 // key is the identity used to match desired against actual. DNS policies have
 // no name, so they are keyed by type plus the domain they answer for.
 func (d dnsPolicy) key() string { return d.Type + " " + d.Domain }
+
+// reservation is a DHCP reservation: a fixed IPv4 address for one client on a
+// named network. It is managed through the legacy controller API — see
+// legacy.go.
+type reservation struct {
+	MAC     string `json:"mac"`
+	Name    string `json:"name,omitempty"`
+	FixedIP string `json:"fixedIp"`
+	Network string `json:"network"`
+}
+
+// key is the identity used to match desired against actual: the MAC address,
+// lower-cased the way the console stores it.
+func (r reservation) key() string { return strings.ToLower(r.MAC) }

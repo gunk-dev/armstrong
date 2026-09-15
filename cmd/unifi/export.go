@@ -13,8 +13,8 @@ import (
 // than emitted in a mangled form: the contract of `export` is that its output
 // feeds straight back into `diff` as a no-op, and a lossy entry would instead
 // become a destructive `PUT`.
-func exportSite(c *client, siteID string, out, warn io.Writer) error {
-	doc, err := buildExport(c, siteID, warn)
+func exportSite(c *client, ref siteRef, out, warn io.Writer) error {
+	doc, err := buildExport(c, ref, true, warn)
 	if err != nil {
 		return err
 	}
@@ -24,8 +24,11 @@ func exportSite(c *client, siteID string, out, warn io.Writer) error {
 }
 
 // buildExport reads the live site into a #Site document; see exportSite.
-func buildExport(c *client, siteID string, warn io.Writer) (site, error) {
+// DHCP reservations are read, through the legacy API, only when reservations
+// is set; otherwise the section is left absent.
+func buildExport(c *client, ref siteRef, reservations bool, warn io.Writer) (site, error) {
 	var doc site
+	siteID := ref.ID
 
 	nets, err := c.networks(siteID)
 	if err != nil {
@@ -103,6 +106,14 @@ func buildExport(c *client, siteID string, warn io.Writer) (site, error) {
 	}
 	for _, a := range dns {
 		doc.DNSPolicies = append(doc.DNSPolicies, a.Spec)
+	}
+
+	if reservations {
+		legacy, err := c.legacyState(ref.InternalReference)
+		if err != nil {
+			return doc, err
+		}
+		doc.Reservations = exportReservations(legacy, warn)
 	}
 
 	// Emit empty lists rather than null so the document round-trips into #Site.

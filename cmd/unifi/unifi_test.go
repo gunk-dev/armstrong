@@ -823,6 +823,9 @@ const exampleSiteFallback = `{
   "dnsPolicies": [
     {"type":"A_RECORD","enabled":true,"domain":"nas.example.internal","ipv4Address":"192.0.2.10","ttlSeconds":0},
     {"type":"CNAME_RECORD","enabled":true,"domain":"files.example.internal","targetDomain":"nas.example.internal","ttlSeconds":0}
+  ],
+  "reservations": [
+    {"mac":"02:00:5e:10:00:10","name":"nas","fixedIp":"192.0.2.10","network":"Default"}
   ]
 }`
 

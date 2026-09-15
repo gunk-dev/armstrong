@@ -20,8 +20,16 @@ import (
 // for it where the instance file declares that SSID, so `unifi restore` reads
 // the same environment variable `sync` does, and export's generated name
 // otherwise.
-func writeSnapshot(c *client, siteID string, want site, dir string, keep int, warn io.Writer) (string, error) {
-	doc, err := buildExport(c, siteID, warn)
+//
+// DHCP reservations are included when the instance file declares a
+// reservations section — the only case in which the run can change them — and
+// read through the legacy API of the site ref names. Like the rest of the
+// export they are keyed by MAC and name their network, so restore resolves
+// both against the live console. An instance file without the section leaves
+// it absent from the snapshot too, which keeps the legacy API out of a run
+// that does not manage reservations and makes restore leave them alone.
+func writeSnapshot(c *client, ref siteRef, want site, dir string, keep int, warn io.Writer) (string, error) {
+	doc, err := buildExport(c, ref, want.Reservations != nil, warn)
 	if err != nil {
 		return "", fmt.Errorf("snapshot: %w", err)
 	}
