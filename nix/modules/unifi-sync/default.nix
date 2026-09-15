@@ -12,6 +12,13 @@
 # The schema it is checked against, and the binary that consumes the export,
 # both come from this flake, so they cannot disagree.
 #
+# In "sync" mode every run that is about to write first saves the live site
+# to `snapshotDir`, and `unifi` refuses — before writing anything — a plan that
+# deletes an object the instance file's `deletions` does not list, or that
+# deletes, updates or moves (reorders) more than `maxChanges` objects. The
+# module never passes `--force`: overriding either guard is for a human,
+# through `unifi-restore` or `unifi` itself.
+#
 # `mode` defaults to "diff", which never writes. In that mode drift is a
 # failure: `unifi diff` exits 2 when the plan is non-empty, and the unit is
 # allowed to fail on it so the drift is visible in `systemctl status` with the
@@ -77,6 +84,27 @@ let
   # `unifi diff` exits 2 for "changes are needed" and 1 for "the command
   # failed"; the caller decides what to do with that, so nothing is swallowed
   # here.
+  #
+  # `connection` is the environment every entry point needs: console details
+  # and the API key.
+  connection = ''
+    export UNIFI_URL=${lib.escapeShellArg cfg.consoleUrl}
+    export UNIFI_SITE=${lib.escapeShellArg cfg.site}
+    ${lib.optionalString (cfg.caFile != null) "export UNIFI_CA_FILE=${lib.escapeShellArg cfg.caFile}"}
+    ${lib.optionalString cfg.insecureTls "export UNIFI_INSECURE_TLS=1"}
+
+    # The API key is never put in the unit's environment, where anything
+    # able to read /proc could lift it. Under systemd it arrives as a
+    # credential; a human running the wrapper reads the secret file
+    # directly, which is why that path is a fallback rather than the rule.
+    if [ -n "''${CREDENTIALS_DIRECTORY:-}" ] && [ -r "$CREDENTIALS_DIRECTORY/api-key" ]; then
+      UNIFI_API_KEY=$(cat "$CREDENTIALS_DIRECTORY/api-key")
+    else
+      UNIFI_API_KEY=$(cat ${lib.escapeShellArg cfg.apiKeyFile})
+    fi
+        export UNIFI_API_KEY
+  '';
+
   pipeline =
     {
       name,
@@ -90,21 +118,7 @@ let
         cfg.package
       ];
       text = ''
-        export UNIFI_URL=${lib.escapeShellArg cfg.consoleUrl}
-        export UNIFI_SITE=${lib.escapeShellArg cfg.site}
-        ${lib.optionalString (cfg.caFile != null) "export UNIFI_CA_FILE=${lib.escapeShellArg cfg.caFile}"}
-        ${lib.optionalString cfg.insecureTls "export UNIFI_INSECURE_TLS=1"}
-
-        # The API key is never put in the unit's environment, where anything
-        # able to read /proc could lift it. Under systemd it arrives as a
-        # credential; a human running the wrapper reads the secret file
-        # directly, which is why that path is a fallback rather than the rule.
-        if [ -n "''${CREDENTIALS_DIRECTORY:-}" ] && [ -r "$CREDENTIALS_DIRECTORY/api-key" ]; then
-          UNIFI_API_KEY=$(cat "$CREDENTIALS_DIRECTORY/api-key")
-        else
-          UNIFI_API_KEY=$(cat ${lib.escapeShellArg cfg.apiKeyFile})
-        fi
-        export UNIFI_API_KEY
+        ${connection}
 
         ${preamble}
 
@@ -116,7 +130,18 @@ let
 
   syncScript = pipeline {
     name = "unifi-sync-run";
-    args = [ cfg.mode ] ++ lib.optional cfg.prune "--prune";
+    args = [
+      cfg.mode
+      "--max-changes"
+      (toString cfg.maxChanges)
+    ]
+    ++ lib.optional cfg.prune "--prune"
+    ++ lib.optionals (cfg.mode == "sync") [
+      "--snapshot-dir"
+      cfg.snapshotDir
+      "--snapshot-keep"
+      (toString cfg.snapshotKeep)
+    ];
   };
 
   # What a human runs to see the plan. Always `sync --dry-run`, whatever `mode`
@@ -127,8 +152,24 @@ let
     args = [
       "sync"
       "--dry-run"
+      "--max-changes"
+      (toString cfg.maxChanges)
     ]
     ++ lib.optional cfg.prune "--prune";
+  };
+
+  # Puts the site back to a snapshot: `unifi-restore [--dry-run] [--prune
+  # --force] <snapshot.json>`. It runs as whoever invokes it, so reading the
+  # snapshots and the secrets file takes root. A snapshot names each SSID's
+  # passphraseEnv, which is read from the same secrets file the unit uses.
+  restoreScript = pkgs.writeShellApplication {
+    name = "unifi-restore";
+    runtimeInputs = [ cfg.package ];
+    text = ''
+      ${connection}
+      ${loadSecrets}
+      exec unifi restore --max-changes ${toString cfg.maxChanges} "$@"
+    '';
   };
 in
 {
@@ -269,9 +310,40 @@ in
       description = ''
         Delete USER_DEFINED objects the instance file does not declare. In
         `diff` mode this only adds the deletions to the printed plan.
+        Only objects whose keys the instance file lists in `deletions` are
+        deleted; any other candidate makes `sync` refuse the whole run.
         `SYSTEM_DEFINED` objects are never deleted, and resource types the
-        instance file leaves as an empty list are never pruned.
+        instance file omits are never pruned.
       '';
+    };
+
+    maxChanges = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 10;
+      description = ''
+        Refuse a plan that deletes, updates or moves more than this many
+        objects (`--max-changes`); every firewall policy whose position a
+        reorder changes counts, creates do not. A refused run writes
+        nothing, fails the unit, and leaves the full plan in the journal. In
+        `diff` mode the plan only notes that `sync` would refuse it.
+      '';
+    };
+
+    snapshotDir = lib.mkOption {
+      type = lib.types.str;
+      default = "/var/lib/unifi-sync/snapshots";
+      description = ''
+        Where `sync` mode saves a JSON export of the live site before its
+        first write. The default is inside the unit's `StateDirectory`; any
+        other path is added to `ReadWritePaths` and must already be writable
+        by the unit's dynamic user. Restore one with `unifi-restore`.
+      '';
+    };
+
+    snapshotKeep = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 10;
+      description = "How many snapshots to keep in `snapshotDir`; 0 keeps every one.";
     };
 
     onSuccessOf = lib.mkOption {
@@ -345,7 +417,10 @@ in
       }
     ];
 
-    environment.systemPackages = [ planScript ];
+    environment.systemPackages = [
+      planScript
+      restoreScript
+    ];
 
     systemd.services = lib.mkMerge [
       {
@@ -364,8 +439,14 @@ in
             LoadCredential = [ "api-key:${cfg.apiKeyFile}" ];
 
             # DynamicUser gives the run no identity that outlives it, which is
-            # all it needs: it talks to one HTTPS endpoint and writes nothing.
+            # all it needs: it talks to one HTTPS endpoint and writes only its
+            # snapshots, to the state directory.
             DynamicUser = true;
+            StateDirectory = "unifi-sync";
+            StateDirectoryMode = "0700";
+            ReadWritePaths = lib.optional (
+              !lib.hasPrefix "/var/lib/unifi-sync/" cfg.snapshotDir
+            ) cfg.snapshotDir;
             ProtectSystem = "strict";
             ProtectHome = true;
             PrivateTmp = true;

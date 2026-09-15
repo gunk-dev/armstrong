@@ -43,6 +43,9 @@ type fakeConsole struct {
 	// policy write path would be untestable otherwise — so the tests that care
 	// switch it on explicitly.
 	omitUserPolicyIDs bool
+	// onMutation, when set, runs as each non-GET request arrives and before
+	// it is applied — so a test can inspect the world as of the first write.
+	onMutation func(mutation)
 
 	mu   sync.Mutex
 	coll map[string]*collection
@@ -481,9 +484,13 @@ func (f *fakeConsole) record(r *http.Request, raw []byte, coll, id string) {
 	if id != "" {
 		path = coll + "/" + id
 	}
+	m := mutation{Method: r.Method, Path: path, Body: body}
+	if f.onMutation != nil {
+		f.onMutation(m)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.mutations = append(f.mutations, mutation{Method: r.Method, Path: path, Body: body})
+	f.mutations = append(f.mutations, m)
 }
 
 // ------------------------------------------------------------------ helpers

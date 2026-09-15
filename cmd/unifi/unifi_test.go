@@ -285,7 +285,8 @@ func TestPruneSkipsSystemDefined(t *testing.T) {
 	    "security":{"type":"WPA2_PERSONAL","passphraseEnv":"UNIFI_WIFI_MAIN"},
 	    "bands":[2.4,5],"clientIsolationEnabled":false,"hideName":false,
 	    "multicastToUnicastConversionEnabled":true,"uapsdEnabled":false}],
-	  "firewallPolicies": [], "dnsPolicies": []
+	  "firewallPolicies": [], "dnsPolicies": [],
+	  "deletions": ["wifi stale-ssid", "dns policy A_RECORD nas.example.internal"]
 	}`
 
 	stdout := mustRun(t, f, desired, []string{"UNIFI_WIFI_MAIN=super-secret-passphrase"}, "sync", "--prune")
@@ -361,7 +362,8 @@ func TestPruneEmptySectionDeletesUserDefined(t *testing.T) {
 	    "bands":[2.4,5],"clientIsolationEnabled":false,"hideName":false,
 	    "multicastToUnicastConversionEnabled":true,"uapsdEnabled":false}],
 	  "firewallPolicies": [],
-	  "dnsPolicies": []
+	  "dnsPolicies": [],
+	  "deletions": ["dns policy A_RECORD nas.example.internal"]
 	}`
 
 	stdout, _, code := run(t, f, desired, []string{"UNIFI_WIFI_MAIN=super-secret-passphrase"}, "sync", "--prune", "--dry-run")
@@ -499,7 +501,8 @@ func TestSystemDefinedIsUpdatedInPlace(t *testing.T) {
 	    "cellularBackupEnabled":false,"mdnsForwardingEnabled":true,
 	    "ipv4":{"hostIpAddress":"192.0.2.1","prefixLength":24,"autoScaleEnabled":false,
 	      "dhcp":{"mode":"SERVER","rangeStart":"192.0.2.100","rangeStop":"192.0.2.199","leaseTimeSeconds":86400}}}],
-	  "firewallZones": [], "wifi": [], "firewallPolicies": [], "dnsPolicies": []
+	  "firewallZones": [], "wifi": [], "firewallPolicies": [], "dnsPolicies": [],
+	  "deletions": ["network IoT", "wifi example-main", "dns policy A_RECORD nas.example.internal"]
 	}`
 	stdout := mustRun(t, f, desired, nil, "sync", "--prune")
 

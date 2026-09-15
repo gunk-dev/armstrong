@@ -27,6 +27,17 @@ package schema
 	wifi?:             [...#WiFi]
 	firewallPolicies?: [...#FirewallPolicy]
 	dnsPolicies?:      [...#DNSPolicy]
+
+	// The deletions this instance file approves. `sync --prune` deletes an
+	// object only if its key is listed here, and refuses the whole run —
+	// before writing anything — when a prune candidate is not. A key is the
+	// kind and identity exactly as the plan prints them, e.g.
+	// "dns policy A_RECORD nas.example.internal" or
+	// "firewall policy internal -> iot / block-cameras". `unifi diff --prune`
+	// marks every candidate as listed or NOT listed. An entry that matches
+	// nothing is only warned about, so the list can be cleaned up after the
+	// deletion has landed.
+	deletions?: [...string & !=""]
 }
 
 // #Network is a gateway-managed L3 network (a VLAN with an IPv4 subnet and,

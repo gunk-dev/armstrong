@@ -10,6 +10,12 @@ type site struct {
 	WiFi             []wifi           `json:"wifi"`
 	FirewallPolicies []firewallPolicy `json:"firewallPolicies"`
 	DNSPolicies      []dnsPolicy      `json:"dnsPolicies"`
+
+	// Deletions are the prune candidates the instance file approves, by the
+	// key the plan prints: kind, a space, then the object's identity (e.g.
+	// "dns policy A_RECORD nas.example.internal"). `sync --prune` refuses to
+	// run while any candidate is missing from this list.
+	Deletions []string `json:"deletions,omitempty"`
 }
 
 type network struct {

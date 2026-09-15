@@ -108,8 +108,18 @@ from under you.
 protects an instance file that simply forgot a section from wiping every
 object of that type on the first sync. But a section the file *does* declare,
 even as an empty list (`"wifi": []`), is fair game: every `USER_DEFINED`
-object of that type is deleted. **Absent = not managed, never pruned; `[]` =
+object of that type is a prune candidate. **Absent = not managed, never pruned; `[]` =
 managed and empty, pruned to zero.**
+
+**Every deletion is declared.** A prune candidate is deleted only if the
+instance file's `deletions` lists its key (`"wifi guest"`,
+`"dns policy A_RECORD nas.example.internal"`,
+`"firewall policy iot -> internal / block-cameras"`). Otherwise `sync` refuses
+the whole run before its first write, and it does the same for a plan that
+deletes, updates or moves (reorders) more than `--max-changes` objects. With `--snapshot-dir`,
+every writing run first saves the live site, and `unifi restore` applies such
+a snapshot. The README's "Guards, snapshots and restore" section has the
+workflow.
 
 Every section of `#Site` is `?`-optional with no default for exactly this
 reason: an instance file that omits `firewallPolicies` produces JSON with no
