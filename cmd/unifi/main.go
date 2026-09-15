@@ -95,7 +95,7 @@ func newDiffCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&opts.prune, "prune", false, "Include the deletions that sync --prune would make in the plan")
-	cmd.Flags().IntVar(&opts.maxChanges, "max-changes", defaultMaxChanges, "Report when the plan deletes or updates more objects than sync --max-changes would allow")
+	cmd.Flags().IntVar(&opts.maxChanges, "max-changes", defaultMaxChanges, "Report when the plan deletes, updates or moves (firewall policy order) more objects than sync --max-changes would allow")
 	return cmd
 }
 
@@ -109,7 +109,8 @@ func newSyncCmd() *cobra.Command {
 			"The whole plan is worked out before anything is written, and the run is refused —\n" +
 			"with the plan printed and nothing changed — when:\n" +
 			"  * --prune would delete an object whose key the input's `deletions` does not list, or\n" +
-			"  * the plan deletes or updates more than --max-changes objects (creates do not count).\n" +
+			"  * the plan deletes, updates or reorders more than --max-changes objects (every firewall\n" +
+			"    policy whose position changes counts; creates do not).\n" +
 			"--force overrides both. With --snapshot-dir, the live site is exported there before\n" +
 			"the first write; `unifi restore` applies such a snapshot.",
 		Args: cobra.NoArgs,
@@ -154,7 +155,7 @@ func newRestoreCmd() *cobra.Command {
 func addWriteFlags(cmd *cobra.Command, opts *options) {
 	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "Print the planned changes without calling the API")
 	cmd.Flags().BoolVar(&opts.force, "force", false, "Apply the plan even if it deletes objects `deletions` does not list or exceeds --max-changes")
-	cmd.Flags().IntVar(&opts.maxChanges, "max-changes", defaultMaxChanges, "Refuse a plan that deletes or updates more than this many objects")
+	cmd.Flags().IntVar(&opts.maxChanges, "max-changes", defaultMaxChanges, "Refuse a plan that deletes, updates or moves (firewall policy order) more than this many objects")
 	cmd.Flags().StringVar(&opts.snapshotDir, "snapshot-dir", "", "Before the first write, save the live site there as a timestamped JSON export")
 	cmd.Flags().IntVar(&opts.snapshotKeep, "snapshot-keep", 10, "Number of snapshots to keep in --snapshot-dir; 0 keeps all")
 }

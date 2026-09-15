@@ -36,7 +36,11 @@ type reconciler struct {
 	zoneIDs    map[string]string // zone name -> id
 	deletes    int
 	updates    int
-	writes     int
+	// moved counts firewall policies an ordering write changes the position
+	// of. It is guarded like deletes and updates: one ordering request can
+	// rearrange a whole zone pair.
+	moved  int
+	writes int
 	// candidates holds the key of every object --prune would delete, listed
 	// or not; unlisted the ones `deletions` does not approve.
 	candidates map[string]bool
@@ -135,9 +139,9 @@ func (r *reconciler) warnStaleDeletions() {
 }
 
 // refusals lists why a sync with this plan must not be applied: prune
-// candidates the instance file does not list, and more deletes and updates
-// than maxChanges allows. Creates never count — they destroy nothing. force
-// overrides both.
+// candidates the instance file does not list, and more deletes, updates and
+// moved firewall policies than maxChanges allows. Creates never count — they
+// destroy nothing. force overrides both.
 func (r *reconciler) refusals(maxChanges int) []string {
 	if r.force {
 		return nil
@@ -152,9 +156,10 @@ func (r *reconciler) refusals(maxChanges int) []string {
 		}
 		out = append(out, b.String())
 	}
-	if n := r.deletes + r.updates; n > maxChanges {
-		out = append(out, fmt.Sprintf("the plan deletes or updates %d object(s), more than --max-changes %d; "+
-			"review the plan above and re-run with --force (or a higher --max-changes) to apply it", n, maxChanges))
+	if n := r.deletes + r.updates + r.moved; n > maxChanges {
+		out = append(out, fmt.Sprintf("the plan changes %d object(s) (%d deleted, %d updated, %d firewall policies moved), "+
+			"more than --max-changes %d; review the plan above and re-run with --force (or a higher --max-changes) to apply it",
+			n, r.deletes, r.updates, r.moved, maxChanges))
 	}
 	return out
 }
@@ -646,7 +651,9 @@ func (r *reconciler) reorderPolicies(base string, managed map[string][]managedPo
 			}
 			ids = append(ids, p.id)
 		}
-		r.logf("ORDER", "firewall policy", pair, "%d policies", len(ids))
+		n := movedPolicies(currentKeys, wantKeys)
+		r.moved += n
+		r.logf("ORDER", "firewall policy", pair, "%d moved", n)
 
 		srcZone, err := r.resolveZone(movable[0].srcZone)
 		if err != nil {
@@ -667,6 +674,31 @@ func (r *reconciler) reorderPolicies(base string, managed map[string][]managedPo
 		}
 	}
 	return nil
+}
+
+// movedPolicies counts the policies that already exist on the console and
+// whose position among the other existing ones differs between current and
+// want. Policies this run creates are left out, as creates are: placing a new
+// policy moves nothing that was there. The comparison is positional, so moving
+// one policy to the front counts every policy it shifts — erring towards the
+// guard.
+func movedPolicies(current, want []string) int {
+	exists := map[string]bool{}
+	for _, k := range current {
+		exists[k] = true
+	}
+	moved := 0
+	i := 0
+	for _, k := range want {
+		if !exists[k] {
+			continue
+		}
+		if current[i] != k {
+			moved++
+		}
+		i++
+	}
+	return moved
 }
 
 // orderOf sorts unordered policies after ordered ones, keeping their relative

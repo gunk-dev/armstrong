@@ -241,3 +241,65 @@ func TestSnapshotsAreRotated(t *testing.T) {
 		t.Errorf("have %d snapshots, want 2: %v", len(got), got)
 	}
 }
+
+// orderedPolicies declares four iot -> internal policies with the given order
+// values, so a test can reorder them by changing only the numbers.
+func orderedPolicies(orders [4]int) string {
+	var entries []string
+	for i, o := range orders {
+		entries = append(entries, fmt.Sprintf(`{"name":"p%d","enabled":true,"action":"BLOCK","allowReturnTraffic":true,
+		  "sourceZone":"iot","destinationZone":"internal","ipVersion":"IPV4","loggingEnabled":false,"order":%d}`, i, o))
+	}
+	return `{
+	  "firewallZones": [{"name":"internal","networks":["Default"]},{"name":"iot","networks":["IoT"]}],
+	  "firewallPolicies": [` + strings.Join(entries, ",") + `]
+	}`
+}
+
+// One ordering request can rearrange a whole zone pair, so every policy it
+// moves counts towards --max-changes: an oversized reorder is refused before
+// the snapshot and before any write, and a small one goes through.
+func TestReorderCountsTowardsMaxChanges(t *testing.T) {
+	f := newFakeConsole(t)
+	seedSite(f)
+	mustRun(t, f, orderedPolicies([4]int{10, 20, 30, 40}), nil, "sync")
+	if want := []string{"p0", "p1", "p2", "p3"}; !equalStrings(f.policyOrder(), want) {
+		t.Fatalf("policies ordered %v, want %v", f.policyOrder(), want)
+	}
+	dir := t.TempDir()
+	writes := len(f.recorded())
+
+	// Reversing moves all four policies; the limit is three.
+	reversed := orderedPolicies([4]int{40, 30, 20, 10})
+	if out, _, code := run(t, f, reversed, nil, "diff", "--max-changes", "3"); code != exitChangesPending ||
+		!strings.Contains(out, "ORDER  firewall policy iot -> internal (4 moved)") ||
+		!strings.Contains(out, "sync would refuse this plan") ||
+		!strings.Contains(out, "4 firewall policies moved") {
+		t.Errorf("diff did not report the oversized reorder (exit %d):\n%s", code, out)
+	}
+	stdout, stderr, code := run(t, f, reversed, nil, "sync", "--max-changes", "3", "--snapshot-dir", dir)
+	if code != 1 || !strings.Contains(stderr, "--max-changes 3") || !strings.Contains(stdout, "(4 moved)") {
+		t.Fatalf("guard did not refuse the reorder (exit %d)\n%s\n%s", code, stdout, stderr)
+	}
+	if muts := f.recorded()[writes:]; len(muts) != 0 {
+		t.Errorf("a refused reorder wrote to the console: %+v", muts)
+	}
+	if s := snapshots(t, dir); len(s) != 0 {
+		t.Errorf("a refused reorder wrote a snapshot: %v", s)
+	}
+	if want := []string{"p0", "p1", "p2", "p3"}; !equalStrings(f.policyOrder(), want) {
+		t.Errorf("policies ordered %v after a refused sync, want %v", f.policyOrder(), want)
+	}
+
+	// Swapping the first two moves two, within a limit of two.
+	stdout = mustRun(t, f, orderedPolicies([4]int{20, 10, 30, 40}), nil, "sync", "--max-changes", "2", "--snapshot-dir", dir)
+	if !strings.Contains(stdout, "(2 moved)") {
+		t.Errorf("plan does not show the moved count:\n%s", stdout)
+	}
+	if want := []string{"p1", "p0", "p2", "p3"}; !equalStrings(f.policyOrder(), want) {
+		t.Errorf("policies ordered %v, want %v", f.policyOrder(), want)
+	}
+	if s := snapshots(t, dir); len(s) != 1 {
+		t.Errorf("have %d snapshots after the allowed reorder, want 1", len(s))
+	}
+}

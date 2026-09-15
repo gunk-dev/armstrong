@@ -116,7 +116,7 @@ instance file's `deletions` lists its key (`"wifi guest"`,
 `"dns policy A_RECORD nas.example.internal"`,
 `"firewall policy iot -> internal / block-cameras"`). Otherwise `sync` refuses
 the whole run before its first write, and it does the same for a plan that
-deletes or updates more than `--max-changes` objects. With `--snapshot-dir`,
+deletes, updates or moves (reorders) more than `--max-changes` objects. With `--snapshot-dir`,
 every writing run first saves the live site, and `unifi restore` applies such
 a snapshot. The README's "Guards, snapshots and restore" section has the
 workflow.

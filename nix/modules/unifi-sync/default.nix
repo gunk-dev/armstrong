@@ -15,9 +15,9 @@
 # In "sync" mode every run that is about to write first saves the live site
 # to `snapshotDir`, and `unifi` refuses — before writing anything — a plan that
 # deletes an object the instance file's `deletions` does not list, or that
-# deletes or updates more than `maxChanges` objects. The module never passes
-# `--force`: overriding either guard is for a human, through `unifi-restore`
-# or `unifi` itself.
+# deletes, updates or moves (reorders) more than `maxChanges` objects. The
+# module never passes `--force`: overriding either guard is for a human,
+# through `unifi-restore` or `unifi` itself.
 #
 # `mode` defaults to "diff", which never writes. In that mode drift is a
 # failure: `unifi diff` exits 2 when the plan is non-empty, and the unit is
@@ -321,8 +321,9 @@ in
       type = lib.types.ints.unsigned;
       default = 10;
       description = ''
-        Refuse a plan that deletes or updates more than this many objects
-        (`--max-changes`); creates do not count. A refused run writes
+        Refuse a plan that deletes, updates or moves more than this many
+        objects (`--max-changes`); every firewall policy whose position a
+        reorder changes counts, creates do not. A refused run writes
         nothing, fails the unit, and leaves the full plan in the journal. In
         `diff` mode the plan only notes that `sync` would refuse it.
       '';

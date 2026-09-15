@@ -432,6 +432,8 @@ even the creates) when either guard trips:
   prints a `WARN`, so the list can be emptied at leisure.
 - **Mass change.** A plan that deletes or updates more than `--max-changes`
   objects (default 10) is refused. Creates do not count.
+  Reorders do: every firewall policy whose position changes counts as one,
+  and the plan shows it as `ORDER firewall policy <pair> (N moved)`.
 
 `--force` overrides both. It is for a human at a shell; the NixOS module never
 passes it.
