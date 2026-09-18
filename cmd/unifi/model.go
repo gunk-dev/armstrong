@@ -13,6 +13,7 @@ type site struct {
 	FirewallPolicies []firewallPolicy `json:"firewallPolicies"`
 	DNSPolicies      []dnsPolicy      `json:"dnsPolicies"`
 	Reservations     []reservation    `json:"reservations"`
+	MDNS             *mdns            `json:"mdns,omitempty"`
 
 	// Deletions are the prune candidates the instance file approves, by the
 	// key the plan prints: kind, a space, then the object's identity (e.g.
@@ -203,3 +204,13 @@ type reservation struct {
 // key is the identity used to match desired against actual: the MAC address,
 // lower-cased the way the console stores it.
 func (r reservation) key() string { return strings.ToLower(r.MAC) }
+
+// mdns is the gateway's site-wide mDNS proxy setting, managed through the
+// legacy controller API — see legacy.go. Networks nil means every network with
+// mdnsForwardingEnabled.
+type mdns struct {
+	Mode           string   `json:"mode"`
+	Services       []string `json:"services,omitempty"`
+	CustomServices []string `json:"customServices,omitempty"`
+	Networks       []string `json:"networks,omitempty"`
+}

@@ -46,17 +46,25 @@ type fakeConsole struct {
 	// onMutation, when set, runs as each non-GET request arrives and before
 	// it is applied — so a test can inspect the world as of the first write.
 	onMutation func(mutation)
+	// onLegacyRequest, when set, runs as each legacy request arrives, reads
+	// included, before it is served.
+	onLegacyRequest func(method, rest string)
+	// mdnsPutMissing makes PUT rest/setting/mdns/{_id} answer 404, as a
+	// console would if the presumed write path were wrong.
+	mdnsPutMissing bool
 
 	mu   sync.Mutex
 	coll map[string]*collection
 	// The legacy controller API, which cmd/unifi uses for DHCP reservations
-	// only. users is `rest/user` by `_id`, in insertion order; stations is
-	// `stat/sta` as MAC -> legacy network id. `rest/networkconf` is derived
-	// from the networks collection, with ids deliberately unlike the
-	// Integration API's, as on a real console.
+	// and the mDNS proxy. users is `rest/user` by `_id`, in insertion order;
+	// stations is `stat/sta` as MAC -> legacy network id; settings is
+	// `rest/setting`. `rest/networkconf` is derived from the networks
+	// collection, with ids deliberately unlike the Integration API's, as on a
+	// real console.
 	users     map[string]map[string]any
 	userOrder []string
 	stations  map[string]string
+	settings  []map[string]any
 	// legacyRequests records every legacy request, reads included, so a test
 	// can assert that an absent section never reached the legacy API.
 	legacyRequests []string
@@ -112,6 +120,10 @@ func newFakeConsole(t *testing.T) *fakeConsole {
 		coll:          map[string]*collection{},
 		users:         map[string]map[string]any{},
 		stations:      map[string]string{},
+		settings: []map[string]any{
+			{"key": "mgmt", "_id": "setting-mgmt", "site_id": fakeLegacySiteID, "led_enabled": true},
+			defaultMDNSSetting(),
+		},
 	}
 	for _, name := range []string{collNetworks, collWiFi, collDNS, collZones, collPolicies} {
 		f.coll[name] = &collection{byID: map[string]map[string]any{}}
@@ -569,6 +581,9 @@ func (f *fakeConsole) handleLegacy(w http.ResponseWriter, r *http.Request, raw [
 	f.mu.Lock()
 	f.legacyRequests = append(f.legacyRequests, r.Method+" "+rest)
 	f.mu.Unlock()
+	if f.onLegacyRequest != nil {
+		f.onLegacyRequest(r.Method, rest)
+	}
 	if r.Method != http.MethodGet {
 		f.record(r, raw, "legacy/"+rest, "")
 	}
@@ -617,6 +632,20 @@ func (f *fakeConsole) handleLegacy(w http.ResponseWriter, r *http.Request, raw [
 		}
 		ok([]map[string]any{u})
 
+	case rest == "rest/setting" && r.Method == http.MethodGet:
+		ok(f.settings)
+
+	case strings.HasPrefix(rest, "rest/setting/mdns/") && r.Method == http.MethodPut:
+		m := f.mdnsLocked()
+		if f.mdnsPutMissing || m["_id"] != strings.TrimPrefix(rest, "rest/setting/mdns/") {
+			legacyFail(w, http.StatusNotFound, "api.err.NotFound")
+			return
+		}
+		for k, v := range body {
+			m[k] = v
+		}
+		ok([]map[string]any{m})
+
 	case rest == "rest/networkconf" && r.Method == http.MethodGet:
 		data := []map[string]any{}
 		for _, n := range f.coll[collNetworks].list() {
@@ -647,6 +676,72 @@ func (f *fakeConsole) handleLegacy(w http.ResponseWriter, r *http.Request, raw [
 
 	default:
 		legacyFail(w, http.StatusNotFound, "api.err.NotFound")
+	}
+}
+
+const (
+	fakeLegacySiteID = "5f0000000000000000000001"
+	fakeMDNSID       = "5f00000000000000000000d5"
+)
+
+// mdnsCatalogue is `predefined_services` in auto mode on UniFi Network
+// 10.6.101: every service the console knows.
+var mdnsCatalogue = []string{
+	"amazon_devices", "android_tv_remote", "apple_airDrop", "apple_airPlay", "apple_file_sharing",
+	"apple_iChat", "apple_iTunes", "aqara", "bose", "dns_service_discovery", "ftp_servers",
+	"google_chromecast", "homeKit", "matter_network", "philips_hue", "printers", "roku",
+	"scanners", "sonos", "spotify_connect", "ssh_servers", "time_capsule", "web_servers",
+	"windows_file_sharing_samba",
+}
+
+// defaultMDNSSetting is the mdns `rest/setting` entry as a stock console
+// holds it, plus attr_hidden_id standing in for fields cmd/unifi does not
+// model and must echo on a write.
+func defaultMDNSSetting() map[string]any {
+	return map[string]any{
+		"_id": fakeMDNSID, "key": "mdns", "site_id": fakeLegacySiteID, "attr_hidden_id": "mdns",
+		"mode": "auto", "enabled_for": "all", "enabled_for_network_ids": []any{},
+		"predefined_services": serviceCodes(mdnsCatalogue...), "custom_services": []any{},
+	}
+}
+
+// serviceCodes is a predefined_services list.
+func serviceCodes(codes ...string) []any {
+	out := []any{}
+	for _, c := range codes {
+		out = append(out, map[string]any{"code": c})
+	}
+	return out
+}
+
+func (f *fakeConsole) mdnsLocked() map[string]any {
+	for _, s := range f.settings {
+		if s["key"] == "mdns" {
+			return s
+		}
+	}
+	return nil
+}
+
+// mdnsSetting returns a copy of the mdns `rest/setting` entry.
+func (f *fakeConsole) mdnsSetting() map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]any{}
+	for k, v := range f.mdnsLocked() {
+		out[k] = v
+	}
+	return out
+}
+
+// setMDNS merges fields into the mdns `rest/setting` entry, bypassing the
+// mutation log.
+func (f *fakeConsole) setMDNS(fields map[string]any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m := f.mdnsLocked()
+	for k, v := range fields {
+		m[k] = v
 	}
 }
 

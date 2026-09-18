@@ -8,8 +8,9 @@ import "gunk.dev/armstrong/schema"
 site: schema.#Site & {
 	networks: [
 		{
-			name:   "Default"
-			vlanId: 1
+			name:                  "Default"
+			vlanId:                1
+			mdnsForwardingEnabled: true
 			ipv4: {
 				hostIpAddress: "192.0.2.1"
 				prefixLength:  24
@@ -26,6 +27,7 @@ site: schema.#Site & {
 			vlanId:                20
 			isolationEnabled:      true
 			internetAccessEnabled: true
+			mdnsForwardingEnabled: true
 			ipv4: {
 				hostIpAddress: "198.51.100.1"
 				prefixLength:  24
@@ -122,4 +124,13 @@ site: schema.#Site & {
 	reservations: [
 		{mac: "02:00:5e:10:00:10", name: "nas", fixedIp: "192.0.2.10", network: "Default"},
 	]
+
+	// The gateway's one mDNS proxy. Both networks above participate, so
+	// whatever this allows crosses between them; SSH, file sharing and the
+	// rest of the catalogue do not.
+	mdns: {
+		mode: "custom"
+		services: ["apple_airPlay", "google_chromecast", "printers"]
+		networks: ["Default", "IoT"]
+	}
 }

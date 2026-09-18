@@ -14,7 +14,7 @@ import (
 // feeds straight back into `diff` as a no-op, and a lossy entry would instead
 // become a destructive `PUT`.
 func exportSite(c *client, ref siteRef, out, warn io.Writer) error {
-	doc, err := buildExport(c, ref, true, warn)
+	doc, err := buildExport(c, ref, legacySections{reservations: true, mdns: true}, warn)
 	if err != nil {
 		return err
 	}
@@ -23,10 +23,17 @@ func exportSite(c *client, ref siteRef, out, warn io.Writer) error {
 	return enc.Encode(doc)
 }
 
+// legacySections picks what buildExport reads through the legacy API; a
+// section not read is left absent.
+type legacySections struct {
+	reservations, mdns bool
+	// strictMDNS fails on an mdns setting #MDNS cannot express, where export
+	// warns and leaves it out: a snapshot without it could not undo the run.
+	strictMDNS bool
+}
+
 // buildExport reads the live site into a #Site document; see exportSite.
-// DHCP reservations are read, through the legacy API, only when reservations
-// is set; otherwise the section is left absent.
-func buildExport(c *client, ref siteRef, reservations bool, warn io.Writer) (site, error) {
+func buildExport(c *client, ref siteRef, legacy legacySections, warn io.Writer) (site, error) {
 	var doc site
 	siteID := ref.ID
 
@@ -108,12 +115,32 @@ func buildExport(c *client, ref siteRef, reservations bool, warn io.Writer) (sit
 		doc.DNSPolicies = append(doc.DNSPolicies, a.Spec)
 	}
 
-	if reservations {
-		legacy, err := c.legacyState(ref.InternalReference)
+	if legacy.reservations {
+		st, err := c.legacyState(ref.InternalReference)
 		if err != nil {
 			return doc, err
 		}
-		doc.Reservations = exportReservations(legacy, warn)
+		doc.Reservations = exportReservations(st, warn)
+	}
+
+	if legacy.mdns {
+		names, err := c.legacyNetworks(ref.InternalReference)
+		if err != nil {
+			return doc, err
+		}
+		got, err := c.legacyMDNS(ref.InternalReference)
+		if err != nil {
+			return doc, err
+		}
+		switch m, err := got.project(names); {
+		case err == nil:
+			doc.MDNS = &m
+		case legacy.strictMDNS:
+			return doc, err
+		default:
+			fmt.Fprintf(warn, "skipping the mdns proxy setting: %v. Declaring it would plan a PUT "+
+				"over what this tool cannot read.\n", err)
+		}
 	}
 
 	// Emit empty lists rather than null so the document round-trips into #Site.

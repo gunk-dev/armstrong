@@ -312,6 +312,56 @@ the reservation fields leaves everything else on the client alone.
 `forget-sta` deletes the whole client record, not just its reservation, which
 is why `cmd/unifi` never calls it.
 
+### Legacy controller API — mDNS proxy setting (issue #25)
+
+The Integration API exposes only a network's `mdnsForwardingEnabled`, which is
+`mdns_enabled` on `rest/networkconf`: whether that network takes part in the
+gateway's mDNS proxy. The proxy itself — one per site — is a legacy settings
+object. Same base, key and envelope as above.
+
+Confirmed on UniFi Network 10.6.101 (`GET rest/setting`, which returns every
+settings object; the proxy is the one with `key: "mdns"`):
+
+| Field | Observed |
+| --- | --- |
+| `mode` | `"auto"`; the console's other modes are `custom` and `off` |
+| `enabled_for` | `"all"` |
+| `enabled_for_network_ids` | `[]`; holds `rest/networkconf` `_id`s (ObjectIds, not Integration API UUIDs), so networks join by name |
+| `predefined_services` | `[{"code": …}]`: in `auto` the whole catalogue, informational; in `custom` the allow-list |
+| `custom_services` | `[]` |
+| `site_id`, `_id` | present |
+
+The 24 codes in `auto`: `amazon_devices`, `android_tv_remote`,
+`apple_airDrop`, `apple_airPlay`, `apple_file_sharing`, `apple_iChat`,
+`apple_iTunes`, `aqara`, `bose`, `dns_service_discovery`, `ftp_servers`,
+`google_chromecast`, `homeKit`, `matter_network`, `philips_hue`, `printers`,
+`roku`, `scanners`, `sonos`, `spotify_connect`, `ssh_servers`,
+`time_capsule`, `web_servers`, `windows_file_sharing_samba`.
+
+`cmd/unifi` reads the proxy from the list; `GET rest/setting/mdns` has not been
+observed and is not used.
+
+**Unconfirmed.** Each has one named place in `cmd/unifi/legacy.go`, marked
+UNCONFIRMED:
+
+1. **The non-`all` value of `enabled_for`**, which makes
+   `enabled_for_network_ids` the participating set. Assumed `"custom"`
+   (`legacyMDNSEnabledForCustom`). Confirm by restricting the proxy to chosen
+   networks in the console UI.
+2. **The shape of a `custom_services` entry.** Assumed `{"name": "_hap._tcp"}`
+   (`customServiceName`, `customServiceEntry`); any other shape is refused on
+   read. Confirm by adding a custom service in the UI.
+3. **The write.** Assumed a full-object `PUT rest/setting/mdns/{_id}`, the
+   classic controller convention for settings (`mdnsWriteBody`): the object as
+   read minus `_id`, so unmodelled fields are echoed. Confirm by changing the
+   mode in the UI.
+
+To confirm any of them, change the setting in the console UI with the browser's
+network inspector open, record the request's method, path and body, then
+re-read the object with `GET rest/setting`. What `predefined_services` holds
+after leaving `custom` is also unknown, which is why a write outside `custom`
+sends both service lists back as read.
+
 ## Write bodies
 
 No write has been performed against the reference console, so create/update

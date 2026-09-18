@@ -14,10 +14,10 @@ import (
 	"strings"
 )
 
-// reconciler converges one site to the desired #Site document. Resource types
-// are handled in dependency order: networks, then firewall zones (which
-// reference networks), then wifi / firewall policies / DNS policies / DHCP
-// reservations.
+// reconciler converges one site to the desired #Site document. The mDNS proxy
+// setting goes first (see run); resource types then follow in dependency
+// order: networks, then firewall zones (which reference networks), then wifi
+// / firewall policies / DNS policies / DHCP reservations.
 type reconciler struct {
 	client     *client
 	siteID     string
@@ -98,6 +98,11 @@ func (r *reconciler) run() error {
 	}
 	r.candidates = map[string]bool{}
 	for _, step := range []func() error{
+		// mDNS first, for two reasons: its write is the least certain (see
+		// mdnsWriteBody), so a failed PUT aborts with nothing else changed;
+		// and the service restriction lands before networks widen
+		// participation.
+		r.syncMDNS,
 		r.syncNetworks,
 		r.syncZones,
 		r.syncWiFi,

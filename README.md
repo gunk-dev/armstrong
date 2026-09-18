@@ -244,7 +244,7 @@ Available definitions:
 - `#HttpService` — HTTP service settings (port, auto-stop, auto-start, health checks)
 - `#HttpCheck` — HTTP health check configuration
 - `#DNSRecord` — DNS record definition (A, AAAA, CNAME, MX, NS, SRV, TXT)
-- `#Site` — a UniFi Network site (see `schema/unifi.cue`), holding `#Network`, `#FirewallZone`, `#WiFi`, `#FirewallPolicy` and `#DNSPolicy` lists. `#FirewallPolicy` models the full policy: `#TrafficFilter` on either end (networks, IP addresses/subnets, ports, MAC addresses, applications), `#FirewallSchedule`, connection states, protocol and logging
+- `#Site` — a UniFi Network site (see `schema/unifi.cue`), holding `#Network`, `#FirewallZone`, `#WiFi`, `#FirewallPolicy`, `#DNSPolicy` and `#Reservation` lists and the `#MDNS` proxy setting. `#FirewallPolicy` models the full policy: `#TrafficFilter` on either end (networks, IP addresses/subnets, ports, MAC addresses, applications), `#FirewallSchedule`, connection states, protocol and logging
 
 ## DNS Tool
 
@@ -347,9 +347,10 @@ A CLI tool (`cmd/unifi/`) that manages a UniFi Network site via the official
 **Integration API** served by the console at
 `https://<console>/proxy/network/integration/v1`. It is the sibling of the DNS
 tool: it reads a JSON document on stdin (pipe from `cue export`) and converges
-the console to match. DHCP reservations, which the Integration API does not
-expose, go through the console's legacy controller API
-(`/proxy/network/api/s/<site>/rest/user`) with the same API key.
+the console to match. DHCP reservations and the site-wide mDNS proxy setting,
+which the Integration API does not expose, go through the console's legacy
+controller API (`/proxy/network/api/s/<site>/rest/user`, `rest/setting`) with
+the same API key.
 
 Commands:
 
@@ -398,7 +399,13 @@ Environment:
   Networks are joined by name, since legacy and Integration API ids differ.
   `--prune` clears a reservation with `use_fixedip: false` (once `deletions`
   lists `reservation <mac>`) and never forgets the client.
-- Resources are reconciled in dependency order: networks → firewall zones →
+- **The mDNS proxy** (`mdns: #MDNS`) is the gateway's one site-wide proxy,
+  which every network with `mdnsForwardingEnabled` shares: `mode` (`auto`,
+  `custom`, `off`), a custom-mode service allow-list and an optional list of
+  participating networks. It is only ever updated, never pruned. See
+  [`docs/unifi.md`](docs/unifi.md#mdns-proxy).
+- Resources are reconciled in dependency order: the mDNS proxy first (so a
+  failed write to it changes nothing else), then networks → firewall zones →
   wifi, firewall policies, DNS policies, DHCP reservations.
 
 ### Running it
@@ -443,7 +450,8 @@ even the creates) when either guard trips:
   reservation is a deletion too, keyed `reservation <mac>` (lower-case MAC).
 - **Mass change.** A plan that deletes or updates more than `--max-changes`
   objects (default 10) is refused. Creates do not count. DHCP reservation
-  updates and clears count like any other; reservation creates do not.
+  updates and clears count like any other; reservation creates do not. An mDNS
+  proxy update counts too.
   Reorders do: every firewall policy whose position changes counts as one,
   and the plan shows it as `ORDER firewall policy <pair> (N moved)`.
 
@@ -459,7 +467,8 @@ instance file's own name for it where the instance file declares the SSID,
 otherwise export's generated `UNIFI_WIFI_<SSID>`). When the instance file
 declares `reservations`, the snapshot holds them too, by MAC and network name,
 so `restore` can recreate, change back or clear them; without that section the
-run cannot touch reservations and the snapshot leaves them out.
+run cannot touch reservations and the snapshot leaves them out. The mDNS proxy
+setting follows the same rule, keyed on `mdns`.
 
 **The review workflow:**
 

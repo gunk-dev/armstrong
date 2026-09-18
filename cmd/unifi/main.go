@@ -42,9 +42,9 @@ func newRootCmd() *cobra.Command {
 			"  UNIFI_CA_FILE       PEM bundle for the console's self-signed certificate\n" +
 			"  UNIFI_INSECURE_TLS  set to 1 to skip certificate verification instead\n\n" +
 			"Objects are matched by name (DHCP reservations by MAC); SYSTEM_DEFINED objects are updated in place\n" +
-			"but never deleted, even with --prune. DHCP reservations are read and written\n" +
-			"through the legacy controller API with the same key, since the Integration\n" +
-			"API has none. Passphrases live in the environment,\n" +
+			"but never deleted, even with --prune. DHCP reservations and the site-wide mDNS\n" +
+			"proxy setting are read and written through the legacy controller API with the\n" +
+			"same key, since the Integration API has neither. Passphrases live in the environment,\n" +
 			"named by each SSID's passphraseEnv, and are redacted from all output.",
 		SilenceUsage: true,
 	}
@@ -56,12 +56,13 @@ func newExportCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "export",
 		Short: "Print the live site as #Site-shaped JSON",
-		Long: "Dumps networks, firewall zones, wifi, firewall policies, DNS policies and DHCP\n" +
-			"reservations as a\n" +
+		Long: "Dumps networks, firewall zones, wifi, firewall policies, DNS policies, DHCP\n" +
+			"reservations and the mDNS proxy setting as a\n" +
 			"#Site-shaped JSON document, so a consumer repo can bootstrap its instance file\n" +
 			"from real state. WiFi passphrases are never included.\n\n" +
 			"Objects the schema cannot express faithfully — a firewall zone whose members are\n" +
-			"WAN interfaces, a firewall policy using a field #FirewallPolicy does not model —\n" +
+			"WAN interfaces, a firewall policy using a field #FirewallPolicy does not model,\n" +
+			"an mDNS proxy setting #MDNS cannot read with certainty —\n" +
 			"are left out and named on stderr, so that feeding the output back into `diff`\n" +
 			"stays a no-op instead of planning a lossy write.",
 		Args: cobra.NoArgs,
@@ -115,7 +116,10 @@ func newSyncCmd() *cobra.Command {
 			"  * the plan deletes, updates or reorders more than --max-changes objects (every firewall\n" +
 			"    policy whose position changes counts; creates do not).\n" +
 			"--force overrides both. With --snapshot-dir, the live site is exported there before\n" +
-			"the first write; `unifi restore` applies such a snapshot.",
+			"the first write; `unifi restore` applies such a snapshot.\n\n" +
+			"A declared mdns proxy setting is reconciled before anything else, so a failed\n" +
+			"write to it aborts the run with nothing changed. It is only ever updated, never\n" +
+			"pruned.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			_, err := reconcile(cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), opts)
