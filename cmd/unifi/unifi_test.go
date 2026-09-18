@@ -780,12 +780,12 @@ const exampleSiteFallback = `{
   "networks": [
     {"name":"Default","management":"GATEWAY","enabled":true,"vlanId":1,
      "isolationEnabled":false,"internetAccessEnabled":true,
-     "cellularBackupEnabled":false,"mdnsForwardingEnabled":false,
+     "cellularBackupEnabled":false,"mdnsForwardingEnabled":true,
      "ipv4":{"hostIpAddress":"192.0.2.1","prefixLength":24,"autoScaleEnabled":false,
        "dhcp":{"mode":"SERVER","rangeStart":"192.0.2.100","rangeStop":"192.0.2.199","leaseTimeSeconds":86400}}},
     {"name":"IoT","management":"GATEWAY","enabled":true,"vlanId":20,
      "isolationEnabled":true,"internetAccessEnabled":true,
-     "cellularBackupEnabled":false,"mdnsForwardingEnabled":false,
+     "cellularBackupEnabled":false,"mdnsForwardingEnabled":true,
      "ipv4":{"hostIpAddress":"198.51.100.1","prefixLength":24,"autoScaleEnabled":false,
        "dhcp":{"mode":"SERVER","rangeStart":"198.51.100.100","rangeStop":"198.51.100.199",
          "leaseTimeSeconds":3600,"dnsServers":["203.0.113.53"]}}}
@@ -826,7 +826,8 @@ const exampleSiteFallback = `{
   ],
   "reservations": [
     {"mac":"02:00:5e:10:00:10","name":"nas","fixedIp":"192.0.2.10","network":"Default"}
-  ]
+  ],
+  "mdns": {"mode":"custom","services":["apple_airPlay","google_chromecast","printers"],"networks":["Default","IoT"]}
 }`
 
 func equalStrings(a, b []string) bool {

@@ -10,9 +10,10 @@ package schema
 // firewall policies by (sourceZone, destinationZone, name). DHCP reservations
 // are keyed by MAC address.
 //
-// DHCP reservations are the one object type the Integration API does not
-// expose; `unifi` manages them through the console's legacy controller API
-// (/proxy/network/api/s/{site}/rest/user) with the same API key.
+// DHCP reservations and the mDNS proxy setting are the two things the
+// Integration API does not expose; `unifi` manages them through the console's
+// legacy controller API (/proxy/network/api/s/{site}/rest/user and
+// rest/setting) with the same API key.
 //
 // Fields mirror the API's own names and enum values so that `unifi export`
 // output can be pasted straight into an instance file.
@@ -25,7 +26,8 @@ package schema
 // as an empty list, means "managed": `--prune` then deletes every
 // USER_DEFINED object of that type the instance file does not list. An
 // instance file must set a section to `[]` on purpose to clear it out — see
-// docs/unifi.md.
+// docs/unifi.md. `mdns` is a single setting, not a list: omitted leaves it
+// alone, declared sets it, and `--prune` never applies.
 #Site: {
 	networks?:         [...#Network]
 	firewallZones?:    [...#FirewallZone]
@@ -33,6 +35,7 @@ package schema
 	firewallPolicies?: [...#FirewallPolicy]
 	dnsPolicies?:      [...#DNSPolicy]
 	reservations?:     [...#Reservation]
+	mdns?:             #MDNS
 
 	// The deletions this instance file approves. `sync --prune` deletes an
 	// object only if its key is listed here, and refuses the whole run —
@@ -65,7 +68,9 @@ package schema
 	internetAccessEnabled: bool | *true
 	// Allow this network to fail over to cellular when the WAN is down.
 	cellularBackupEnabled: bool | *false
-	// Forward mDNS between this network and others.
+	// Forward mDNS between this network and others. This is participation in
+	// the gateway's one shared proxy scope, not a per-network reflector: N
+	// enabled networks all mesh. The scope itself is #Site.mdns.
 	mdnsForwardingEnabled: bool | *false
 
 	ipv4?: #NetworkIPv4
@@ -247,6 +252,38 @@ package schema
 	fixedIp: #IPv4Address
 	// NAME of the network the reservation applies on.
 	network: string & !=""
+}
+
+// #MDNS is the gateway's site-wide mDNS proxy: one shared scope across every
+// participating network. `custom` narrows which services cross and which
+// networks take part; nothing partitions the scope pairwise, so "People <->
+// IoT, Guest <-> Media only" cannot be expressed. `off` is here so `unifi
+// export` round-trips; it switches the proxy off, whereas omitting #Site.mdns
+// leaves the setting unmanaged.
+#MDNS: X={
+	mode: "auto" | "custom" | "off"
+
+	// Custom-mode allow-list of predefined service codes as the console names
+	// them (apple_airPlay, google_chromecast, printers, …). Not checked here:
+	// the console rejects a code it does not know.
+	services?: [...string & !=""]
+	// Custom-mode `_service._proto` entries beyond the predefined ones.
+	customServices?: [...string & =~"^_[a-z0-9-]+\\._(tcp|udp)$"]
+
+	// Participating networks by NAME. Absent means every network whose
+	// mdnsForwardingEnabled is true; present narrows to these. To have none,
+	// set `mode: "off"`.
+	networks?: [string & !="", ...string & !=""]
+
+	if mode == "custom" {
+		// Refuses a custom proxy with nothing on its allow-list.
+		_allowed: [for k, v in X if k == "services" || k == "customServices" for s in v {s}] & [_, ...]
+	}
+	if mode != "custom" {
+		// auto reflects the whole catalogue; off reflects nothing.
+		services?:       _|_
+		customServices?: _|_
+	}
 }
 
 #IPv4Address: string & =~"^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$"

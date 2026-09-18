@@ -27,9 +27,15 @@ import (
 // export they are keyed by MAC and name their network, so restore resolves
 // both against the live console. An instance file without the section leaves
 // it absent from the snapshot too, which keeps the legacy API out of a run
-// that does not manage reservations and makes restore leave them alone.
+// that does not manage reservations and makes restore leave them alone. The
+// mDNS proxy setting follows the same rule, keyed on `mdns`; one the snapshot
+// cannot hold faithfully fails the run before its first write.
 func writeSnapshot(c *client, ref siteRef, want site, dir string, keep int, warn io.Writer) (string, error) {
-	doc, err := buildExport(c, ref, want.Reservations != nil, warn)
+	doc, err := buildExport(c, ref, legacySections{
+		reservations: want.Reservations != nil,
+		mdns:         want.MDNS != nil,
+		strictMDNS:   true,
+	}, warn)
 	if err != nil {
 		return "", fmt.Errorf("snapshot: %w", err)
 	}
