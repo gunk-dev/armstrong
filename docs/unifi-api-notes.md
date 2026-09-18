@@ -350,7 +350,7 @@ UNCONFIRMED:
    networks in the console UI.
 2. **The shape of a `custom_services` entry.** Assumed `{"name": "_hap._tcp"}`
    (`customServiceName`, `customServiceEntry`); any other shape is refused on
-   read. Confirm by adding a custom service in the UI.
+   read, in every mode. Confirm by adding a custom service in the UI.
 3. **The write.** Assumed a full-object `PUT rest/setting/mdns/{_id}`, the
    classic controller convention for settings (`mdnsWriteBody`): the object as
    read minus `_id`, so unmodelled fields are echoed. Confirm by changing the

@@ -443,19 +443,23 @@ func (c *client) legacyMDNS(site string) (*legacyMDNS, error) {
 // certainty is an error, never a guess: a guess would plan a PUT over it.
 func (m *legacyMDNS) project(names nameLookup) (mdns, error) {
 	out := mdns{Mode: m.Mode}
+	// Read in every mode: auto and off ignore them, but a write to custom
+	// replaces them.
+	var custom []string
+	for _, raw := range m.CustomServices {
+		name, err := customServiceName(raw)
+		if err != nil {
+			return mdns{}, err
+		}
+		custom = append(custom, name)
+	}
 	switch m.Mode {
 	case "auto", "off":
 	case "custom":
 		for _, s := range m.PredefinedServices {
 			out.Services = append(out.Services, s.Code)
 		}
-		for _, raw := range m.CustomServices {
-			name, err := customServiceName(raw)
-			if err != nil {
-				return mdns{}, err
-			}
-			out.CustomServices = append(out.CustomServices, name)
-		}
+		out.CustomServices = custom
 		sort.Strings(out.Services)
 		sort.Strings(out.CustomServices)
 	default:

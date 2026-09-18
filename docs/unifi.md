@@ -374,7 +374,9 @@ first — and, when the file declares a `networks` section, be declared there.
 
 **Fail closed.** `unifi` never plans over a live setting it cannot read with
 certainty: an unknown `mode` or `enabled_for`, a `custom_services` entry of
-another shape, a network id `rest/networkconf` does not know. `diff` and
+another shape (in any mode: a console in `auto` or `off` may still hold some,
+and a write to `custom` replaces them), a network id `rest/networkconf` does
+not know. `diff` and
 `sync` exit 1 before any write, and `export` leaves `mdns` out and says why on
 stderr.
 

@@ -301,6 +301,12 @@ func TestMDNSUnreadableSettingIsRefused(t *testing.T) {
 			"custom_services": []any{"_hap._tcp"}}, `custom service "_hap._tcp" is not the`},
 		{"custom service with unknown fields", map[string]any{"mode": "custom", "predefined_services": serviceCodes("printers"),
 			"custom_services": []any{map[string]any{"name": "_hap._tcp", "port": 80}}}, `custom service {"name":"_hap._tcp","port":80} is not the`},
+		// Ignored by the console in these modes, but a write to custom would
+		// replace them unread.
+		{"custom service of another shape in auto", map[string]any{"custom_services": []any{map[string]any{"service": "_x._tcp"}}},
+			`custom service {"service":"_x._tcp"} is not the`},
+		{"custom service of another shape in off", map[string]any{"mode": "off", "custom_services": []any{map[string]any{"service": "_x._tcp"}}},
+			`custom service {"service":"_x._tcp"} is not the`},
 		{"network naming nothing", map[string]any{"enabled_for": "custom", "enabled_for_network_ids": []any{"5f00000000000000000000ff"}},
 			`network "5f00000000000000000000ff" is not in legacy rest/networkconf`},
 	} {
@@ -318,7 +324,8 @@ func TestMDNSUnreadableSettingIsRefused(t *testing.T) {
 				t.Errorf("export did not leave mdns out with a warning naming %q:\n%s", tc.err, stderr)
 			}
 
-			desired := `{` + newRecord + `, "mdns": {"mode": "auto"}}`
+			// custom: the desired state whose write replaces everything read.
+			desired := `{` + newRecord + `, "mdns": {"mode": "custom", "services": ["printers"]}}`
 			dir := t.TempDir()
 			for _, args := range [][]string{{"diff"}, {"sync"}, {"sync", "--snapshot-dir", dir}} {
 				_, stderr, code := run(t, f, desired, nil, args...)
