@@ -128,14 +128,10 @@ func buildExport(c *client, ref siteRef, legacy legacySections, warn io.Writer) 
 		if err != nil {
 			return doc, err
 		}
-		got, err := c.legacyMDNS(ref.InternalReference)
-		if err != nil {
-			return doc, err
-		}
-		switch m, err := got.project(names); {
+		switch _, m, err := c.readMDNS(ref.InternalReference, names); {
 		case err == nil:
 			doc.MDNS = &m
-		case legacy.strictMDNS:
+		case legacy.strictMDNS || !isMDNSUnreadable(err):
 			return doc, err
 		default:
 			fmt.Fprintf(warn, "skipping the mdns proxy setting: %v. Declaring it would plan a PUT "+

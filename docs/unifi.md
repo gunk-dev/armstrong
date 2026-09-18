@@ -152,8 +152,8 @@ or a range; the tool additionally enforces 1-65535 and `start <= end`, which a
 string regex cannot express. A port it cannot parse fails the sync rather than
 being sent as 0.
 
-**Reconciliation runs in dependency order:** the mDNS proxy setting (first, see
-[mDNS proxy](#mdns-proxy)) → networks → firewall zones → wifi, firewall
+**Reconciliation runs in dependency order:** the mDNS proxy setting (first,
+unless it names a network the run creates — see [mDNS proxy](#mdns-proxy)) → networks → firewall zones → wifi, firewall
 policies, DNS policies and DHCP reservations. Zones reference networks
 by name, and policies reference zones by name, so the ids exist by the time
 they are needed.
@@ -365,20 +365,30 @@ towards `--max-changes`. A run that declares `mdns` snapshots it under
 `--snapshot-dir`, so `restore` puts it back; a run that does not leaves it out
 of the snapshot, and restoring that snapshot leaves the proxy alone.
 
-**It runs first**, before networks, for two reasons: its write is the least
-certain one `unifi` makes (see below), so a failed `PUT` stops the run with
-nothing else changed; and the service restriction is in force before a network
-in the same run starts to participate. So every network `mdns.networks` names
-must already exist on the console — create a new one in a sync of its own
-first — and, when the file declares a `networks` section, be declared there.
+**It runs first by default**, before networks, for two reasons: its write is
+the least certain one `unifi` makes (see below), so a failed `PUT` stops the
+run with nothing else changed; and the service restriction is in force before
+a network in the same run starts to participate. The exception is a proxy that
+names a network this run creates (a new network, or one `restore` brings back
+after a prune): its legacy id only exists once the network does, so the proxy
+is reconciled right after networks instead, and the plan says so:
+
+```
+CREATE network        Media (vlan 30)
+UPDATE mdns proxy     custom (networks Default -> Default, Media; after networks: Media created this run)
+```
+
+That costs a short window in which the new network participates under the
+previous proxy settings. Any other network `mdns.networks` names must already
+exist on the console, and when the file declares a `networks` section every
+one of them must be declared there.
 
 **Fail closed.** `unifi` never plans over a live setting it cannot read with
-certainty: an unknown `mode` or `enabled_for`, a `custom_services` entry of
-another shape (in any mode: a console in `auto` or `off` may still hold some,
-and a write to `custom` replaces them), a network id `rest/networkconf` does
-not know. `diff` and
-`sync` exit 1 before any write, and `export` leaves `mdns` out and says why on
-stderr.
+certainty: a field of an unexpected type, an unknown `mode` or `enabled_for`, a
+`custom_services` entry of another shape (in any mode: a console in `auto` or
+`off` may still hold some, and a write to `custom` replaces them), a network id
+`rest/networkconf` does not know. `diff` and `sync` exit 1 before any write,
+and `export` leaves `mdns` out and says why on stderr.
 
 **Service codes are not checked locally.** `services` takes any non-empty
 string: the catalogue is only visible while the console is in `auto`, so there

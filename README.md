@@ -405,7 +405,8 @@ Environment:
   participating networks. It is only ever updated, never pruned. See
   [`docs/unifi.md`](docs/unifi.md#mdns-proxy).
 - Resources are reconciled in dependency order: the mDNS proxy first (so a
-  failed write to it changes nothing else), then networks → firewall zones →
+  failed write to it changes nothing else) unless it names a network the run
+  creates, in which case right after networks; networks → firewall zones →
   wifi, firewall policies, DNS policies, DHCP reservations.
 
 ### Running it

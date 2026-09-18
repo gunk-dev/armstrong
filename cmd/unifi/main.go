@@ -118,8 +118,8 @@ func newSyncCmd() *cobra.Command {
 			"--force overrides both. With --snapshot-dir, the live site is exported there before\n" +
 			"the first write; `unifi restore` applies such a snapshot.\n\n" +
 			"A declared mdns proxy setting is reconciled before anything else, so a failed\n" +
-			"write to it aborts the run with nothing changed. It is only ever updated, never\n" +
-			"pruned.",
+			"write to it aborts the run with nothing changed — unless it names a network the\n" +
+			"run creates, when it follows the networks. It is only ever updated, never pruned.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			_, err := reconcile(cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), opts)

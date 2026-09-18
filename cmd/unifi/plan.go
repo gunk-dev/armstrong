@@ -47,6 +47,9 @@ type reconciler struct {
 	// or not; unlisted the ones `deletions` does not approve.
 	candidates map[string]bool
 	unlisted   []string
+	// mdnsAfterNetworks names the networks mdns references that this run
+	// creates; non-empty defers the proxy until after syncNetworks.
+	mdnsAfterNetworks []string
 }
 
 // pendingID stands in for an id that would only exist after an earlier create
@@ -98,12 +101,15 @@ func (r *reconciler) run() error {
 	}
 	r.candidates = map[string]bool{}
 	for _, step := range []func() error{
-		// mDNS first, for two reasons: its write is the least certain (see
-		// mdnsWriteBody), so a failed PUT aborts with nothing else changed;
-		// and the service restriction lands before networks widen
-		// participation.
+		// mDNS first by default, for two reasons: its write is the least
+		// certain (see mdnsWriteBody), so a failed PUT aborts with nothing
+		// else changed; and the service restriction lands before networks
+		// widen participation. A proxy naming a network this run creates
+		// waits for that network instead, which leaves a short window in
+		// which it participates under the previous proxy settings.
 		r.syncMDNS,
 		r.syncNetworks,
+		r.syncDeferredMDNS,
 		r.syncZones,
 		r.syncWiFi,
 		r.syncFirewallPolicies,

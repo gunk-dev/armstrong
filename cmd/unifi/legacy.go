@@ -403,6 +403,23 @@ func customServiceName(raw json.RawMessage) (string, error) {
 // customServiceEntry is the inverse of customServiceName, and as unconfirmed.
 func customServiceEntry(name string) map[string]any { return map[string]any{"name": name} }
 
+// mdnsUnreadable marks an mdns setting that was fetched but cannot be read
+// with certainty, as opposed to a console that could not be read at all:
+// export warns and omits it; diff, sync and a snapshot refuse.
+type mdnsUnreadable struct{ error }
+
+func isMDNSUnreadable(err error) bool { return errors.As(err, new(mdnsUnreadable)) }
+
+// readMDNS fetches the live setting and projects it; see mdnsUnreadable.
+func (c *client) readMDNS(site string, names nameLookup) (*legacyMDNS, mdns, error) {
+	got, err := c.legacyMDNS(site)
+	if err != nil {
+		return nil, mdns{}, err
+	}
+	have, err := got.project(names)
+	return got, have, err
+}
+
 // legacyMDNS reads the proxy setting from the settings list; the per-key
 // GET rest/setting/mdns has never been observed, so it is not relied on.
 func (c *client) legacyMDNS(site string) (*legacyMDNS, error) {
@@ -423,13 +440,13 @@ func (c *client) legacyMDNS(site string) (*legacyMDNS, error) {
 		}
 		m := &legacyMDNS{}
 		if err := json.Unmarshal(raw, m); err != nil {
-			return nil, fmt.Errorf("parse mdns setting: %w", err)
+			return nil, mdnsUnreadable{fmt.Errorf("parse mdns setting: %w", err)}
 		}
 		// UseNumber: an echoed number must not come back as a rounded float.
 		dec := json.NewDecoder(bytes.NewReader(raw))
 		dec.UseNumber()
 		if err := dec.Decode(&m.raw); err != nil {
-			return nil, fmt.Errorf("parse mdns setting: %w", err)
+			return nil, mdnsUnreadable{fmt.Errorf("parse mdns setting: %w", err)}
 		}
 		found = append(found, m)
 	}
@@ -440,8 +457,14 @@ func (c *client) legacyMDNS(site string) (*legacyMDNS, error) {
 }
 
 // project reads the live setting as #MDNS. Anything it cannot read with
-// certainty is an error, never a guess: a guess would plan a PUT over it.
-func (m *legacyMDNS) project(names nameLookup) (mdns, error) {
+// certainty is an mdnsUnreadable error, never a guess: a guess would plan a
+// PUT over it.
+func (m *legacyMDNS) project(names nameLookup) (_ mdns, err error) {
+	defer func() {
+		if err != nil {
+			err = mdnsUnreadable{err}
+		}
+	}()
 	out := mdns{Mode: m.Mode}
 	// Read in every mode: auto and off ignore them, but a write to custom
 	// replaces them.
@@ -531,9 +554,20 @@ func checkMDNS(m *mdns) error {
 // syncMDNS reconciles the site-wide mDNS proxy. An absent mdns is not managed
 // and the legacy API is not read. It is a singleton, only ever updated, so
 // --prune and `deletions` do not apply; an update counts towards
-// --max-changes. It runs before syncNetworks (see run), so every network it
-// names must already exist on the console.
-func (r *reconciler) syncMDNS() error {
+// --max-changes. It runs before syncNetworks (see run) unless it names a
+// network the networks section is about to create: then it only records
+// those in mdnsAfterNetworks and syncDeferredMDNS does the work.
+func (r *reconciler) syncMDNS() error { return r.reconcileMDNS(false) }
+
+// syncDeferredMDNS is syncMDNS run after syncNetworks, when syncMDNS deferred.
+func (r *reconciler) syncDeferredMDNS() error {
+	if len(r.mdnsAfterNetworks) == 0 {
+		return nil
+	}
+	return r.reconcileMDNS(true)
+}
+
+func (r *reconciler) reconcileMDNS(afterNetworks bool) error {
 	want := r.want.MDNS
 	if want == nil {
 		return nil
@@ -545,13 +579,12 @@ func (r *reconciler) syncMDNS() error {
 	if err != nil {
 		return err
 	}
-	got, err := r.client.legacyMDNS(r.legacySite)
+	got, have, err := r.client.readMDNS(r.legacySite, names)
+	if isMDNSUnreadable(err) {
+		return fmt.Errorf("%w; refusing to manage an mdns proxy setting this tool cannot read faithfully", err)
+	}
 	if err != nil {
 		return err
-	}
-	have, err := got.project(names)
-	if err != nil {
-		return fmt.Errorf("%w; refusing to manage an mdns proxy setting this tool cannot read faithfully", err)
 	}
 
 	netIDs := map[string]string{}
@@ -562,17 +595,31 @@ func (r *reconciler) syncMDNS() error {
 	for _, n := range r.want.Networks {
 		declared[n.Name] = true
 	}
-	var ids []string
+	var ids, missing []string
 	for _, n := range want.Networks {
 		id, ok := netIDs[n]
-		if !ok {
+		if !ok && !declared[n] {
 			return fmt.Errorf("mdns proxy references unknown network %q; create it in a sync of its own first", n)
 		}
 		// A declared networks section is every network the file keeps.
 		if r.want.Networks != nil && !declared[n] {
 			return fmt.Errorf("mdns proxy references network %q, which the networks section does not declare", n)
 		}
+		if !ok {
+			switch {
+			case !afterNetworks:
+				missing = append(missing, n)
+				continue
+			case !r.dryRun:
+				return fmt.Errorf("mdns proxy network %q is still not in legacy rest/networkconf after networks were reconciled", n)
+			}
+			id = pendingID
+		}
 		ids = append(ids, id)
+	}
+	if len(missing) > 0 {
+		r.mdnsAfterNetworks = missing
+		return nil
 	}
 
 	changes := mdnsChanges(have, *want)
@@ -582,6 +629,9 @@ func (r *reconciler) syncMDNS() error {
 	}
 	if got.ID == "" {
 		return errors.New("the console's mdns setting has no _id to update")
+	}
+	if afterNetworks {
+		changes = append(changes, "after networks: "+strings.Join(r.mdnsAfterNetworks, ", ")+" created this run")
 	}
 	r.logf("UPDATE", "mdns proxy", want.Mode, "%s", strings.Join(changes, "; "))
 	// UNCONFIRMED path; see mdnsWriteBody.

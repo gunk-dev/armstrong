@@ -27,6 +27,12 @@ const iotJoinsProxy = `"networks": [
      "dhcp":{"mode":"SERVER","rangeStart":"198.51.100.100","rangeStop":"198.51.100.199","leaseTimeSeconds":3600}}}
 ]`
 
+// defaultOnly declares seedSite's Default network as it is, and no other.
+const defaultOnly = `"networks": [{"name":"Default","management":"GATEWAY","enabled":true,"vlanId":1,
+  "isolationEnabled":false,"internetAccessEnabled":true,"cellularBackupEnabled":false,"mdnsForwardingEnabled":false,
+  "ipv4":{"hostIpAddress":"192.0.2.1","prefixLength":24,"autoScaleEnabled":false,
+    "dhcp":{"mode":"SERVER","rangeStart":"192.0.2.100","rangeStop":"192.0.2.199","leaseTimeSeconds":86400}}}]`
+
 // newRecord is a DNS record to create: an Integration API write to put in
 // the same run as an mdns change.
 const newRecord = `"dnsPolicies": [
@@ -236,6 +242,51 @@ func TestMDNSPlanLines(t *testing.T) {
 	}
 }
 
+// A proxy naming a network this run creates waits for syncNetworks: the
+// network's legacy id only exists once it does.
+func TestMDNSWaitsForANetworkItCreates(t *testing.T) {
+	f := newFakeConsole(t)
+	seedSite(f)
+	def := f.legacyNetworkIDNamed("Default")
+	wantPut := mdnsPut(f, map[string]any{"mode": "custom", "enabled_for": "custom",
+		"predefined_services": serviceCodes("printers"), "custom_services": []any{}})
+
+	desired := `{"networks": [` + strings.TrimSuffix(strings.TrimPrefix(defaultOnly, `"networks": [`), `]`) + `,
+	  {"name":"Media","management":"GATEWAY","enabled":true,"vlanId":30,"isolationEnabled":false,
+	   "internetAccessEnabled":true,"cellularBackupEnabled":false,"mdnsForwardingEnabled":true}],
+	  "mdns": {"mode": "custom", "services": ["printers"], "networks": ["Default", "Media"]}}`
+	const create = "CREATE network        Media (vlan 30)\n"
+	const update = "UPDATE mdns proxy     custom (mode auto -> custom; services +printers; " +
+		"networks all -> Default, Media; after networks: Media created this run)\n"
+
+	stdout := mustRun(t, f, desired, nil, "sync", "--dry-run")
+	if i, j := strings.Index(stdout, create), strings.Index(stdout, update); i < 0 || j < i {
+		t.Errorf("dry run does not plan %q then %q:\n%s", create, update, stdout)
+	}
+	if strings.Count(stdout, "mdns proxy") != 1 {
+		t.Errorf("dry run planned the proxy more than once:\n%s", stdout)
+	}
+	if muts := f.recorded(); len(muts) != 0 {
+		t.Fatalf("--dry-run wrote to the console: %+v", muts)
+	}
+
+	stdout = mustRun(t, f, desired, nil, "sync")
+	if i, j := strings.Index(stdout, create), strings.Index(stdout, update); i < 0 || j < i {
+		t.Errorf("sync does not report %q then %q:\n%s", create, update, stdout)
+	}
+	muts := f.recorded()
+	if len(muts) != 2 || muts[0].Method != "POST" || muts[0].Path != "networks" {
+		t.Fatalf("writes = %+v, want the Media create then the mdns PUT", muts)
+	}
+	wantPut.Body["enabled_for_network_ids"] = []any{def, f.legacyNetworkIDNamed("Media")}
+	if !reflect.DeepEqual(muts[1], wantPut) {
+		t.Errorf("second write = %+v\nwant %+v", muts[1], wantPut)
+	}
+	if stdout, _, code := run(t, f, desired, nil, "diff"); code != 0 {
+		t.Errorf("second run is not a no-op (exit %d):\n%s", code, stdout)
+	}
+}
+
 func TestMDNSDryRunAndDiffWriteNothing(t *testing.T) {
 	f := newFakeConsole(t)
 	seedSite(f)
@@ -253,21 +304,14 @@ func TestMDNSDryRunAndDiffWriteNothing(t *testing.T) {
 	}
 }
 
-// The proxy runs before networks are reconciled, so a network it names must
-// already exist — even one this same file creates.
+// A network the proxy names must exist on the console or be one this run
+// creates (TestMDNSWaitsForANetworkItCreates).
 func TestMDNSNetworkReferencesAreCheckedBeforeAnyWrite(t *testing.T) {
-	const defaultOnly = `"networks": [{"name":"Default","management":"GATEWAY","enabled":true,"vlanId":1,
-	  "isolationEnabled":false,"internetAccessEnabled":true,"cellularBackupEnabled":false,"mdnsForwardingEnabled":false,
-	  "ipv4":{"hostIpAddress":"192.0.2.1","prefixLength":24,"autoScaleEnabled":false,
-	    "dhcp":{"mode":"SERVER","rangeStart":"192.0.2.100","rangeStop":"192.0.2.199","leaseTimeSeconds":86400}}}]`
 	for _, tc := range []struct {
 		name, desired, err string
 	}{
 		{"unknown", `{` + newRecord + `, "mdns": {"mode": "custom", "services": ["printers"], "networks": ["Nope"]}}`,
 			`mdns proxy references unknown network "Nope"; create it in a sync of its own first`},
-		{"declared but not on the console", `{"networks": [{"name":"Media","enabled":true,"vlanId":30}], ` + newRecord +
-			`, "mdns": {"mode": "custom", "services": ["printers"], "networks": ["Media"]}}`,
-			`mdns proxy references unknown network "Media"; create it in a sync of its own first`},
 		{"missing from the networks section", `{` + defaultOnly + `, ` + newRecord +
 			`, "mdns": {"mode": "custom", "services": ["printers"], "networks": ["IoT"]}}`,
 			`mdns proxy references network "IoT", which the networks section does not declare`},
@@ -307,6 +351,11 @@ func TestMDNSUnreadableSettingIsRefused(t *testing.T) {
 			`custom service {"service":"_x._tcp"} is not the`},
 		{"custom service of another shape in off", map[string]any{"mode": "off", "custom_services": []any{map[string]any{"service": "_x._tcp"}}},
 			`custom service {"service":"_x._tcp"} is not the`},
+		// Decode failures of the mdns object itself, before any projection.
+		{"custom_services not a list", map[string]any{"custom_services": map[string]any{"name": "_hap._tcp"}},
+			`parse mdns setting: json: cannot unmarshal object`},
+		{"network ids not strings", map[string]any{"enabled_for": "custom", "enabled_for_network_ids": []any{7}},
+			`parse mdns setting: json: cannot unmarshal number`},
 		{"network naming nothing", map[string]any{"enabled_for": "custom", "enabled_for_network_ids": []any{"5f00000000000000000000ff"}},
 			`network "5f00000000000000000000ff" is not in legacy rest/networkconf`},
 	} {
@@ -427,6 +476,37 @@ func TestMDNSSnapshotRestoreRoundTrip(t *testing.T) {
 	}
 	if after := mustRun(t, f, "", nil, "export"); after != before {
 		t.Errorf("restore did not round-trip the proxy\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+// A run that drops IoT from the proxy and prunes it snapshots both; restoring
+// has to recreate IoT before the proxy can name it again.
+func TestMDNSRestoreRecreatesPrunedNetwork(t *testing.T) {
+	f := newFakeConsole(t)
+	seedSite(f)
+	setCustomMDNS(f, []string{"printers"}, "Default", "IoT")
+	dir := t.TempDir()
+	before := mustRun(t, f, "", nil, "export")
+
+	desired := `{` + defaultOnly + `, "mdns": {"mode": "custom", "services": ["printers"], "networks": ["Default"]},
+	  "deletions": ["network IoT"]}`
+	mustRun(t, f, desired, nil, "sync", "--prune", "--snapshot-dir", dir)
+	if f.objectNamed(collNetworks, "IoT") != nil {
+		t.Fatal("sync --prune kept IoT")
+	}
+	snaps := snapshots(t, dir)
+	if len(snaps) != 1 {
+		t.Fatalf("have %d snapshots, want 1", len(snaps))
+	}
+
+	stdout := mustRun(t, f, "", mainPassphrase, "restore", "--prune", "--force", snaps[0])
+	const create = "CREATE network        IoT (vlan 20)\n"
+	const update = "UPDATE mdns proxy     custom (networks Default -> Default, IoT; after networks: IoT created this run)\n"
+	if i, j := strings.Index(stdout, create), strings.Index(stdout, update); i < 0 || j < i {
+		t.Errorf("restore does not report %q then %q:\n%s", create, update, stdout)
+	}
+	if after := mustRun(t, f, "", nil, "export"); after != before {
+		t.Errorf("restore did not round-trip\nbefore:\n%s\nafter:\n%s", before, after)
 	}
 }
 
