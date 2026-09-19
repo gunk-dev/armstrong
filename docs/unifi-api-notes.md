@@ -220,18 +220,38 @@ Invalid Traffic` ×10. The triple **(source zone name, destination zone name,
 policy name)** was verified unique across all 67, so that is the identity
 `cmd/unifi` matches on. `index` is not usable as a tiebreaker: it repeats.
 
-#### USER_DEFINED policies come back without an `id`
+#### Policies that predate the zone-based firewall migration have no `id`
 
-On 10.6.101 the API omits `id` from every `USER_DEFINED` policy — the 63
-system-defined ones all carry one, the 4 user-defined ones carry none. The
-ordering endpoint agrees: it returns `beforeSystemDefined: [null, null, null,
-null]` for that zone pair. There is therefore **no way to address a
-user-created policy** for `PUT`, `PATCH` or `DELETE` through the Integration
-API on this firmware.
+Four of the 67 policies on 10.6.106 come back with no `id` — the ones the
+zone-based firewall migration converted from the old rule set. The ordering
+endpoint agrees: `beforeSystemDefined` is `[null, null, null, null]` for their
+zone pair. There is **no way to address such a policy** for `PUT`, `PATCH`,
+`DELETE` or reordering through the Integration API.
 
-`cmd/unifi` can still create policies and can update the system-defined ones.
-Any plan that needs to update, delete or reorder an id-less policy fails with a
-message naming this limitation, rather than issuing a write it cannot target.
+Policies created through the Integration API do carry an `id` and are fully
+manageable. A `POST /sites/{id}/firewall/policies` with a minimal body (name,
+`enabled: false`, `action: BLOCK`, source and destination `zoneId` only,
+`ipProtocolScope: IPV4_AND_IPV6`, `loggingEnabled: false`) answers 201 with an
+`id` (a UUID) and an `index` of `10000`; the subsequent `GET
+/firewall/policies` lists it with that id; the ordering call for its zone pair
+returns `beforeSystemDefined: ["<that id>"]` rather than null; `PUT
+/firewall/policies/{id}` answers 200 and echoes the change back, and `DELETE
+/firewall/policies/{id}` answers 200 and drops it from the list. Policies
+created in the console after the migration behave the same way.
+
+> **Note — the v2 endpoint has ids for all of them.** The console's own
+> `GET /proxy/network/v2/api/site/default/firewall-policies` (same
+> `X-API-KEY`, no envelope, a bare JSON array) gives every policy a Mongo
+> ObjectId `_id`, including the four migrated ones, which share the ObjectId
+> time prefix of the zones themselves. That id space is disjoint from the
+> Integration API's UUIDs: an Integration `GET /firewall/policies/{v2 _id}`
+> answers 400. `cmd/unifi` does not use the v2 endpoint.
+
+`cmd/unifi` can create policies, and can update the system-defined ones and
+any it created itself. A plan that needs to update, delete or reorder an
+id-less policy fails with a message naming this limitation, rather than
+issuing a write it cannot target; deleting and re-creating such a policy
+through `cmd/unifi` gives it an id.
 
 #### Ordering is per zone pair
 

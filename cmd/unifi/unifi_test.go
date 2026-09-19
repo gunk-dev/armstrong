@@ -1159,10 +1159,10 @@ func TestExportRoundTripsEveryPolicy(t *testing.T) {
 	}
 }
 
-// TestIdlessPolicyCannotBeWritten pins the firmware limitation from
-// docs/unifi-api-notes.md: UniFi Network 10.6 returns USER_DEFINED policies
-// without an id, so there is no URL to PUT or DELETE against. The tool has to
-// say so rather than guess.
+// TestIdlessPolicyCannotBeWritten pins the limitation from
+// docs/unifi-api-notes.md: policies that predate the zone-based firewall
+// migration come back without an id, so there is no URL to PUT or DELETE
+// against. The tool has to say so rather than guess.
 func TestIdlessPolicyCannotBeWritten(t *testing.T) {
 	f := newFakeConsole(t)
 	f.omitUserPolicyIDs = true
