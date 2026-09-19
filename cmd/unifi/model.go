@@ -1,6 +1,11 @@
 package main
 
-import "strings"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"strings"
+)
 
 // Desired state, shaped exactly like `cue export` output of schema.#Site.
 // Objects are identified by name; ids are server-assigned and never appear in
@@ -205,12 +210,32 @@ type reservation struct {
 // lower-cased the way the console stores it.
 func (r reservation) key() string { return strings.ToLower(r.MAC) }
 
-// mdns is the gateway's site-wide mDNS proxy setting, managed through the
-// legacy controller API — see legacy.go. Networks nil means every network with
-// mdnsForwardingEnabled.
+// mdns is the service scope of the gateway's site-wide mDNS proxy, managed
+// through the legacy controller API — see legacy.go. Which networks take part
+// is each network's MDNSForwardingEnabled, not part of this.
 type mdns struct {
-	Mode           string   `json:"mode"`
-	Services       []string `json:"services,omitempty"`
-	CustomServices []string `json:"customServices,omitempty"`
-	Networks       []string `json:"networks,omitempty"`
+	Mode           string          `json:"mode"`
+	Services       []string        `json:"services,omitempty"`
+	CustomServices []customService `json:"customServices,omitempty"`
+}
+
+// customService is a service beyond the predefined ones: Address is the
+// `_service._proto` string, Name the label the console shows.
+type customService struct {
+	Name    string `json:"name"`
+	Address string `json:"address"`
+}
+
+// UnmarshalJSON refuses an mdns object carrying keys #MDNS does not have,
+// such as a `networks` list, rather than dropping them: a document that says
+// which networks take part would otherwise be applied without them.
+func (m *mdns) UnmarshalJSON(data []byte) error {
+	type plain mdns
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode((*plain)(m)); err != nil {
+		return fmt.Errorf("mdns is not #MDNS-shaped (mode, services, customServices as {name, address}; "+
+			"participation is each network's mdnsForwardingEnabled): %w", err)
+	}
+	return nil
 }

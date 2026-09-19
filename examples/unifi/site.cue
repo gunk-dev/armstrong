@@ -125,12 +125,12 @@ site: schema.#Site & {
 		{mac: "02:00:5e:10:00:10", name: "nas", fixedIp: "192.0.2.10", network: "Default"},
 	]
 
-	// The gateway's one mDNS proxy. Both networks above participate, so
-	// whatever this allows crosses between them; SSH, file sharing and the
-	// rest of the catalogue do not.
+	// The service scope of the gateway's one mDNS proxy. Both networks above
+	// set mdnsForwardingEnabled, so whatever this allows crosses between
+	// them; SSH, file sharing and the rest of the catalogue do not.
 	mdns: {
 		mode: "custom"
 		services: ["apple_airPlay", "google_chromecast", "printers"]
-		networks: ["Default", "IoT"]
+		customServices: [{name: "HomeKit", address: "_hap._tcp"}]
 	}
 }

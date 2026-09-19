@@ -49,9 +49,9 @@ type fakeConsole struct {
 	// onLegacyRequest, when set, runs as each legacy request arrives, reads
 	// included, before it is served.
 	onLegacyRequest func(method, rest string)
-	// mdnsPutMissing makes PUT rest/setting/mdns/{_id} answer 404, as a
-	// console would if the presumed write path were wrong.
-	mdnsPutMissing bool
+	// mdnsWriteRefused makes POST set/setting/mdns answer
+	// api.err.InvalidValue whatever the body.
+	mdnsWriteRefused bool
 
 	mu   sync.Mutex
 	coll map[string]*collection
@@ -138,7 +138,11 @@ func newFakeConsole(t *testing.T) *fakeConsole {
 func (f *fakeConsole) seed(coll, origin string, obj map[string]any) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.insert(coll, origin, obj)
+	id := f.insert(coll, origin, obj)
+	if coll == collNetworks {
+		f.projectMDNSLocked()
+	}
+	return id
 }
 
 func (f *fakeConsole) insert(coll, origin string, obj map[string]any) string {
@@ -318,6 +322,11 @@ func (f *fakeConsole) handleCollection(w http.ResponseWriter, r *http.Request, r
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	c := f.coll[coll]
+	if coll == collNetworks && r.Method != http.MethodGet {
+		// Runs before the unlock above: a network write moves the legacy
+		// mdns projection, as on a real console.
+		defer f.projectMDNSLocked()
+	}
 
 	switch {
 	case r.Method == http.MethodGet && id == "":
@@ -635,21 +644,27 @@ func (f *fakeConsole) handleLegacy(w http.ResponseWriter, r *http.Request, raw [
 	case rest == "rest/setting" && r.Method == http.MethodGet:
 		ok(f.settings)
 
-	case strings.HasPrefix(rest, "rest/setting/mdns/") && r.Method == http.MethodPut:
-		m := f.mdnsLocked()
-		if f.mdnsPutMissing || m["_id"] != strings.TrimPrefix(rest, "rest/setting/mdns/") {
-			legacyFail(w, http.StatusNotFound, "api.err.NotFound")
+	case rest == "set/setting/mdns" && r.Method == http.MethodPost:
+		if msg := checkMDNSWrite(body); msg != "" || f.mdnsWriteRefused {
+			if msg == "" {
+				msg = "api.err.InvalidValue"
+			}
+			legacyFail(w, http.StatusBadRequest, msg)
 			return
 		}
-		for k, v := range body {
-			m[k] = v
+		// enabled_for and enabled_for_network_ids are a projection of the
+		// networks' flags: what the body says of them is ignored.
+		m := f.mdnsLocked()
+		for _, k := range []string{"mode", "predefined_services", "custom_services"} {
+			m[k] = body[k]
 		}
 		ok([]map[string]any{m})
 
 	case rest == "rest/networkconf" && r.Method == http.MethodGet:
 		data := []map[string]any{}
 		for _, n := range f.coll[collNetworks].list() {
-			data = append(data, map[string]any{"_id": legacyNetworkID(n["id"].(string)), "name": n["name"]})
+			data = append(data, map[string]any{"_id": legacyNetworkID(n["id"].(string)), "name": n["name"],
+				"mdns_enabled": n["mdnsForwardingEnabled"] == true})
 		}
 		ok(data)
 
@@ -684,8 +699,9 @@ const (
 	fakeMDNSID       = "5f00000000000000000000d5"
 )
 
-// mdnsCatalogue is `predefined_services` in auto mode on UniFi Network
-// 10.6.101: every service the console knows.
+// mdnsCatalogue is `predefined_services` as a console that has not been
+// written since its migration to UniFi Network 10.6 reports it, in the legacy
+// mode "auto": every service the console knows.
 var mdnsCatalogue = []string{
 	"amazon_devices", "android_tv_remote", "apple_airDrop", "apple_airPlay", "apple_file_sharing",
 	"apple_iChat", "apple_iTunes", "aqara", "bose", "dns_service_discovery", "ftp_servers",
@@ -694,15 +710,64 @@ var mdnsCatalogue = []string{
 	"windows_file_sharing_samba",
 }
 
-// defaultMDNSSetting is the mdns `rest/setting` entry as a stock console
-// holds it, plus attr_hidden_id standing in for fields cmd/unifi does not
-// model and must echo on a write.
+// defaultMDNSSetting is the mdns `rest/setting` entry as the console UI's
+// Auto leaves it. enabled_for and enabled_for_network_ids are filled in by
+// projectMDNSLocked.
 func defaultMDNSSetting() map[string]any {
 	return map[string]any{
-		"_id": fakeMDNSID, "key": "mdns", "site_id": fakeLegacySiteID, "attr_hidden_id": "mdns",
-		"mode": "auto", "enabled_for": "all", "enabled_for_network_ids": []any{},
-		"predefined_services": serviceCodes(mdnsCatalogue...), "custom_services": []any{},
+		"_id": fakeMDNSID, "key": "mdns", "site_id": fakeLegacySiteID,
+		"mode": "all", "enabled_for": "none", "enabled_for_network_ids": []any{},
+		"predefined_services": []any{}, "custom_services": []any{},
 	}
+}
+
+// checkMDNSWrite is what the console checks of a set/setting/mdns body: the
+// api.err.* message it refuses it with, or "".
+func checkMDNSWrite(body map[string]any) string {
+	for _, k := range []string{"mode", "predefined_services", "custom_services", "enabled_for", "enabled_for_network_ids"} {
+		if _, ok := body[k]; !ok {
+			return "api.err.InvalidPayload"
+		}
+	}
+	switch body["mode"] {
+	case "all", "auto", "custom":
+	default:
+		return "api.err.InvalidPayload"
+	}
+	custom, ok := body["custom_services"].([]any)
+	if !ok {
+		return "api.err.InvalidPayload"
+	}
+	for _, e := range custom {
+		cs, _ := e.(map[string]any)
+		if len(cs) != 2 || cs["address"] == "" || cs["name"] == "" || cs["address"] == nil || cs["name"] == nil {
+			return "api.err.InvalidPayload"
+		}
+	}
+	return ""
+}
+
+// projectMDNSLocked derives the mdns entry's enabled_for and
+// enabled_for_network_ids from the networks' mdnsForwardingEnabled, as the
+// console does: all true is "all", none true is "none", otherwise "some"
+// with the true ones listed.
+func (f *fakeConsole) projectMDNSLocked() {
+	nets := f.coll[collNetworks].list()
+	ids := []any{}
+	for _, n := range nets {
+		if n["mdnsForwardingEnabled"] == true {
+			ids = append(ids, legacyNetworkID(n["id"].(string)))
+		}
+	}
+	enabledFor := "some"
+	switch len(ids) {
+	case 0:
+		enabledFor = "none"
+	case len(nets):
+		enabledFor = "all"
+	}
+	m := f.mdnsLocked()
+	m["enabled_for"], m["enabled_for_network_ids"] = enabledFor, ids
 }
 
 // serviceCodes is a predefined_services list.

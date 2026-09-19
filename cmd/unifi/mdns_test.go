@@ -4,15 +4,17 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 )
 
-// mDNS tests drive the fake's `rest/setting` mdns entry, which starts as a
-// stock console holds it: mode auto, every network, the whole catalogue.
+// mDNS tests drive the fake's `rest/setting` mdns entry, which starts as the
+// console UI's Auto leaves it: mode all, both service lists empty, and
+// enabled_for projected from the networks' mdnsForwardingEnabled.
 
-const mdnsPath = "legacy/rest/setting/mdns/" + fakeMDNSID
+const mdnsPath = "legacy/set/setting/mdns"
 
 // iotJoinsProxy declares seedSite's two networks as they are, except that IoT
 // joins the proxy.
@@ -27,12 +29,6 @@ const iotJoinsProxy = `"networks": [
      "dhcp":{"mode":"SERVER","rangeStart":"198.51.100.100","rangeStop":"198.51.100.199","leaseTimeSeconds":3600}}}
 ]`
 
-// defaultOnly declares seedSite's Default network as it is, and no other.
-const defaultOnly = `"networks": [{"name":"Default","management":"GATEWAY","enabled":true,"vlanId":1,
-  "isolationEnabled":false,"internetAccessEnabled":true,"cellularBackupEnabled":false,"mdnsForwardingEnabled":false,
-  "ipv4":{"hostIpAddress":"192.0.2.1","prefixLength":24,"autoScaleEnabled":false,
-    "dhcp":{"mode":"SERVER","rangeStart":"192.0.2.100","rangeStop":"192.0.2.199","leaseTimeSeconds":86400}}}]`
-
 // newRecord is a DNS record to create: an Integration API write to put in
 // the same run as an mdns change.
 const newRecord = `"dnsPolicies": [
@@ -42,30 +38,48 @@ const newRecord = `"dnsPolicies": [
 
 var mainPassphrase = []string{"UNIFI_WIFI_EXAMPLE_MAIN=super-secret-passphrase"}
 
-// setCustomMDNS puts the fake's proxy in custom mode with these services,
-// restricted to the named networks, or on every network when none are named.
-func setCustomMDNS(f *fakeConsole, codes []string, networks ...string) {
-	fields := map[string]any{"mode": "custom", "predefined_services": serviceCodes(codes...),
-		"enabled_for": "all", "enabled_for_network_ids": []any{}}
-	if len(networks) > 0 {
-		ids := []any{}
-		for _, n := range networks {
-			ids = append(ids, f.legacyNetworkIDNamed(n))
-		}
-		fields["enabled_for"], fields["enabled_for_network_ids"] = "custom", ids
-	}
-	f.setMDNS(fields)
+// customEntry is a custom_services element as the console stores it.
+func customEntry(address, name string) map[string]any {
+	return map[string]any{"address": address, "name": name}
 }
 
-// mdnsPut is the PUT expected against the fake's current mdns entry: the
-// entry minus `_id`, with fields replaced.
-func mdnsPut(f *fakeConsole, fields map[string]any) mutation {
-	body := f.mdnsSetting()
-	delete(body, "_id")
-	for k, v := range fields {
-		body[k] = v
+// setCustomMDNS puts the fake's proxy in custom mode with these predefined
+// services and custom services.
+func setCustomMDNS(f *fakeConsole, codes []string, custom ...map[string]any) {
+	entries := []any{}
+	for _, c := range custom {
+		entries = append(entries, c)
 	}
-	return mutation{Method: "PUT", Path: mdnsPath, Body: body}
+	f.setMDNS(map[string]any{"mode": "custom", "predefined_services": serviceCodes(codes...), "custom_services": entries})
+}
+
+// setLegacyAutoMDNS puts the fake's proxy in the state a console reports
+// when it has not been written since its migration to 10.6.
+func setLegacyAutoMDNS(f *fakeConsole) {
+	f.setMDNS(map[string]any{"mode": "auto", "predefined_services": serviceCodes(mdnsCatalogue...)})
+}
+
+// setMDNSFlag sets a network's mdnsForwardingEnabled directly, and the legacy
+// projection with it.
+func setMDNSFlag(f *fakeConsole, network string, on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, n := range f.coll[collNetworks].list() {
+		if n["name"] == network {
+			n["mdnsForwardingEnabled"] = on
+		}
+	}
+	f.projectMDNSLocked()
+}
+
+// mdnsPost is the write expected against the fake's current mdns entry:
+// the five keys, enabled_for* echoed as they stand.
+func mdnsPost(f *fakeConsole, mode string, predefined, custom []any) mutation {
+	m := f.mdnsSetting()
+	return mutation{Method: "POST", Path: mdnsPath, Body: map[string]any{
+		"mode": mode, "predefined_services": predefined, "custom_services": custom,
+		"enabled_for": m["enabled_for"], "enabled_for_network_ids": m["enabled_for_network_ids"],
+	}}
 }
 
 func TestExportReadsMDNS(t *testing.T) {
@@ -75,13 +89,16 @@ func TestExportReadsMDNS(t *testing.T) {
 		want mdns
 		line string
 	}{
-		{"auto", func(*fakeConsole) {}, mdns{Mode: "auto"}, "OK     mdns proxy     auto\n"},
-		{"custom", func(f *fakeConsole) {
-			setCustomMDNS(f, []string{"printers", "apple_airPlay"}, "IoT", "Default")
-			f.setMDNS(map[string]any{"custom_services": []any{map[string]any{"name": "_hap._tcp"}}})
-		}, mdns{Mode: "custom", Services: []string{"apple_airPlay", "printers"}, CustomServices: []string{"_hap._tcp"}, Networks: []string{"Default", "IoT"}},
-			"OK     mdns proxy     custom (services apple_airPlay, printers; customServices _hap._tcp; networks Default, IoT)\n"},
-		{"off", func(f *fakeConsole) { f.setMDNS(map[string]any{"mode": "off"}) }, mdns{Mode: "off"}, "OK     mdns proxy     off\n"},
+		{"all", func(*fakeConsole) {}, mdns{Mode: "all"}, "OK     mdns proxy     all\n"},
+		{"legacy auto reads as all", setLegacyAutoMDNS, mdns{Mode: "all"}, "OK     mdns proxy     all\n"},
+		{"custom with labelled custom services", func(f *fakeConsole) {
+			setCustomMDNS(f, []string{"printers", "apple_airPlay"},
+				customEntry("_hap._tcp", "HomeKit test"), customEntry("_airplay._tcp", "Living room"))
+			setMDNSFlag(f, "IoT", true)
+		}, mdns{Mode: "custom", Services: []string{"apple_airPlay", "printers"}, CustomServices: []customService{
+			{Name: "Living room", Address: "_airplay._tcp"}, {Name: "HomeKit test", Address: "_hap._tcp"},
+		}}, "OK     mdns proxy     custom (services apple_airPlay, printers; " +
+			"customServices Living room (_airplay._tcp), HomeKit test (_hap._tcp))\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeConsole(t)
@@ -112,123 +129,145 @@ func TestMDNSAbsentIsNotRead(t *testing.T) {
 	seedSite(f)
 	mustRun(t, f, `{"reservations": []}`, nil, "sync", "--prune")
 	for _, req := range f.legacyRequestLog() {
-		if strings.Contains(req, "rest/setting") {
-			t.Errorf("an absent mdns reached rest/setting: %s", req)
+		if strings.Contains(req, "setting") {
+			t.Errorf("an absent mdns reached the settings: %s", req)
 		}
 	}
 
-	// And mdns alone reads nothing reservations need.
+	// And mdns alone reads nothing else.
 	f = newFakeConsole(t)
 	seedSite(f)
-	mustRun(t, f, `{"mdns": {"mode": "auto"}}`, nil, "sync")
-	if got, want := f.legacyRequestLog(), []string{"GET rest/networkconf", "GET rest/setting"}; !reflect.DeepEqual(got, want) {
+	mustRun(t, f, `{"mdns": {"mode": "all"}}`, nil, "sync")
+	if got, want := f.legacyRequestLog(), []string{"GET rest/setting"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("legacy requests = %v, want %v", got, want)
 	}
 }
 
-// TestMDNSAutoToCustom is the change cosmo needs, made alongside a network
-// joining the proxy: the allow-list must land first.
-func TestMDNSAutoToCustom(t *testing.T) {
+// TestMDNSServiceChangeIsOnePost narrows the scope alongside a network joining
+// the proxy: the scope is one POST with all five keys, written before the
+// network update, and participation is the network's flag alone.
+func TestMDNSServiceChangeIsOnePost(t *testing.T) {
 	f := newFakeConsole(t)
 	seedSite(f)
-	def, iot := f.legacyNetworkIDNamed("Default"), f.legacyNetworkIDNamed("IoT")
+	setMDNSFlag(f, "Default", true)
 	iotID := f.objectNamed(collNetworks, "IoT")["id"].(string)
-	wantPut := mdnsPut(f, map[string]any{
-		"mode": "custom", "enabled_for": "custom", "enabled_for_network_ids": []any{iot, def},
+	wantPost := mutation{Method: "POST", Path: mdnsPath, Body: map[string]any{
+		"mode":                "custom",
 		"predefined_services": serviceCodes("apple_airPlay", "printers"),
-		"custom_services":     []any{map[string]any{"name": "_hap._tcp"}},
-	})
+		"custom_services":     []any{customEntry("_hap._tcp", "HomeKit")},
+		// As read: only Default participates until IoT's update lands.
+		"enabled_for": "some", "enabled_for_network_ids": []any{f.legacyNetworkIDNamed("Default")},
+	}}
 
-	desired := `{` + iotJoinsProxy + `, "mdns": {"mode": "custom", "services": ["printers", "apple_airPlay"],
-	  "customServices": ["_hap._tcp"], "networks": ["IoT", "Default"]}}`
+	desired := `{` + strings.Replace(iotJoinsProxy, `"mdnsForwardingEnabled":false`, `"mdnsForwardingEnabled":true`, 1) +
+		`, "mdns": {"mode": "custom", "services": ["printers", "apple_airPlay"],
+	  "customServices": [{"name": "HomeKit", "address": "_hap._tcp"}]}}`
 	stdout := mustRun(t, f, desired, nil, "sync")
 
-	const line = "UPDATE mdns proxy     custom (mode auto -> custom; services +apple_airPlay +printers; " +
-		"customServices +_hap._tcp; networks all -> IoT, Default)\n"
+	const line = "UPDATE mdns proxy     custom (mode all -> custom; services +apple_airPlay +printers; " +
+		"customServices +HomeKit (_hap._tcp))\n"
 	if !strings.Contains(stdout, line) {
 		t.Errorf("plan is missing %q:\n%s", line, stdout)
 	}
 	muts := f.recorded()
 	if len(muts) != 2 {
-		t.Fatalf("writes = %+v, want the mdns PUT then the IoT network PUT", muts)
+		t.Fatalf("writes = %+v, want the mdns POST then the IoT network PUT", muts)
 	}
-	if !reflect.DeepEqual(muts[0], wantPut) {
-		t.Errorf("first write = %+v\nwant %+v", muts[0], wantPut)
+	if !reflect.DeepEqual(muts[0], wantPost) {
+		t.Errorf("first write = %+v\nwant %+v", muts[0], wantPost)
 	}
 	if muts[1].Method != "PUT" || muts[1].Path != "networks/"+iotID {
 		t.Errorf("second write = %s %s, want the IoT network update", muts[1].Method, muts[1].Path)
 	}
+	if m := f.mdnsSetting(); m["enabled_for"] != "all" {
+		t.Errorf("after IoT joined, enabled_for = %v, want all", m["enabled_for"])
+	}
 
 	stdout, _, code := run(t, f, desired, nil, "diff")
 	if code != 0 || !strings.Contains(stdout, "OK     mdns proxy     custom (services printers, apple_airPlay; "+
-		"customServices _hap._tcp; networks IoT, Default)\n") {
+		"customServices HomeKit (_hap._tcp))\n") {
 		t.Errorf("second run is not a no-op (exit %d):\n%s", code, stdout)
 	}
 }
 
-func TestMDNSCustomToAutoSendsListsBackAsRead(t *testing.T) {
+// Participation is written through the network, never through the proxy.
+func TestMDNSParticipationIsTheNetworkFlag(t *testing.T) {
 	f := newFakeConsole(t)
 	seedSite(f)
-	setCustomMDNS(f, []string{"printers", "ssh_servers"}, "IoT")
-	f.setMDNS(map[string]any{"custom_services": []any{map[string]any{"name": "_hap._tcp"}}})
-	wantPut := mdnsPut(f, map[string]any{"mode": "auto", "enabled_for": "all", "enabled_for_network_ids": []any{}})
 
-	stdout := mustRun(t, f, `{"mdns": {"mode": "auto"}}`, nil, "sync")
-	if line := "UPDATE mdns proxy     auto (mode custom -> auto; networks IoT -> all)\n"; !strings.Contains(stdout, line) {
+	mustRun(t, f, `{`+iotJoinsProxy+`, "mdns": {"mode": "all"}}`, nil, "sync")
+	if got := legacyWrites(f); len(got) != 0 {
+		t.Errorf("joining the proxy wrote to the legacy API: %+v", got)
+	}
+	m := f.mdnsSetting()
+	if want := []any{f.legacyNetworkIDNamed("IoT")}; m["enabled_for"] != "some" || !reflect.DeepEqual(m["enabled_for_network_ids"], want) {
+		t.Errorf("projection = %v %v, want some %v", m["enabled_for"], m["enabled_for_network_ids"], want)
+	}
+}
+
+func TestMDNSCustomToAllSendsEmptyLists(t *testing.T) {
+	f := newFakeConsole(t)
+	seedSite(f)
+	setCustomMDNS(f, []string{"printers", "ssh_servers"}, customEntry("_hap._tcp", "HomeKit"))
+	setMDNSFlag(f, "IoT", true)
+	wantPost := mdnsPost(f, "all", []any{}, []any{})
+
+	stdout := mustRun(t, f, `{"mdns": {"mode": "all"}}`, nil, "sync")
+	if line := "UPDATE mdns proxy     all (mode custom -> all)\n"; !strings.Contains(stdout, line) {
 		t.Errorf("plan is missing %q:\n%s", line, stdout)
 	}
-	if got := legacyWrites(f); !reflect.DeepEqual(got, []mutation{wantPut}) {
-		t.Fatalf("writes = %+v\nwant %+v", got, wantPut)
+	if got := legacyWrites(f); !reflect.DeepEqual(got, []mutation{wantPost}) {
+		t.Fatalf("writes = %+v\nwant %+v", got, wantPost)
+	}
+}
+
+// A console still reporting the legacy auto, catalogue and all, is what an
+// instance file's all asks for.
+func TestMDNSLegacyAutoIsAll(t *testing.T) {
+	f := newFakeConsole(t)
+	seedSite(f)
+	setLegacyAutoMDNS(f)
+
+	stdout, _, code := run(t, f, `{"mdns": {"mode": "all"}}`, nil, "diff")
+	if code != 0 || !strings.Contains(stdout, "OK     mdns proxy     all\n") {
+		t.Errorf("legacy auto against all is not a no-op (exit %d):\n%s", code, stdout)
 	}
 }
 
 func TestMDNSPlanLines(t *testing.T) {
 	seeded := []string{"apple_airPlay", "ssh_servers", "web_servers"}
+	hap := customEntry("_hap._tcp", "HomeKit")
 	for _, tc := range []struct {
-		name     string
-		networks []string // the seeded restriction; none means all
-		mdns     string
-		line     string
-		put      func(*fakeConsole) map[string]any // nil: no write
+		name string
+		mdns string
+		line string
+		post func(*fakeConsole) mutation // nil: no write
 	}{
-		{"same sets in another order", []string{"Default", "IoT"},
-			`{"mode": "custom", "services": ["web_servers", "apple_airPlay", "ssh_servers"], "networks": ["IoT", "Default"]}`,
-			"OK     mdns proxy     custom (services web_servers, apple_airPlay, ssh_servers; networks IoT, Default)", nil},
-		{"services added and removed", []string{"Default", "IoT"},
-			`{"mode": "custom", "services": ["web_servers", "printers", "apple_airPlay"], "networks": ["Default", "IoT"]}`,
+		{"same sets in another order",
+			`{"mode": "custom", "services": ["web_servers", "apple_airPlay", "ssh_servers"], "customServices": [{"name": "HomeKit", "address": "_hap._tcp"}]}`,
+			"OK     mdns proxy     custom (services web_servers, apple_airPlay, ssh_servers; customServices HomeKit (_hap._tcp))", nil},
+		{"services added and removed",
+			`{"mode": "custom", "services": ["web_servers", "printers", "apple_airPlay"], "customServices": [{"name": "HomeKit", "address": "_hap._tcp"}]}`,
 			"UPDATE mdns proxy     custom (services +printers -ssh_servers)",
-			func(*fakeConsole) map[string]any {
-				return map[string]any{"predefined_services": serviceCodes("apple_airPlay", "printers", "web_servers")}
+			func(f *fakeConsole) mutation {
+				return mdnsPost(f, "custom", serviceCodes("apple_airPlay", "printers", "web_servers"), []any{hap})
 			}},
-		{"services swapped for a custom one", []string{"Default", "IoT"},
-			`{"mode": "custom", "services": ["apple_airPlay"], "customServices": ["_hap._tcp"], "networks": ["Default", "IoT"]}`,
-			"UPDATE mdns proxy     custom (services -ssh_servers -web_servers; customServices +_hap._tcp)",
-			func(*fakeConsole) map[string]any {
-				return map[string]any{"predefined_services": serviceCodes("apple_airPlay"),
-					"custom_services": []any{map[string]any{"name": "_hap._tcp"}}}
+		{"custom service relabelled",
+			`{"mode": "custom", "services": ["apple_airPlay", "ssh_servers", "web_servers"], "customServices": [{"name": "Home", "address": "_hap._tcp"}]}`,
+			"UPDATE mdns proxy     custom (customServices +Home (_hap._tcp) -HomeKit (_hap._tcp))",
+			func(f *fakeConsole) mutation {
+				return mdnsPost(f, "custom", serviceCodes(seeded...), []any{customEntry("_hap._tcp", "Home")})
 			}},
-		{"networks to all", []string{"Default", "IoT"},
-			`{"mode": "custom", "services": ["apple_airPlay", "ssh_servers", "web_servers"]}`,
-			"UPDATE mdns proxy     custom (networks Default, IoT -> all)",
-			func(*fakeConsole) map[string]any {
-				return map[string]any{"enabled_for": "all", "enabled_for_network_ids": []any{}}
-			}},
-		{"networks narrowed", []string{"Default", "IoT"},
-			`{"mode": "custom", "services": ["apple_airPlay", "ssh_servers", "web_servers"], "networks": ["Default"]}`,
-			"UPDATE mdns proxy     custom (networks Default, IoT -> Default)",
-			func(f *fakeConsole) map[string]any {
-				return map[string]any{"enabled_for_network_ids": []any{f.legacyNetworkIDNamed("Default")}}
-			}},
-		{"custom to off", nil, `{"mode": "off"}`, "UPDATE mdns proxy     off (mode custom -> off)",
-			func(*fakeConsole) map[string]any { return map[string]any{"mode": "off"} }},
+		{"to all", `{"mode": "all"}`, "UPDATE mdns proxy     all (mode custom -> all)",
+			func(f *fakeConsole) mutation { return mdnsPost(f, "all", []any{}, []any{}) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeConsole(t)
 			seedSite(f)
-			setCustomMDNS(f, seeded, tc.networks...)
+			setCustomMDNS(f, seeded, hap)
 			var want []mutation
-			if tc.put != nil {
-				want = []mutation{mdnsPut(f, tc.put(f))}
+			if tc.post != nil {
+				want = []mutation{tc.post(f)}
 			}
 
 			stdout := mustRun(t, f, `{"mdns": `+tc.mdns+`}`, nil, "sync")
@@ -242,58 +281,13 @@ func TestMDNSPlanLines(t *testing.T) {
 	}
 }
 
-// A proxy naming a network this run creates waits for syncNetworks: the
-// network's legacy id only exists once it does.
-func TestMDNSWaitsForANetworkItCreates(t *testing.T) {
-	f := newFakeConsole(t)
-	seedSite(f)
-	def := f.legacyNetworkIDNamed("Default")
-	wantPut := mdnsPut(f, map[string]any{"mode": "custom", "enabled_for": "custom",
-		"predefined_services": serviceCodes("printers"), "custom_services": []any{}})
-
-	desired := `{"networks": [` + strings.TrimSuffix(strings.TrimPrefix(defaultOnly, `"networks": [`), `]`) + `,
-	  {"name":"Media","management":"GATEWAY","enabled":true,"vlanId":30,"isolationEnabled":false,
-	   "internetAccessEnabled":true,"cellularBackupEnabled":false,"mdnsForwardingEnabled":true}],
-	  "mdns": {"mode": "custom", "services": ["printers"], "networks": ["Default", "Media"]}}`
-	const create = "CREATE network        Media (vlan 30)\n"
-	const update = "UPDATE mdns proxy     custom (mode auto -> custom; services +printers; " +
-		"networks all -> Default, Media; after networks: Media created this run)\n"
-
-	stdout := mustRun(t, f, desired, nil, "sync", "--dry-run")
-	if i, j := strings.Index(stdout, create), strings.Index(stdout, update); i < 0 || j < i {
-		t.Errorf("dry run does not plan %q then %q:\n%s", create, update, stdout)
-	}
-	if strings.Count(stdout, "mdns proxy") != 1 {
-		t.Errorf("dry run planned the proxy more than once:\n%s", stdout)
-	}
-	if muts := f.recorded(); len(muts) != 0 {
-		t.Fatalf("--dry-run wrote to the console: %+v", muts)
-	}
-
-	stdout = mustRun(t, f, desired, nil, "sync")
-	if i, j := strings.Index(stdout, create), strings.Index(stdout, update); i < 0 || j < i {
-		t.Errorf("sync does not report %q then %q:\n%s", create, update, stdout)
-	}
-	muts := f.recorded()
-	if len(muts) != 2 || muts[0].Method != "POST" || muts[0].Path != "networks" {
-		t.Fatalf("writes = %+v, want the Media create then the mdns PUT", muts)
-	}
-	wantPut.Body["enabled_for_network_ids"] = []any{def, f.legacyNetworkIDNamed("Media")}
-	if !reflect.DeepEqual(muts[1], wantPut) {
-		t.Errorf("second write = %+v\nwant %+v", muts[1], wantPut)
-	}
-	if stdout, _, code := run(t, f, desired, nil, "diff"); code != 0 {
-		t.Errorf("second run is not a no-op (exit %d):\n%s", code, stdout)
-	}
-}
-
 func TestMDNSDryRunAndDiffWriteNothing(t *testing.T) {
 	f := newFakeConsole(t)
 	seedSite(f)
 	desired := `{"mdns": {"mode": "custom", "services": ["printers"]}}`
 
 	stdout := mustRun(t, f, desired, nil, "sync", "--dry-run")
-	if !strings.Contains(stdout, "DRY RUN") || !strings.Contains(stdout, "UPDATE mdns proxy     custom (mode auto -> custom;") {
+	if !strings.Contains(stdout, "DRY RUN") || !strings.Contains(stdout, "UPDATE mdns proxy     custom (mode all -> custom;") {
 		t.Errorf("dry run did not plan the update:\n%s", stdout)
 	}
 	if stdout, _, code := run(t, f, desired, nil, "diff"); code != exitChangesPending {
@@ -304,34 +298,6 @@ func TestMDNSDryRunAndDiffWriteNothing(t *testing.T) {
 	}
 }
 
-// A network the proxy names must exist on the console or be one this run
-// creates (TestMDNSWaitsForANetworkItCreates).
-func TestMDNSNetworkReferencesAreCheckedBeforeAnyWrite(t *testing.T) {
-	for _, tc := range []struct {
-		name, desired, err string
-	}{
-		{"unknown", `{` + newRecord + `, "mdns": {"mode": "custom", "services": ["printers"], "networks": ["Nope"]}}`,
-			`mdns proxy references unknown network "Nope"; create it in a sync of its own first`},
-		{"missing from the networks section", `{` + defaultOnly + `, ` + newRecord +
-			`, "mdns": {"mode": "custom", "services": ["printers"], "networks": ["IoT"]}}`,
-			`mdns proxy references network "IoT", which the networks section does not declare`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newFakeConsole(t)
-			seedSite(f)
-			for _, args := range [][]string{{"sync", "--dry-run"}, {"diff"}, {"sync"}} {
-				_, stderr, code := run(t, f, tc.desired, nil, args...)
-				if code != 1 || !strings.Contains(stderr, tc.err) {
-					t.Errorf("%v exited %d, want 1 with %q:\n%s", args, code, tc.err, stderr)
-				}
-			}
-			if muts := f.recorded(); len(muts) != 0 {
-				t.Errorf("wrote before refusing: %+v", muts)
-			}
-		})
-	}
-}
-
 func TestMDNSUnreadableSettingIsRefused(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -339,25 +305,22 @@ func TestMDNSUnreadableSettingIsRefused(t *testing.T) {
 		err     string
 	}{
 		{"unknown mode", map[string]any{"mode": "smart"}, `mode "smart" is not one #MDNS models`},
-		{"unknown enabled_for", map[string]any{"enabled_for": "selected", "enabled_for_network_ids": []any{"legacy-networks-002"}},
-			`enabled_for "selected" is not one #MDNS models`},
+		{"unknown enabled_for", map[string]any{"enabled_for": "custom"}, `enabled_for "custom" is not none, all or some`},
 		{"custom service not an object", map[string]any{"mode": "custom", "predefined_services": serviceCodes("printers"),
 			"custom_services": []any{"_hap._tcp"}}, `custom service "_hap._tcp" is not the`},
 		{"custom service with unknown fields", map[string]any{"mode": "custom", "predefined_services": serviceCodes("printers"),
-			"custom_services": []any{map[string]any{"name": "_hap._tcp", "port": 80}}}, `custom service {"name":"_hap._tcp","port":80} is not the`},
-		// Ignored by the console in these modes, but a write to custom would
-		// replace them unread.
-		{"custom service of another shape in auto", map[string]any{"custom_services": []any{map[string]any{"service": "_x._tcp"}}},
-			`custom service {"service":"_x._tcp"} is not the`},
-		{"custom service of another shape in off", map[string]any{"mode": "off", "custom_services": []any{map[string]any{"service": "_x._tcp"}}},
+			"custom_services": []any{map[string]any{"address": "_hap._tcp", "name": "HomeKit", "port": 80}}},
+			`custom service {"address":"_hap._tcp","name":"HomeKit","port":80} is not the`},
+		{"custom service without a name", map[string]any{"mode": "custom",
+			"custom_services": []any{map[string]any{"address": "_hap._tcp"}}}, `custom service {"address":"_hap._tcp"} is not the`},
+		// Informational in all, but a write replaces it unread.
+		{"custom service of another shape in all", map[string]any{"custom_services": []any{map[string]any{"service": "_x._tcp"}}},
 			`custom service {"service":"_x._tcp"} is not the`},
 		// Decode failures of the mdns object itself, before any projection.
 		{"custom_services not a list", map[string]any{"custom_services": map[string]any{"name": "_hap._tcp"}},
 			`parse mdns setting: json: cannot unmarshal object`},
-		{"network ids not strings", map[string]any{"enabled_for": "custom", "enabled_for_network_ids": []any{7}},
+		{"network ids not strings", map[string]any{"enabled_for_network_ids": []any{7}},
 			`parse mdns setting: json: cannot unmarshal number`},
-		{"network naming nothing", map[string]any{"enabled_for": "custom", "enabled_for_network_ids": []any{"5f00000000000000000000ff"}},
-			`network "5f00000000000000000000ff" is not in legacy rest/networkconf`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeConsole(t)
@@ -373,7 +336,6 @@ func TestMDNSUnreadableSettingIsRefused(t *testing.T) {
 				t.Errorf("export did not leave mdns out with a warning naming %q:\n%s", tc.err, stderr)
 			}
 
-			// custom: the desired state whose write replaces everything read.
 			desired := `{` + newRecord + `, "mdns": {"mode": "custom", "services": ["printers"]}}`
 			dir := t.TempDir()
 			for _, args := range [][]string{{"diff"}, {"sync"}, {"sync", "--snapshot-dir", dir}} {
@@ -407,7 +369,7 @@ func TestMDNSSnapshotRefusesUnreadableSetting(t *testing.T) {
 		}
 	}
 
-	_, stderr, code := run(t, f, `{"mdns": {"mode": "off"}}`, nil, "sync", "--snapshot-dir", dir)
+	_, stderr, code := run(t, f, `{"mdns": {"mode": "custom", "services": ["printers"]}}`, nil, "sync", "--snapshot-dir", dir)
 	if code != 1 || !strings.Contains(stderr, `snapshot: mdns proxy mode "smart"`) {
 		t.Errorf("sync exited %d, want 1 with the snapshot refusing:\n%s", code, stderr)
 	}
@@ -425,16 +387,16 @@ func TestMDNSSnapshotRefusesUnreadableSetting(t *testing.T) {
 func TestMDNSFailedWriteAbortsTheRun(t *testing.T) {
 	f := newFakeConsole(t)
 	seedSite(f)
-	f.mdnsPutMissing = true
+	f.mdnsWriteRefused = true
 
 	desired := `{` + iotJoinsProxy + `, "mdns": {"mode": "custom", "services": ["printers"]}}`
 	_, stderr, code := run(t, f, desired, nil, "sync")
-	if code != 1 || !strings.Contains(stderr, "update mdns proxy") || !strings.Contains(stderr, "api.err.NotFound") {
+	if code != 1 || !strings.Contains(stderr, "update mdns proxy") || !strings.Contains(stderr, "api.err.InvalidValue") {
 		t.Fatalf("sync exited %d, want 1 naming the failed mdns write:\n%s", code, stderr)
 	}
 	for _, m := range f.recorded() {
 		if m.Path != mdnsPath {
-			t.Errorf("wrote %s %s after the mdns PUT failed", m.Method, m.Path)
+			t.Errorf("wrote %s %s after the mdns write failed", m.Method, m.Path)
 		}
 	}
 	if f.objectNamed(collNetworks, "IoT")["mdnsForwardingEnabled"] != false {
@@ -445,11 +407,11 @@ func TestMDNSFailedWriteAbortsTheRun(t *testing.T) {
 func TestMDNSSnapshotRestoreRoundTrip(t *testing.T) {
 	f := newFakeConsole(t)
 	seedSite(f)
-	setCustomMDNS(f, []string{"printers", "apple_airPlay"}, "IoT")
+	setCustomMDNS(f, []string{"printers", "apple_airPlay"}, customEntry("_hap._tcp", "HomeKit test"))
 	dir := t.TempDir()
 	before := mustRun(t, f, "", nil, "export")
 
-	mustRun(t, f, `{"mdns": {"mode": "auto"}}`, nil, "sync", "--snapshot-dir", dir)
+	mustRun(t, f, `{"mdns": {"mode": "all"}}`, nil, "sync", "--snapshot-dir", dir)
 	snaps := snapshots(t, dir)
 	if len(snaps) != 1 {
 		t.Fatalf("have %d snapshots, want 1", len(snaps))
@@ -462,16 +424,18 @@ func TestMDNSSnapshotRestoreRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &snap); err != nil {
 		t.Fatal(err)
 	}
-	want := mdns{Mode: "custom", Services: []string{"apple_airPlay", "printers"}, Networks: []string{"IoT"}}
+	want := mdns{Mode: "custom", Services: []string{"apple_airPlay", "printers"},
+		CustomServices: []customService{{Name: "HomeKit test", Address: "_hap._tcp"}}}
 	if snap.MDNS == nil || !reflect.DeepEqual(*snap.MDNS, want) {
 		t.Fatalf("snapshot mdns = %+v, want %+v", snap.MDNS, want)
 	}
-	if mode := f.mdnsSetting()["mode"]; mode != "auto" {
+	if mode := f.mdnsSetting()["mode"]; mode != "all" {
 		t.Fatalf("sync left mode %v", mode)
 	}
 
 	stdout := mustRun(t, f, "", mainPassphrase, "restore", snaps[0])
-	if line := "UPDATE mdns proxy     custom (mode auto -> custom; services +apple_airPlay +printers; networks all -> IoT)\n"; !strings.Contains(stdout, line) {
+	if line := "UPDATE mdns proxy     custom (mode all -> custom; services +apple_airPlay +printers; " +
+		"customServices +HomeKit test (_hap._tcp))\n"; !strings.Contains(stdout, line) {
 		t.Errorf("restore plan is missing %q:\n%s", line, stdout)
 	}
 	if after := mustRun(t, f, "", nil, "export"); after != before {
@@ -479,34 +443,23 @@ func TestMDNSSnapshotRestoreRoundTrip(t *testing.T) {
 	}
 }
 
-// A run that drops IoT from the proxy and prunes it snapshots both; restoring
-// has to recreate IoT before the proxy can name it again.
-func TestMDNSRestoreRecreatesPrunedNetwork(t *testing.T) {
+// A snapshot whose mdns names networks predates the service-scope-only #MDNS:
+// restore refuses it rather than apply it without the networks.
+func TestMDNSRestoreRefusesOldShape(t *testing.T) {
 	f := newFakeConsole(t)
 	seedSite(f)
-	setCustomMDNS(f, []string{"printers"}, "Default", "IoT")
-	dir := t.TempDir()
-	before := mustRun(t, f, "", nil, "export")
-
-	desired := `{` + defaultOnly + `, "mdns": {"mode": "custom", "services": ["printers"], "networks": ["Default"]},
-	  "deletions": ["network IoT"]}`
-	mustRun(t, f, desired, nil, "sync", "--prune", "--snapshot-dir", dir)
-	if f.objectNamed(collNetworks, "IoT") != nil {
-		t.Fatal("sync --prune kept IoT")
-	}
-	snaps := snapshots(t, dir)
-	if len(snaps) != 1 {
-		t.Fatalf("have %d snapshots, want 1", len(snaps))
+	path := filepath.Join(t.TempDir(), "snapshot-old.json")
+	old := `{"networks": [], "mdns": {"mode": "custom", "services": ["printers"], "networks": ["IoT"]}}`
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
 	}
 
-	stdout := mustRun(t, f, "", mainPassphrase, "restore", "--prune", "--force", snaps[0])
-	const create = "CREATE network        IoT (vlan 20)\n"
-	const update = "UPDATE mdns proxy     custom (networks Default -> Default, IoT; after networks: IoT created this run)\n"
-	if i, j := strings.Index(stdout, create), strings.Index(stdout, update); i < 0 || j < i {
-		t.Errorf("restore does not report %q then %q:\n%s", create, update, stdout)
+	_, stderr, code := run(t, f, "", mainPassphrase, "restore", "--dry-run", path)
+	if code != 1 || !strings.Contains(stderr, "mdns is not #MDNS-shaped") || !strings.Contains(stderr, `unknown field "networks"`) {
+		t.Errorf("restore exited %d, want 1 refusing the mdns shape:\n%s", code, stderr)
 	}
-	if after := mustRun(t, f, "", nil, "export"); after != before {
-		t.Errorf("restore did not round-trip\nbefore:\n%s\nafter:\n%s", before, after)
+	if muts := f.recorded(); len(muts) != 0 {
+		t.Errorf("restore wrote: %+v", muts)
 	}
 }
 
@@ -515,7 +468,7 @@ func TestMDNSRestoreRecreatesPrunedNetwork(t *testing.T) {
 func TestMDNSUnmanagedSnapshotLeavesProxyAlone(t *testing.T) {
 	f := newFakeConsole(t)
 	seedSite(f)
-	setCustomMDNS(f, []string{"printers"}, "IoT")
+	setCustomMDNS(f, []string{"printers"})
 	dir := t.TempDir()
 
 	mustRun(t, f, `{`+newRecord+`}`, nil, "sync", "--snapshot-dir", dir)
@@ -535,15 +488,15 @@ func TestMDNSUnmanagedSnapshotLeavesProxyAlone(t *testing.T) {
 		t.Fatalf("snapshot of a run without mdns holds it:\n%s", data)
 	}
 
-	f.setMDNS(map[string]any{"mode": "off", "enabled_for": "all", "enabled_for_network_ids": []any{}})
+	f.setMDNS(map[string]any{"mode": "all", "predefined_services": []any{}})
 	n := len(f.legacyRequestLog())
 	mustRun(t, f, "", mainPassphrase, "restore", snaps[0])
 	for _, req := range f.legacyRequestLog()[n:] {
-		if strings.Contains(req, "rest/setting") {
-			t.Errorf("restore reached rest/setting: %s", req)
+		if strings.Contains(req, "setting") {
+			t.Errorf("restore reached the settings: %s", req)
 		}
 	}
-	if mode := f.mdnsSetting()["mode"]; mode != "off" {
+	if mode := f.mdnsSetting()["mode"]; mode != "all" {
 		t.Errorf("restore changed the unmanaged proxy to %v", mode)
 	}
 }
@@ -553,7 +506,7 @@ func TestMDNSUpdateCountsTowardsMaxChanges(t *testing.T) {
 	seedSite(f)
 	// Two updates: the proxy and the seeded record. Neither is a deletion, so
 	// --prune needs no `deletions`.
-	desired := `{"mdns": {"mode": "off"}, "dnsPolicies": [
+	desired := `{"mdns": {"mode": "custom", "services": ["printers"]}, "dnsPolicies": [
 	  {"type":"A_RECORD","enabled":true,"domain":"nas.example.internal","ipv4Address":"192.0.2.11","ttlSeconds":0}]}`
 
 	stdout, stderr, code := run(t, f, desired, nil, "sync", "--prune", "--max-changes", "1")
@@ -568,8 +521,28 @@ func TestMDNSUpdateCountsTowardsMaxChanges(t *testing.T) {
 	if strings.Contains(stdout, "DELETE") {
 		t.Errorf("the proxy was treated as a deletion:\n%s", stdout)
 	}
-	if mode := f.mdnsSetting()["mode"]; mode != "off" {
+	if mode := f.mdnsSetting()["mode"]; mode != "custom" {
 		t.Errorf("sync within the limit left mode %v", mode)
+	}
+}
+
+// A network update carries the zoneId the console reported, so it cannot
+// detach the network from its firewall zone.
+func TestNetworkUpdateKeepsZoneID(t *testing.T) {
+	f := newFakeConsole(t)
+	seedSite(f)
+	iot := f.objectNamed(collNetworks, "IoT")
+	f.mu.Lock()
+	iot["zoneId"] = "zone-iot"
+	f.mu.Unlock()
+
+	mustRun(t, f, `{`+iotJoinsProxy+`}`, nil, "sync")
+	muts := f.recorded()
+	if len(muts) != 1 || muts[0].Body["zoneId"] != "zone-iot" {
+		t.Fatalf("writes = %+v, want one network PUT carrying zoneId", muts)
+	}
+	if got := f.objectNamed(collNetworks, "IoT")["zoneId"]; got != "zone-iot" {
+		t.Errorf("IoT's zoneId after the update = %v", got)
 	}
 }
 
@@ -578,7 +551,7 @@ func TestCueVetMDNS(t *testing.T) {
 	if _, err := exec.LookPath("cue"); err != nil {
 		t.Skip("cue not installed")
 	}
-	for _, dir := range []string{"auto-with-services", "custom-without-services", "empty-networks", "missing-mode"} {
+	for _, dir := range []string{"all-with-services", "custom-without-services", "missing-mode", "mode-off", "networks"} {
 		cmd := exec.Command("cue", "vet", "-c", "./cmd/unifi/testdata/mdns-invalid/"+dir)
 		cmd.Dir = "../.."
 		out, err := cmd.CombinedOutput()
