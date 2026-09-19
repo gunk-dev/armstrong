@@ -152,8 +152,8 @@ or a range; the tool additionally enforces 1-65535 and `start <= end`, which a
 string regex cannot express. A port it cannot parse fails the sync rather than
 being sent as 0.
 
-**Reconciliation runs in dependency order:** the mDNS proxy setting (first,
-unless it names a network the run creates — see [mDNS proxy](#mdns-proxy)) → networks → firewall zones → wifi, firewall
+**Reconciliation runs in dependency order:** the mDNS proxy's service scope (see
+[mDNS proxy](#mdns-proxy)) → networks → firewall zones → wifi, firewall
 policies, DNS policies and DHCP reservations. Zones reference networks
 by name, and policies reference zones by name, so the ids exist by the time
 they are needed.
@@ -232,9 +232,9 @@ drift, and reporting "no changes" would hide it. Drop the `firewallZones` and
 
 The read path has since been confirmed against a console with the zone-based
 firewall enabled (6 zones, 67 policies): `unifi export` then `unifi diff` is a
-clean no-op over all 67. **No write has been made against a live console**, so
-create/update payloads remain inferred and are exercised only against the test
-fake. Run `--dry-run` first.
+clean no-op over all 67. DNS policy and network updates are confirmed on UniFi
+Network 10.6.101; creates and the other types are inferred from the same
+convention and exercised only against the test fake. Run `--dry-run` first.
 
 ## DHCP reservations
 
@@ -311,95 +311,74 @@ says so on stderr.
 mdns: {
 	mode: "custom"
 	services: ["apple_airPlay", "google_chromecast", "printers"]
-	networks: ["Default", "IoT"]
+	customServices: [{name: "HomeKit", address: "_hap._tcp"}]
 }
 ```
 
-The gateway runs **one** mDNS proxy for the whole site. A network's
-`mdnsForwardingEnabled` only says whether that network takes part; every
-participating network shares one scope. Enabling it on four networks therefore
-reflects every announcement — SSH, SMB, AirDrop included — between all four,
-across tiers the firewall keeps apart. `#Site.mdns` is that scope:
+The gateway runs **one** mDNS proxy for the whole site. A network takes part
+when its `mdnsForwardingEnabled` is true, and that flag is the whole story for
+participation: every participating network shares one service scope, and the
+proxy is off when no network participates. Enabling it on four networks
+therefore reflects every allowed announcement between all four, across tiers
+the firewall keeps apart. `#Site.mdns` is the service scope:
 
 | `mode` | Effect |
 | --- | --- |
-| `auto` | every service in the console's catalogue crosses |
-| `custom` | only `services` (predefined codes) and `customServices` (`_service._tcp` / `_udp`) cross; at least one is required |
-| `off` | the proxy is off |
+| `all` | every service the gateway knows crosses (the console UI's Auto) |
+| `custom` | only `services` (predefined codes) and `customServices` cross; at least one is required |
 
-`networks` narrows participation to the networks named; absent means every
-network with `mdnsForwardingEnabled: true`. It cannot be `[]`: say
-`mode: "off"`. `custom` narrows services and networks, but nothing partitions
-the scope pairwise, so "People ↔ IoT, Guest ↔ Media only" cannot be expressed.
-Omitting `mdns` leaves the setting unmanaged — the legacy API is not asked for
-it — which is not the same as `mode: "off"`.
+A custom service is `{name, address}`: `address` is `_service._tcp` or
+`_service._udp`, `name` the label the console shows. Nothing partitions the
+scope pairwise, so "People ↔ IoT, Guest ↔ Media only" cannot be expressed.
+Omitting `mdns` leaves the service scope unmanaged — the legacy API is not
+asked for it.
 
-**Transport.** The Integration API exposes only the per-network flag, so the
-setting goes through the legacy controller API, like reservations, with the
-same key and in `cmd/unifi/legacy.go`:
+**Transport.** The Integration API exposes only the per-network flag, which
+`unifi` writes with the network. The service scope goes through the legacy
+controller API, like reservations, with the same key and in
+`cmd/unifi/legacy.go`:
 
 | Request | Used for |
 | --- | --- |
-| `GET rest/networkconf` | legacy network `_id` → name, since `networks` is joined by name |
-| `GET rest/setting` | every settings object; the proxy is the one with `key: "mdns"` |
-| `PUT rest/setting/mdns/{_id}` | the object as read, minus `_id`, with `mode`, `enabled_for`, `enabled_for_network_ids`, `predefined_services` and `custom_services` replaced |
+| `GET rest/setting` | every settings object; the scope is the one with `key: "mdns"` |
+| `POST set/setting/mdns` | `mode`, `predefined_services`, `custom_services`, and `enabled_for` / `enabled_for_network_ids` echoed as read (the console requires all five and ignores the last two) |
 
-Outside `custom`, `predefined_services` and `custom_services` go back exactly
-as read.
+Outside `custom` both service lists are sent empty, as the console UI does. A
+console that reports the legacy `mode: "auto"` with its whole catalogue reads
+as `all`.
 
 **Plan lines** name the desired mode:
 
 ```
-OK     mdns proxy     auto
-OK     mdns proxy     custom (services apple_airPlay, google_chromecast; networks People, IoT)
-UPDATE mdns proxy     custom (mode auto -> custom; services +apple_airPlay +printers; networks all -> People, IoT)
-UPDATE mdns proxy     custom (services -ssh_servers -web_servers; customServices +_hap._tcp)
-UPDATE mdns proxy     off (mode custom -> off)
+OK     mdns proxy     all
+OK     mdns proxy     custom (services apple_airPlay, google_chromecast; customServices HomeKit (_hap._tcp))
+UPDATE mdns proxy     custom (mode all -> custom; services +apple_airPlay +printers)
+UPDATE mdns proxy     custom (services -ssh_servers -web_servers; customServices +HomeKit (_hap._tcp))
+UPDATE mdns proxy     all (mode custom -> all)
 ```
 
-Services and networks compare as sets: reordering them is not a change.
+Services compare as sets and custom services as sets of `(name, address)`
+pairs: reordering them is not a change.
 
 **A singleton.** The setting always exists, so it is only ever updated, never
 created or deleted: `--prune` and `deletions` do not apply. An update counts
-towards `--max-changes`. A run that declares `mdns` snapshots it under
-`--snapshot-dir`, so `restore` puts it back; a run that does not leaves it out
-of the snapshot, and restoring that snapshot leaves the proxy alone.
-
-**It runs first by default**, before networks, for two reasons: its write is
-the least certain one `unifi` makes (see below), so a failed `PUT` stops the
-run with nothing else changed; and the service restriction is in force before
-a network in the same run starts to participate. The exception is a proxy that
-names a network this run creates (a new network, or one `restore` brings back
-after a prune): its legacy id only exists once the network does, so the proxy
-is reconciled right after networks instead, and the plan says so:
-
-```
-CREATE network        Media (vlan 30)
-UPDATE mdns proxy     custom (networks Default -> Default, Media; after networks: Media created this run)
-```
-
-That costs a short window in which the new network participates under the
-previous proxy settings. Any other network `mdns.networks` names must already
-exist on the console, and when the file declares a `networks` section every
-one of them must be declared there.
+towards `--max-changes`. It is reconciled before networks, so the scope is in
+force before a network in the same run starts to participate. A run that
+declares `mdns` snapshots it under `--snapshot-dir`, so `restore` puts it back;
+a run that does not leaves it out of the snapshot, and restoring that snapshot
+leaves the scope alone. `restore` refuses an `mdns` holding keys `#MDNS` does
+not have, such as a `networks` list.
 
 **Fail closed.** `unifi` never plans over a live setting it cannot read with
-certainty: a field of an unexpected type, an unknown `mode` or `enabled_for`, a
-`custom_services` entry of another shape (in any mode: a console in `auto` or
-`off` may still hold some, and a write to `custom` replaces them), a network id
-`rest/networkconf` does not know. `diff` and `sync` exit 1 before any write,
-and `export` leaves `mdns` out and says why on stderr.
+certainty: a field of an unexpected type, an unknown `mode` or `enabled_for`,
+or a `custom_services` entry of another shape (in any mode, since a write
+replaces them). `diff` and `sync` exit 1 before any write, and `export` leaves
+`mdns` out and says why on stderr.
 
 **Service codes are not checked locally.** `services` takes any non-empty
-string: the catalogue is only visible while the console is in `auto`, so there
-is nothing reliable to check against at plan time. The console rejects an
-unknown code and `unifi` reports its `api.err.*` message. The codes seen on
-10.6.101 are listed in [`unifi-api-notes.md`](./unifi-api-notes.md).
-
-**Unconfirmed.** Reads are confirmed on UniFi Network 10.6.101; the write is
-not. The non-`all` value of `enabled_for`, the shape of a `custom_services`
-entry and the write path itself are inferred — see the API notes for each and
-how to confirm it. Run `unifi diff` and read the plan before the first `sync`.
+string. The console rejects an unknown code and `unifi` reports its
+`api.err.*` message. The codes seen on 10.6.101 are listed in
+[`unifi-api-notes.md`](./unifi-api-notes.md).
 
 ## Running it
 

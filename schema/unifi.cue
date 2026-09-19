@@ -10,7 +10,7 @@ package schema
 // firewall policies by (sourceZone, destinationZone, name). DHCP reservations
 // are keyed by MAC address.
 //
-// DHCP reservations and the mDNS proxy setting are the two things the
+// DHCP reservations and the mDNS proxy's service scope are the two things the
 // Integration API does not expose; `unifi` manages them through the console's
 // legacy controller API (/proxy/network/api/s/{site}/rest/user and
 // rest/setting) with the same API key.
@@ -68,9 +68,10 @@ package schema
 	internetAccessEnabled: bool | *true
 	// Allow this network to fail over to cellular when the WAN is down.
 	cellularBackupEnabled: bool | *false
-	// Forward mDNS between this network and others. This is participation in
-	// the gateway's one shared proxy scope, not a per-network reflector: N
-	// enabled networks all mesh. The scope itself is #Site.mdns.
+	// Take part in the gateway's mDNS proxy. This flag is the whole story for
+	// participation: every enabled network shares one service scope
+	// (#Site.mdns) and N enabled networks all mesh; with none enabled the
+	// proxy is off.
 	mdnsForwardingEnabled: bool | *false
 
 	ipv4?: #NetworkIPv4
@@ -254,33 +255,28 @@ package schema
 	network: string & !=""
 }
 
-// #MDNS is the gateway's site-wide mDNS proxy: one shared scope across every
-// participating network. `custom` narrows which services cross and which
-// networks take part; nothing partitions the scope pairwise, so "People <->
-// IoT, Guest <-> Media only" cannot be expressed. `off` is here so `unifi
-// export` round-trips; it switches the proxy off, whereas omitting #Site.mdns
-// leaves the setting unmanaged.
+// #MDNS is the service scope of the gateway's site-wide mDNS proxy. Which
+// networks take part is each network's #Network.mdnsForwardingEnabled, and
+// every participating network shares this one scope; the proxy is off when no
+// network participates. Nothing partitions the scope pairwise, so "People <->
+// IoT, Guest <-> Media only" cannot be expressed. Omitting #Site.mdns leaves
+// the service scope unmanaged.
 #MDNS: X={
-	mode: "auto" | "custom" | "off"
-
-	// Custom-mode allow-list of predefined service codes as the console names
-	// them (apple_airPlay, google_chromecast, printers, …). Not checked here:
-	// the console rejects a code it does not know.
+	// "all" reflects every service the gateway knows (the UI's Auto);
+	// "custom" reflects only the allow-list below (the UI's Specific).
+	mode: "all" | "custom"
+	// Predefined service codes as the console names them (apple_airPlay,
+	// google_chromecast, printers, …); not checked here.
 	services?: [...string & !=""]
-	// Custom-mode `_service._proto` entries beyond the predefined ones.
-	customServices?: [...string & =~"^_[a-z0-9-]+\\._(tcp|udp)$"]
+	// Services beyond the predefined ones: address is `_service._proto`,
+	// name is the label the console shows.
+	customServices?: [...{name: string & !="", address: string & =~"^_[a-z0-9-]+\\._(tcp|udp)$"}]
 
-	// Participating networks by NAME. Absent means every network whose
-	// mdnsForwardingEnabled is true; present narrows to these. To have none,
-	// set `mode: "off"`.
-	networks?: [string & !="", ...string & !=""]
-
+	// custom needs at least one entry across the two lists; all takes none.
 	if mode == "custom" {
-		// Refuses a custom proxy with nothing on its allow-list.
 		_allowed: [for k, v in X if k == "services" || k == "customServices" for s in v {s}] & [_, ...]
 	}
-	if mode != "custom" {
-		// auto reflects the whole catalogue; off reflects nothing.
+	if mode == "all" {
 		services?:       _|_
 		customServices?: _|_
 	}

@@ -827,7 +827,7 @@ const exampleSiteFallback = `{
   "reservations": [
     {"mac":"02:00:5e:10:00:10","name":"nas","fixedIp":"192.0.2.10","network":"Default"}
   ],
-  "mdns": {"mode":"custom","services":["apple_airPlay","google_chromecast","printers"],"networks":["Default","IoT"]}
+  "mdns": {"mode":"custom","services":["apple_airPlay","google_chromecast","printers"],"customServices":[{"name":"HomeKit","address":"_hap._tcp"}]}
 }`
 
 func equalStrings(a, b []string) bool {

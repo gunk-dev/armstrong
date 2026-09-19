@@ -91,6 +91,7 @@ fetch per network.
 id, name, management: "GATEWAY", enabled, vlanId, default,
 metadata: {origin, configurable},
 isolationEnabled, internetAccessEnabled, cellularBackupEnabled, mdnsForwardingEnabled,
+zoneId,                                  // with the zone-based firewall
 ipv4Configuration: {
   hostIpAddress, prefixLength, autoScaleEnabled,
   dhcpConfiguration: {
@@ -314,63 +315,91 @@ is why `cmd/unifi` never calls it.
 
 ### Legacy controller API — mDNS proxy setting (issue #25)
 
-The Integration API exposes only a network's `mdnsForwardingEnabled`, which is
-`mdns_enabled` on `rest/networkconf`: whether that network takes part in the
-gateway's mDNS proxy. The proxy itself — one per site — is a legacy settings
-object. Same base, key and envelope as above.
+Confirmed on UniFi Network 10.6.101 on 2026-09-19, by changing the setting in
+the console UI (Settings → Networks → Gateway mDNS Proxy) with the network
+inspector open and reproducing every write with `curl` and the same
+`X-API-KEY`.
 
-Confirmed on UniFi Network 10.6.101 (`GET rest/setting`, which returns every
-settings object; the proxy is the one with `key: "mdns"`):
+**Participation is one flag per network**, visible and writable in three
+places that the console keeps in step in both directions:
+
+| View | Field | Write |
+| --- | --- | --- |
+| Integration API `GET/PUT /networks/{id}` | `mdnsForwardingEnabled: bool` | `PUT` the detail body; the other views follow |
+| legacy `rest/networkconf` | `mdns_enabled: bool` | not used |
+| v2 global network config (below) | `mdns_enabled_for`, `mdns_enabled_for_network_ids` | partial-body `PUT` |
+
+The enum is derived from the set of flags: all true → `all`, none true →
+`none`, otherwise `some` with the true ones listed. The UI's Auto/Off/Custom
+"VLAN Scope" is a bulk setter for the flags and nothing more; its Off is every
+flag false. `cmd/unifi` writes participation only through the network `PUT`.
+
+**The service scope** is the legacy settings object with `key: "mdns"`, read
+from `GET rest/setting` (the list of every settings object):
 
 | Field | Observed |
 | --- | --- |
-| `mode` | `"auto"`; the console's other modes are `custom` and `off` |
-| `enabled_for` | `"all"` |
-| `enabled_for_network_ids` | `[]`; holds `rest/networkconf` `_id`s (ObjectIds, not Integration API UUIDs), so networks join by name |
-| `predefined_services` | `[{"code": …}]`: in `auto` the whole catalogue, informational; in `custom` the allow-list |
-| `custom_services` | `[]` |
-| `site_id`, `_id` | present |
+| `mode` | `all` (the UI's Auto), `custom` (the UI's Specific), or `auto` |
+| `predefined_services` | `[{"code": …}]`: the allow-list in `custom`; `[]` after the UI writes `all` |
+| `custom_services` | `[{"address": "_hap._tcp", "name": "HomeKit test"}]`: `address` is `_service._proto`, `name` the UI's "Label"; the UI requires both |
+| `enabled_for` | `none`, `all` or `some`: a read-only projection of the per-network flags |
+| `enabled_for_network_ids` | the `rest/networkconf` `_id`s (ObjectIds, not Integration API UUIDs) of the participating networks when `some` |
+| `site_id`, `_id`, `key` | present |
 
-The 24 codes in `auto`: `amazon_devices`, `android_tv_remote`,
-`apple_airDrop`, `apple_airPlay`, `apple_file_sharing`, `apple_iChat`,
-`apple_iTunes`, `aqara`, `bose`, `dns_service_discovery`, `ftp_servers`,
-`google_chromecast`, `homeKit`, `matter_network`, `philips_hue`, `printers`,
-`roku`, `scanners`, `sonos`, `spotify_connect`, `ssh_servers`,
-`time_capsule`, `web_servers`, `windows_file_sharing_samba`.
+`auto` is accepted on write but the UI never sends it; a console not written
+since its migration to 10.6 reports `mode: "auto"` with the whole catalogue in
+`predefined_services`, and becomes `all` with `[]` at the first UI write.
+`cmd/unifi` reads `auto` as `all` and never writes it. `off` and any other
+mode are refused with `api.err.InvalidPayload`. Whether `custom` with both
+lists empty is accepted has not been tested; `cmd/unifi` refuses it at plan
+time.
 
-`cmd/unifi` reads the proxy from the list; `GET rest/setting/mdns` has not been
-observed and is not used.
+**Write:** `POST /proxy/network/api/s/default/set/setting/mdns` with a JSON body
+carrying all five of `mode`, `predefined_services`, `custom_services`,
+`enabled_for` and `enabled_for_network_ids`. A body with only `mode` is refused
+with `api.err.InvalidPayload`. Values sent for `enabled_for*` are ignored (rc
+ok, unchanged), so `cmd/unifi` echoes them as read. `key`, `site_id` and `_id`
+are accepted and harmless. The response is
+`{"meta":{"rc":"ok"},"data":[<the object as now stored>]}`; a refused write is
+`{"meta":{"rc":"error","msg":"api.err.InvalidPayload"}}` or
+`api.err.InvalidValue`. The UI sends both lists empty outside `custom`, and so
+does `cmd/unifi`. `PUT rest/setting/mdns/{_id}` with the same body was also
+observed to return 200 and apply; the UI uses the `POST`, and so does
+`cmd/unifi`.
 
-**Unconfirmed.** Each has one named place in `cmd/unifi/legacy.go`, marked
-UNCONFIRMED:
+The 24 predefined codes (the catalogue a console reports in `auto`):
+`amazon_devices`, `android_tv_remote`, `apple_airDrop`, `apple_airPlay`,
+`apple_file_sharing`, `apple_iChat`, `apple_iTunes`, `aqara`, `bose`,
+`dns_service_discovery`, `ftp_servers`, `google_chromecast`, `homeKit`,
+`matter_network`, `philips_hue`, `printers`, `roku`, `scanners`, `sonos`,
+`spotify_connect`, `ssh_servers`, `time_capsule`, `web_servers`,
+`windows_file_sharing_samba`.
 
-1. **The non-`all` value of `enabled_for`**, which makes
-   `enabled_for_network_ids` the participating set. Assumed `"custom"`
-   (`legacyMDNSEnabledForCustom`). Confirm by restricting the proxy to chosen
-   networks in the console UI.
-2. **The shape of a `custom_services` entry.** Assumed `{"name": "_hap._tcp"}`
-   (`customServiceName`, `customServiceEntry`); any other shape is refused on
-   read, in every mode. Confirm by adding a custom service in the UI.
-3. **The write.** Assumed a full-object `PUT rest/setting/mdns/{_id}`, the
-   classic controller convention for settings (`mdnsWriteBody`): the object as
-   read minus `_id`, so unmodelled fields are echoed. Confirm by changing the
-   mode in the UI.
+### v2 API — global network config
 
-To confirm any of them, change the setting in the console UI with the browser's
-network inspector open, record the request's method, path and body, then
-re-read the object with `GET rest/setting`. What `predefined_services` holds
-after leaving `custom` is also unknown, which is why a write outside `custom`
-sends both service lists back as read.
+`GET/PUT /proxy/network/v2/api/site/default/global/config/network` holds,
+among other site-wide network settings, `mdns_enabled_for:
+"none"|"all"|"some"` and `mdns_enabled_for_network_ids: [networkconf _id]`.
+A `PUT` with a partial body merges into the object; the enum refuses any other
+string with a 400. It is a third view of the per-network flags, in both
+directions: `some` with `[<id>]` sets that network's `mdnsForwardingEnabled`,
+`some` with `[]` or `none` clears every flag, `all` sets every flag, and a
+network `PUT` made afterwards re-derives the enum from the flags (`some` + `[]`
+followed by one flag set true reads `all` on a one-network console).
+`cmd/unifi` does not use it: the network `PUT` it already makes writes the
+same state, and a second writer would model participation twice.
 
 ## Write bodies
 
-No write has been performed against the reference console, so create/update
-payloads are **inferred**: they mirror the `GET` detail representation with the
-server-owned keys (`id`, `metadata`, `index`, `default`) removed. This matches
-how the rest of the Integration API behaves and is the shape
-`cmd/unifi/api.go` sends; the fake server in `cmd/unifi/fake_test.go` asserts
-it, but a live console has not yet confirmed it. Run `unifi sync --dry-run`
-first on a real deployment.
+Create/update payloads mirror the `GET` detail representation with the
+server-owned keys (`id`, `metadata`, `index`, `default`) removed; that is the
+shape `cmd/unifi/api.go` sends. Two no-op `PUT`s built that way returned 200
+and left the object unchanged on UniFi Network 10.6.101: `/dns/policies/{id}`
+(an A record) and `/networks/{id}` (Default, whose detail carries `zoneId`
+under the zone-based firewall; `cmd/unifi` sends it back as read, so an update
+cannot detach a network from its zone). Creates and updates of the other
+types are inferred from the same convention and exercised only against the
+test fake. Run `unifi sync --dry-run` first on a real deployment.
 
 For firewall policies the inference is now checked in both directions:
 `cmd/unifi` re-renders every live policy from its own projection and compares

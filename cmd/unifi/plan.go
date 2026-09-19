@@ -47,9 +47,6 @@ type reconciler struct {
 	// or not; unlisted the ones `deletions` does not approve.
 	candidates map[string]bool
 	unlisted   []string
-	// mdnsAfterNetworks names the networks mdns references that this run
-	// creates; non-empty defers the proxy until after syncNetworks.
-	mdnsAfterNetworks []string
 }
 
 // pendingID stands in for an id that would only exist after an earlier create
@@ -101,15 +98,11 @@ func (r *reconciler) run() error {
 	}
 	r.candidates = map[string]bool{}
 	for _, step := range []func() error{
-		// mDNS first by default, for two reasons: its write is the least
-		// certain (see mdnsWriteBody), so a failed PUT aborts with nothing
-		// else changed; and the service restriction lands before networks
-		// widen participation. A proxy naming a network this run creates
-		// waits for that network instead, which leaves a short window in
-		// which it participates under the previous proxy settings.
+		// The mDNS service scope first, so that it is in force before a
+		// network in the same run starts to participate, and a failed write
+		// to it aborts the run with nothing else changed.
 		r.syncMDNS,
 		r.syncNetworks,
-		r.syncDeferredMDNS,
 		r.syncZones,
 		r.syncWiFi,
 		r.syncFirewallPolicies,
@@ -253,7 +246,11 @@ func (r *reconciler) syncNetworks() error {
 			continue
 		}
 		r.logf("UPDATE", "network", want.Name, "%s", diffSummary(got.Spec, want))
-		if err := r.mutate(http.MethodPut, base+"/"+got.ID, want.body(), nil); err != nil {
+		body, err := want.updateBody(got)
+		if err != nil {
+			return err
+		}
+		if err := r.mutate(http.MethodPut, base+"/"+got.ID, body, nil); err != nil {
 			return fmt.Errorf("update network %q: %w", want.Name, err)
 		}
 	}

@@ -56,6 +56,10 @@ type apiNetwork struct {
 	MDNSForwardingEnabled bool     `json:"mdnsForwardingEnabled"`
 	IPv4Configuration     *apiIPv4 `json:"ipv4Configuration,omitempty"`
 	Default               bool     `json:"default"`
+	// ZoneID is the firewall zone the network belongs to, present on a
+	// console running the zone-based firewall. It is not modelled (zones name
+	// their networks), but an update carries it through; see updateBody.
+	ZoneID string `json:"zoneId,omitempty"`
 }
 
 type apiIPv4 struct {
@@ -156,6 +160,21 @@ func (n network) body() map[string]any {
 	return b
 }
 
+// updateBody is the PUT that makes the live network got match n: n's body
+// plus the zoneId got reports, so that an update never detaches a network
+// from its firewall zone.
+func (n network) updateBody(got actual[network]) (map[string]any, error) {
+	b := n.body()
+	var live apiNetwork
+	if err := json.Unmarshal(got.Raw, &live); err != nil {
+		return nil, fmt.Errorf("parse network %q: %w", n.Name, err)
+	}
+	if live.ZoneID != "" {
+		b["zoneId"] = live.ZoneID
+	}
+	return b, nil
+}
+
 func (c *client) networks(siteID string) ([]actual[network], error) {
 	raws, err := c.list("/sites/" + siteID + "/networks")
 	if err != nil {
@@ -168,15 +187,20 @@ func (c *client) networks(siteID string) ([]actual[network], error) {
 			return nil, fmt.Errorf("parse network: %w", err)
 		}
 		// The list response omits ipv4Configuration; fetch the detail view.
-		var detail apiNetwork
-		if err := c.do(http.MethodGet, "/sites/"+siteID+"/networks/"+overview.ID, nil, &detail); err != nil {
+		var raw json.RawMessage
+		if err := c.do(http.MethodGet, "/sites/"+siteID+"/networks/"+overview.ID, nil, &raw); err != nil {
 			return nil, fmt.Errorf("get network %q: %w", overview.Name, err)
+		}
+		var detail apiNetwork
+		if err := json.Unmarshal(raw, &detail); err != nil {
+			return nil, fmt.Errorf("parse network %q: %w", overview.Name, err)
 		}
 		out = append(out, actual[network]{
 			ID:       detail.ID,
 			Origin:   detail.Metadata.Origin,
 			Spec:     detail.spec(),
 			IsSystem: detail.Metadata.Origin == originSystem,
+			Raw:      raw,
 		})
 	}
 	return out, nil

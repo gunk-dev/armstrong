@@ -124,17 +124,13 @@ func buildExport(c *client, ref siteRef, legacy legacySections, warn io.Writer) 
 	}
 
 	if legacy.mdns {
-		names, err := c.legacyNetworks(ref.InternalReference)
-		if err != nil {
-			return doc, err
-		}
-		switch _, m, err := c.readMDNS(ref.InternalReference, names); {
+		switch _, m, err := c.readMDNS(ref.InternalReference); {
 		case err == nil:
 			doc.MDNS = &m
 		case legacy.strictMDNS || !isMDNSUnreadable(err):
 			return doc, err
 		default:
-			fmt.Fprintf(warn, "skipping the mdns proxy setting: %v. Declaring it would plan a PUT "+
+			fmt.Fprintf(warn, "skipping the mdns proxy setting: %v. Declaring it would plan a write "+
 				"over what this tool cannot read.\n", err)
 		}
 	}

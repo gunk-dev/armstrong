@@ -244,7 +244,7 @@ Available definitions:
 - `#HttpService` — HTTP service settings (port, auto-stop, auto-start, health checks)
 - `#HttpCheck` — HTTP health check configuration
 - `#DNSRecord` — DNS record definition (A, AAAA, CNAME, MX, NS, SRV, TXT)
-- `#Site` — a UniFi Network site (see `schema/unifi.cue`), holding `#Network`, `#FirewallZone`, `#WiFi`, `#FirewallPolicy`, `#DNSPolicy` and `#Reservation` lists and the `#MDNS` proxy setting. `#FirewallPolicy` models the full policy: `#TrafficFilter` on either end (networks, IP addresses/subnets, ports, MAC addresses, applications), `#FirewallSchedule`, connection states, protocol and logging
+- `#Site` — a UniFi Network site (see `schema/unifi.cue`), holding `#Network`, `#FirewallZone`, `#WiFi`, `#FirewallPolicy`, `#DNSPolicy` and `#Reservation` lists and the `#MDNS` proxy service scope. `#FirewallPolicy` models the full policy: `#TrafficFilter` on either end (networks, IP addresses/subnets, ports, MAC addresses, applications), `#FirewallSchedule`, connection states, protocol and logging
 
 ## DNS Tool
 
@@ -399,15 +399,16 @@ Environment:
   Networks are joined by name, since legacy and Integration API ids differ.
   `--prune` clears a reservation with `use_fixedip: false` (once `deletions`
   lists `reservation <mac>`) and never forgets the client.
-- **The mDNS proxy** (`mdns: #MDNS`) is the gateway's one site-wide proxy,
-  which every network with `mdnsForwardingEnabled` shares: `mode` (`auto`,
-  `custom`, `off`), a custom-mode service allow-list and an optional list of
-  participating networks. It is only ever updated, never pruned. See
+- **The mDNS proxy** (`mdns: #MDNS`) is the service scope of the gateway's one
+  site-wide proxy: `mode` (`all` or `custom`) and, in `custom`, an allow-list
+  of predefined `services` and `customServices` (`{name, address}`). Which
+  networks take part is each network's `mdnsForwardingEnabled`. It is only
+  ever updated, never pruned. See
   [`docs/unifi.md`](docs/unifi.md#mdns-proxy).
-- Resources are reconciled in dependency order: the mDNS proxy first (so a
-  failed write to it changes nothing else) unless it names a network the run
-  creates, in which case right after networks; networks → firewall zones →
-  wifi, firewall policies, DNS policies, DHCP reservations.
+- Resources are reconciled in dependency order: the mDNS service scope first
+  (so it is in force before a network joins, and a failed write to it changes
+  nothing else), then networks → firewall zones → wifi, firewall policies,
+  DNS policies, DHCP reservations.
 
 ### Running it
 

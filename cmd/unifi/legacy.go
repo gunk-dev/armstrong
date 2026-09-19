@@ -4,8 +4,8 @@ package main
 // manages through the legacy controller API (/proxy/network/api/s/{site}/…)
 // rather than the Integration API, which has no surface for either: its
 // /clients routes are GET-only, list only connected clients and carry no
-// fixed-IP field, and it exposes only the per-network mDNS participation flag
-// (see docs/unifi-api-notes.md). The legacy API accepts the same X-API-KEY,
+// fixed-IP field, and it exposes only the per-network mDNS participation flag,
+// not the proxy's service scope (see docs/unifi-api-notes.md). The legacy API accepts the same X-API-KEY,
 // lists every known client including offline ones, and accepts writes. It is
 // undocumented and can change without notice, so everything that speaks it
 // lives in this file and nothing else does.
@@ -362,46 +362,39 @@ func checkReservations(res []reservation) error {
 
 // ------------------------------------------------------------ mDNS proxy
 
-// legacyMDNS is the `rest/setting` entry keyed "mdns": the gateway's one
-// mDNS proxy. raw is the entry as read, which a write echoes so that fields
-// this tool does not model survive it.
+// legacyMDNS is the `rest/setting` entry keyed "mdns": the service scope of
+// the gateway's one mDNS proxy. Which networks take part is each network's
+// mdnsForwardingEnabled, written through the Integration API; EnabledFor and
+// EnabledForNetworkIDs are the console's read-only projection of those flags
+// here, kept only so that a write can echo them.
 type legacyMDNS struct {
-	ID                   string   `json:"_id"`
+	// Mode is "all" (the UI's Auto), "custom", or "auto", which the console
+	// still accepts and reads here as "all".
 	Mode                 string   `json:"mode"`
 	EnabledFor           string   `json:"enabled_for"`
 	EnabledForNetworkIDs []string `json:"enabled_for_network_ids"`
-	// The allow-list in custom mode; the whole catalogue, informational only,
-	// in auto.
+	// The allow-list in custom mode; informational otherwise.
 	PredefinedServices []struct {
 		Code string `json:"code"`
 	} `json:"predefined_services"`
 	CustomServices []json.RawMessage `json:"custom_services"`
-
-	raw map[string]any
 }
 
-// legacyMDNSEnabledForCustom is the enabled_for value that makes
-// enabled_for_network_ids the participating set. UNCONFIRMED: only "all" has
-// been seen on a console.
-const legacyMDNSEnabledForCustom = "custom"
-
-// customServiceName reads one custom_services element. UNCONFIRMED: assumed
-// to be {"name":"_hap._tcp"}; only an empty list has been seen. Anything else,
-// extra keys included, is refused rather than rewritten without them.
-func customServiceName(raw json.RawMessage) (string, error) {
+// parseCustomService reads one custom_services element,
+// {"address": "_hap._tcp", "name": "HomeKit"}. Anything else, extra keys
+// included, is refused rather than rewritten without them.
+func parseCustomService(raw json.RawMessage) (customService, error) {
 	var e struct {
-		Name string `json:"name"`
+		Address string `json:"address"`
+		Name    string `json:"name"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&e); err != nil || e.Name == "" {
-		return "", fmt.Errorf(`mdns proxy custom service %s is not the {"name": "_service._proto"} shape this tool assumes`, raw)
+	if err := dec.Decode(&e); err != nil || e.Address == "" || e.Name == "" {
+		return customService{}, fmt.Errorf(`mdns proxy custom service %s is not the {"address": "_service._proto", "name": "label"} shape this tool reads`, raw)
 	}
-	return e.Name, nil
+	return customService{Name: e.Name, Address: e.Address}, nil
 }
-
-// customServiceEntry is the inverse of customServiceName, and as unconfirmed.
-func customServiceEntry(name string) map[string]any { return map[string]any{"name": name} }
 
 // mdnsUnreadable marks an mdns setting that was fetched but cannot be read
 // with certainty, as opposed to a console that could not be read at all:
@@ -411,17 +404,16 @@ type mdnsUnreadable struct{ error }
 func isMDNSUnreadable(err error) bool { return errors.As(err, new(mdnsUnreadable)) }
 
 // readMDNS fetches the live setting and projects it; see mdnsUnreadable.
-func (c *client) readMDNS(site string, names nameLookup) (*legacyMDNS, mdns, error) {
+func (c *client) readMDNS(site string) (*legacyMDNS, mdns, error) {
 	got, err := c.legacyMDNS(site)
 	if err != nil {
 		return nil, mdns{}, err
 	}
-	have, err := got.project(names)
+	have, err := got.project()
 	return got, have, err
 }
 
-// legacyMDNS reads the proxy setting from the settings list; the per-key
-// GET rest/setting/mdns has never been observed, so it is not relied on.
+// legacyMDNS reads the proxy setting from the settings list.
 func (c *client) legacyMDNS(site string) (*legacyMDNS, error) {
 	raws, err := c.legacyDo(http.MethodGet, site, "/rest/setting", nil)
 	if err != nil {
@@ -442,12 +434,6 @@ func (c *client) legacyMDNS(site string) (*legacyMDNS, error) {
 		if err := json.Unmarshal(raw, m); err != nil {
 			return nil, mdnsUnreadable{fmt.Errorf("parse mdns setting: %w", err)}
 		}
-		// UseNumber: an echoed number must not come back as a rounded float.
-		dec := json.NewDecoder(bytes.NewReader(raw))
-		dec.UseNumber()
-		if err := dec.Decode(&m.raw); err != nil {
-			return nil, mdnsUnreadable{fmt.Errorf("parse mdns setting: %w", err)}
-		}
 		found = append(found, m)
 	}
 	if len(found) != 1 {
@@ -458,52 +444,42 @@ func (c *client) legacyMDNS(site string) (*legacyMDNS, error) {
 
 // project reads the live setting as #MDNS. Anything it cannot read with
 // certainty is an mdnsUnreadable error, never a guess: a guess would plan a
-// PUT over it.
-func (m *legacyMDNS) project(names nameLookup) (_ mdns, err error) {
+// write over it.
+func (m *legacyMDNS) project() (_ mdns, err error) {
 	defer func() {
 		if err != nil {
 			err = mdnsUnreadable{err}
 		}
 	}()
-	out := mdns{Mode: m.Mode}
-	// Read in every mode: auto and off ignore them, but a write to custom
-	// replaces them.
-	var custom []string
+	// Read in every mode, so that a shape this tool does not know is refused
+	// before any write replaces it.
+	var custom []customService
 	for _, raw := range m.CustomServices {
-		name, err := customServiceName(raw)
+		cs, err := parseCustomService(raw)
 		if err != nil {
 			return mdns{}, err
 		}
-		custom = append(custom, name)
+		custom = append(custom, cs)
 	}
+	var out mdns
 	switch m.Mode {
-	case "auto", "off":
+	case "all", "auto":
+		// Both reflect every service; the lists are informational.
+		out.Mode = "all"
 	case "custom":
+		out.Mode = "custom"
 		for _, s := range m.PredefinedServices {
 			out.Services = append(out.Services, s.Code)
 		}
-		out.CustomServices = custom
 		sort.Strings(out.Services)
-		sort.Strings(out.CustomServices)
+		out.CustomServices = sortedServices(custom)
 	default:
 		return mdns{}, fmt.Errorf("mdns proxy mode %q is not one #MDNS models", m.Mode)
 	}
 	switch m.EnabledFor {
-	case "all":
-	case legacyMDNSEnabledForCustom:
-		if len(m.EnabledForNetworkIDs) == 0 {
-			return mdns{}, errors.New("mdns proxy is restricted to a list of networks, but the list is empty")
-		}
-		for _, id := range m.EnabledForNetworkIDs {
-			name := names.name(id)
-			if name == "" {
-				return mdns{}, fmt.Errorf("mdns proxy network %q is not in legacy rest/networkconf", id)
-			}
-			out.Networks = append(out.Networks, name)
-		}
-		sort.Strings(out.Networks)
+	case "none", "all", "some":
 	default:
-		return mdns{}, fmt.Errorf("mdns proxy enabled_for %q is not one #MDNS models", m.EnabledFor)
+		return mdns{}, fmt.Errorf("mdns proxy enabled_for %q is not none, all or some", m.EnabledFor)
 	}
 	if err := checkMDNS(&out); err != nil {
 		return mdns{}, fmt.Errorf("live %w", err)
@@ -521,53 +497,43 @@ func checkMDNS(m *mdns) error {
 		if len(m.Services)+len(m.CustomServices) == 0 {
 			return errors.New("mdns proxy: mode custom needs services or customServices")
 		}
-	case "auto", "off":
+	case "all":
 		if m.Services != nil || m.CustomServices != nil {
-			return fmt.Errorf("mdns proxy: mode %s takes no services or customServices", m.Mode)
+			return errors.New("mdns proxy: mode all takes no services or customServices")
 		}
 	default:
-		return fmt.Errorf("mdns proxy: mode %q is not auto, custom or off", m.Mode)
+		return fmt.Errorf("mdns proxy: mode %q is not all or custom", m.Mode)
 	}
-	if m.Networks != nil && len(m.Networks) == 0 {
-		return errors.New(`mdns proxy: networks is empty; use mode "off" for no networks`)
-	}
-	for _, list := range []struct {
-		field  string
-		values []string
-	}{{"services", m.Services}, {"customServices", m.CustomServices}, {"networks", m.Networks}} {
-		seen := map[string]bool{}
-		for _, v := range list.values {
-			switch {
-			case v == "":
-				return fmt.Errorf("mdns proxy: empty entry in %s", list.field)
-			case list.field == "customServices" && !customServiceRE.MatchString(v):
-				return fmt.Errorf("mdns proxy: custom service %q is not _service._tcp or _service._udp", v)
-			case seen[v]:
-				return fmt.Errorf("mdns proxy: %s lists %q twice", list.field, v)
-			}
-			seen[v] = true
+	seen := map[string]bool{}
+	for _, v := range m.Services {
+		switch {
+		case v == "":
+			return errors.New("mdns proxy: empty entry in services")
+		case seen[v]:
+			return fmt.Errorf("mdns proxy: services lists %q twice", v)
 		}
+		seen[v] = true
+	}
+	seen = map[string]bool{}
+	for _, cs := range m.CustomServices {
+		switch {
+		case cs.Name == "":
+			return fmt.Errorf("mdns proxy: custom service %q has no name", cs.Address)
+		case !customServiceRE.MatchString(cs.Address):
+			return fmt.Errorf("mdns proxy: custom service address %q is not _service._tcp or _service._udp", cs.Address)
+		case seen[cs.label()]:
+			return fmt.Errorf("mdns proxy: customServices lists %s twice", cs.label())
+		}
+		seen[cs.label()] = true
 	}
 	return nil
 }
 
-// syncMDNS reconciles the site-wide mDNS proxy. An absent mdns is not managed
-// and the legacy API is not read. It is a singleton, only ever updated, so
-// --prune and `deletions` do not apply; an update counts towards
-// --max-changes. It runs before syncNetworks (see run) unless it names a
-// network the networks section is about to create: then it only records
-// those in mdnsAfterNetworks and syncDeferredMDNS does the work.
-func (r *reconciler) syncMDNS() error { return r.reconcileMDNS(false) }
-
-// syncDeferredMDNS is syncMDNS run after syncNetworks, when syncMDNS deferred.
-func (r *reconciler) syncDeferredMDNS() error {
-	if len(r.mdnsAfterNetworks) == 0 {
-		return nil
-	}
-	return r.reconcileMDNS(true)
-}
-
-func (r *reconciler) reconcileMDNS(afterNetworks bool) error {
+// syncMDNS reconciles the service scope of the site-wide mDNS proxy. An
+// absent mdns is not managed and the legacy API is not read. It is a
+// singleton, only ever updated, so --prune and `deletions` do not apply; an
+// update counts towards --max-changes.
+func (r *reconciler) syncMDNS() error {
 	want := r.want.MDNS
 	if want == nil {
 		return nil
@@ -575,11 +541,7 @@ func (r *reconciler) reconcileMDNS(afterNetworks bool) error {
 	if err := checkMDNS(want); err != nil {
 		return err
 	}
-	names, err := r.client.legacyNetworks(r.legacySite)
-	if err != nil {
-		return err
-	}
-	got, have, err := r.client.readMDNS(r.legacySite, names)
+	got, have, err := r.client.readMDNS(r.legacySite)
 	if isMDNSUnreadable(err) {
 		return fmt.Errorf("%w; refusing to manage an mdns proxy setting this tool cannot read faithfully", err)
 	}
@@ -587,97 +549,48 @@ func (r *reconciler) reconcileMDNS(afterNetworks bool) error {
 		return err
 	}
 
-	netIDs := map[string]string{}
-	for id, name := range names {
-		netIDs[name] = id
-	}
-	declared := map[string]bool{}
-	for _, n := range r.want.Networks {
-		declared[n.Name] = true
-	}
-	var ids, missing []string
-	for _, n := range want.Networks {
-		id, ok := netIDs[n]
-		if !ok && !declared[n] {
-			return fmt.Errorf("mdns proxy references unknown network %q; create it in a sync of its own first", n)
-		}
-		// A declared networks section is every network the file keeps.
-		if r.want.Networks != nil && !declared[n] {
-			return fmt.Errorf("mdns proxy references network %q, which the networks section does not declare", n)
-		}
-		if !ok {
-			switch {
-			case !afterNetworks:
-				missing = append(missing, n)
-				continue
-			case !r.dryRun:
-				return fmt.Errorf("mdns proxy network %q is still not in legacy rest/networkconf after networks were reconciled", n)
-			}
-			id = pendingID
-		}
-		ids = append(ids, id)
-	}
-	if len(missing) > 0 {
-		r.mdnsAfterNetworks = missing
-		return nil
-	}
-
 	changes := mdnsChanges(have, *want)
 	if len(changes) == 0 {
 		r.logf("OK", "mdns proxy", want.Mode, "%s", want.summary())
 		return nil
 	}
-	if got.ID == "" {
-		return errors.New("the console's mdns setting has no _id to update")
-	}
-	if afterNetworks {
-		changes = append(changes, "after networks: "+strings.Join(r.mdnsAfterNetworks, ", ")+" created this run")
-	}
 	r.logf("UPDATE", "mdns proxy", want.Mode, "%s", strings.Join(changes, "; "))
-	// UNCONFIRMED path; see mdnsWriteBody.
-	if err := r.mutateLegacy(http.MethodPut, "/rest/setting/mdns/"+got.ID, mdnsWriteBody(got, *want, ids)); err != nil {
+	if err := r.mutateLegacy(http.MethodPost, "/set/setting/mdns", mdnsWriteBody(got, *want)); err != nil {
 		return fmt.Errorf("update mdns proxy: %w", err)
 	}
 	return nil
 }
 
-// mdnsWriteBody is the PUT to rest/setting/mdns/{_id} that makes the setting
-// want: the entry as read, minus `_id`, with the modelled fields replaced.
-// UNCONFIRMED: path and full-object body are the classic controller
-// convention for settings, not yet seen on a console; echoing every field
-// read is what keeps a full-object PUT from dropping any.
-func mdnsWriteBody(got *legacyMDNS, want mdns, networkIDs []string) map[string]any {
-	body := map[string]any{}
-	for k, v := range got.raw {
-		if k != "_id" {
-			body[k] = v
-		}
-	}
-	body["mode"] = want.Mode
-	// Outside custom the lists go back as read: what the console keeps there
-	// after leaving custom is unknown.
+// mdnsWriteBody is the POST to set/setting/mdns that makes the setting want.
+// The console refuses a body without all five keys. It ignores enabled_for
+// and enabled_for_network_ids, so they go back as read; outside custom both
+// service lists are empty, as the console UI sends them.
+func mdnsWriteBody(got *legacyMDNS, want mdns) map[string]any {
+	predefined, custom := []map[string]any{}, []map[string]any{}
 	if want.Mode == "custom" {
-		predefined := []map[string]any{}
 		for _, code := range sortedCopy(want.Services) {
 			predefined = append(predefined, map[string]any{"code": code})
 		}
-		custom := []map[string]any{}
-		for _, name := range sortedCopy(want.CustomServices) {
-			custom = append(custom, customServiceEntry(name))
+		for _, cs := range sortedServices(want.CustomServices) {
+			custom = append(custom, map[string]any{"address": cs.Address, "name": cs.Name})
 		}
-		body["predefined_services"], body["custom_services"] = predefined, custom
 	}
-	if want.Networks == nil {
-		body["enabled_for"], body["enabled_for_network_ids"] = "all", []string{}
-	} else {
-		body["enabled_for"], body["enabled_for_network_ids"] = legacyMDNSEnabledForCustom, networkIDs
+	networkIDs := got.EnabledForNetworkIDs
+	if networkIDs == nil {
+		networkIDs = []string{}
 	}
-	return body
+	return map[string]any{
+		"mode":                    want.Mode,
+		"predefined_services":     predefined,
+		"custom_services":         custom,
+		"enabled_for":             got.EnabledFor,
+		"enabled_for_network_ids": networkIDs,
+	}
 }
 
 // mdnsChanges describes how have differs from want, for the plan line. The
-// service lists are compared only when want is custom: in auto they are the
-// console's catalogue, and off ignores them.
+// service lists are compared only when want is custom: in all they are
+// informational.
 func mdnsChanges(have, want mdns) []string {
 	var out []string
 	if have.Mode != want.Mode {
@@ -687,12 +600,9 @@ func mdnsChanges(have, want mdns) []string {
 		if d := setChanges(have.Services, want.Services); d != "" {
 			out = append(out, "services "+d)
 		}
-		if d := setChanges(have.CustomServices, want.CustomServices); d != "" {
+		if d := setChanges(serviceLabels(have.CustomServices), serviceLabels(want.CustomServices)); d != "" {
 			out = append(out, "customServices "+d)
 		}
-	}
-	if (have.Networks == nil) != (want.Networks == nil) || setChanges(have.Networks, want.Networks) != "" {
-		out = append(out, fmt.Sprintf("networks %s -> %s", mdnsNetworks(have.Networks), mdnsNetworks(want.Networks)))
 	}
 	return out
 }
@@ -713,11 +623,25 @@ func setChanges(have, want []string) string {
 	return strings.Join(out, " ")
 }
 
-func mdnsNetworks(names []string) string {
-	if names == nil {
-		return "all"
+// label is how a custom service appears in the plan, and its identity:
+// "HomeKit (_hap._tcp)".
+func (cs customService) label() string { return cs.Name + " (" + cs.Address + ")" }
+
+func serviceLabels(list []customService) []string {
+	var out []string
+	for _, cs := range list {
+		out = append(out, cs.label())
 	}
-	return strings.Join(names, ", ")
+	return out
+}
+
+// sortedServices is a copy of list ordered by address, then name.
+func sortedServices(list []customService) []customService {
+	out := slices.Clone(list)
+	slices.SortFunc(out, func(a, b customService) int {
+		return strings.Compare(a.Address+"\x00"+a.Name, b.Address+"\x00"+b.Name)
+	})
+	return out
 }
 
 // summary is the OK line's detail: the lists, as the instance file orders them.
@@ -727,10 +651,7 @@ func (m mdns) summary() string {
 		out = append(out, "services "+strings.Join(m.Services, ", "))
 	}
 	if len(m.CustomServices) > 0 {
-		out = append(out, "customServices "+strings.Join(m.CustomServices, ", "))
-	}
-	if m.Networks != nil {
-		out = append(out, "networks "+strings.Join(m.Networks, ", "))
+		out = append(out, "customServices "+strings.Join(serviceLabels(m.CustomServices), ", "))
 	}
 	return strings.Join(out, "; ")
 }
