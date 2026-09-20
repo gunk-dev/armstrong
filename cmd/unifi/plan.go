@@ -572,14 +572,14 @@ type managedPolicy struct {
 	system  bool
 }
 
-// errNoPolicyID explains the firmware limitation that makes a write
-// impossible: UniFi Network 10.6 omits `id` from USER_DEFINED firewall
-// policies, so there is no URL to address them at.
+// errNoPolicyID explains the limitation that makes a write impossible: the
+// console returns some firewall policies without an `id`, so there is no URL
+// to address them at.
 func errNoPolicyID(key, verb string) error {
 	return fmt.Errorf("cannot %s firewall policy %q: the console returned it without an id, which "+
-		"UniFi Network 10.6 does for every USER_DEFINED policy, so there is no endpoint to "+
-		"address it at. Change it in the console UI, or delete and re-create it so that "+
-		"cmd/unifi owns it — see docs/unifi-api-notes.md", verb, key)
+		"happens for policies that predate the zone-based firewall migration, so there is no "+
+		"endpoint to address it at. Change it in the console UI, or delete and re-create it so "+
+		"that cmd/unifi owns it — see docs/unifi-api-notes.md", verb, key)
 }
 
 func errAmbiguousPolicy(key string) error {

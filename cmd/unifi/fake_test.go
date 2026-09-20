@@ -36,12 +36,12 @@ type fakeConsole struct {
 	// body back, the way a validating API does — so the response contains the
 	// passphrase that was just sent.
 	wifiPutFault bool
-	// omitUserPolicyIDs reproduces what UniFi Network 10.6.101 actually does:
-	// it returns every USER_DEFINED firewall policy without an `id`, leaving
-	// nothing to PUT or DELETE against. The fake does not do this by default —
-	// the documented contract is that ids are returned, and the rest of the
-	// policy write path would be untestable otherwise — so the tests that care
-	// switch it on explicitly.
+	// omitUserPolicyIDs reproduces a console holding policies that predate the
+	// zone-based firewall migration: those come back without an `id`, leaving
+	// nothing to PUT or DELETE against. Policies created through the API do
+	// carry ids, so the fake does not do this by default — the rest of the
+	// policy write path would be untestable otherwise — and the tests that
+	// care switch it on explicitly.
 	omitUserPolicyIDs bool
 	// onMutation, when set, runs as each non-GET request arrives and before
 	// it is applied — so a test can inspect the world as of the first write.

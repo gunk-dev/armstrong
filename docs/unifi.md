@@ -191,13 +191,13 @@ where it is; `SYSTEM_DEFINED` policies are never reordered.
 
 ### Two limits of UniFi Network 10.6
 
-**`USER_DEFINED` policies come back without an `id`.** The API returns one for
-every system-defined policy and none for any user-created one, so there is no
-URL to `PUT`, `PATCH` or `DELETE` against. `unifi` can create policies and can
-update the system-defined ones; a plan that needs to change, delete or reorder
-a user-created policy fails with a message saying so rather than issuing a
-write it cannot target. Delete and re-create such a policy through `unifi` to
-take ownership of it, or change it in the console UI.
+**Policies that predate the zone-based firewall migration come back without an
+`id`.** The API returns no id for them, so there is no URL to `PUT`, `PATCH`
+or `DELETE` against. Policies created through the API — including by `unifi`
+itself — do carry ids and are fully manageable. A plan that needs to change,
+delete or reorder an id-less policy fails with a message saying so rather than
+issuing a write it cannot target. Delete and re-create such a policy through
+`unifi` to take ownership of it, or change it in the console UI.
 
 **The `External` zone cannot be declared.** Its members are WAN interfaces,
 which `GET /networks` does not return, so their ids cannot be turned back into
