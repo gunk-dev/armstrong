@@ -191,7 +191,7 @@ func TestZonedNetworkNeedsExactlyOneZone(t *testing.T) {
 	for name, tc := range map[string]struct{ from, to, err string }{
 		"no zone": {
 			`{"name":"Things","networks":["IoT"]}`, `{"name":"Things","networks":[]}`,
-			`network "IoT": network-needs-zone: in no declared firewall zone`,
+			`network "IoT" is in no declared firewall zone`,
 		},
 		"two zones": {
 			`{"name":"Things","networks":["IoT"]}`, `{"name":"Things","networks":["IoT","Guest"]}`,

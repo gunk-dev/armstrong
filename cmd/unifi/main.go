@@ -87,7 +87,6 @@ func newLintCmd() *cobra.Command {
 			"diff, sync and restore run the same checks before their first request.\n\n" +
 			"Rules:\n" +
 			"  network-in-one-zone    a network is declared in at most one firewall zone\n" +
-			"  network-needs-zone     with firewallZones declared, every network is in one of them\n" +
 			"  tcp-udp-not-negated    protocol TCP_UDP takes no protocolMatchOpposite\n" +
 			"  icmp-ip-version        ICMP only with ipVersion IPV4, ICMPV6 only with IPV6\n" +
 			"  return-traffic-states  no allowReturnTraffic when connectionStates is exactly\n" +

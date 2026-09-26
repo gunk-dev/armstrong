@@ -49,7 +49,7 @@ cue export ./unifi --out json -e site | unifi lint
 ```
 
 `lint` checks a `#Site` document against every validation rule a live console
-is known to enforce on writes: a network in exactly one declared zone, no
+is known to enforce on writes: a network in at most one declared zone, no
 negated `TCP_UDP`, `ICMP`/`ICMPV6` only with their own `ipVersion`, no
 `allowReturnTraffic` on a policy matching only `ESTABLISHED` and `RELATED` or on
 one to or from the `Gateway` or `External` zone, and IP address filter values of

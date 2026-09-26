@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -321,8 +322,8 @@ type zoneRef struct{ name, id string }
 // are created without a zone.
 //
 // It also refuses, before anything is written, a network still to be created
-// in no declared zone. lintZones checks that offline only when the instance
-// file declares zones; this needs the console to know the network is new.
+// in no declared zone: that needs the console to know the network is new.
+// lintZones has already refused a network declared in two zones.
 func (r *reconciler) createZones(liveNets map[string]actual[network]) (map[string]zoneRef, error) {
 	r.createdZones = map[string]string{}
 	r.placed = map[string]bool{}
@@ -334,7 +335,6 @@ func (r *reconciler) createZones(liveNets map[string]actual[network]) (map[strin
 		return nil, nil
 	}
 
-	// lintZones has already refused a network declared in two zones.
 	zoneOf := map[string]string{} // network name -> declared zone
 	for _, z := range r.want.FirewallZones {
 		for _, n := range z.Networks {
@@ -668,6 +668,11 @@ func (r *reconciler) syncFirewallPolicies() error {
 		}
 		got, ok := byKey[want.key()]
 		if !ok {
+			// lint skips these rules for the console's own policy names; a
+			// policy about to be created is not the console's own.
+			if errs := returnTrafficViolations(want); len(errs) > 0 {
+				return errors.Join(errs...)
+			}
 			r.logf("CREATE", "firewall policy", want.key(), "%s", want.Action)
 			var created apiFirewallPolicy
 			if err := r.mutate(http.MethodPost, base, body, &created); err != nil {

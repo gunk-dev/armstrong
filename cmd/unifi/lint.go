@@ -51,12 +51,11 @@ func lintError(want site) error {
 		len(errs), errors.Join(errs...))
 }
 
-// lintZones: the console places each network in exactly one zone, and on a
-// zone-based-firewall console creates a network only into one (POST /networks
-// without a zoneId answers api.network.validation.missing-zone-id). So a
-// network is declared in at most one zone, and, once the document declares
-// any zone, in exactly one. Whether the console has the zone-based firewall at
-// all is checked in the planning pass, which needs the console.
+// lintZones: the console places each network in exactly one zone, so a
+// network is declared in at most one. That a network still to be created is
+// in one (POST /networks without a zoneId answers
+// api.network.validation.missing-zone-id) needs the console to know which
+// networks exist, so createZones checks it in the planning pass.
 func lintZones(want site) []error {
 	var errs []error
 	zoneOf := map[string]string{}
@@ -72,19 +71,6 @@ func lintZones(want site) []error {
 				continue
 			}
 			zoneOf[n] = z.Name
-		}
-	}
-	if len(want.FirewallZones) == 0 {
-		return errs
-	}
-	for _, n := range want.Networks {
-		if zoneOf[n.Name] == "" {
-			errs = append(errs, lintViolation{
-				object: fmt.Sprintf("network %q", n.Name),
-				rule:   "network-needs-zone",
-				detail: "in no declared firewall zone; the console creates a network only into a zone, so list it in exactly one firewallZones entry's networks",
-				code:   codeMissingZoneID,
-			})
 		}
 	}
 	return errs
@@ -138,19 +124,8 @@ func lintPolicy(p firewallPolicy) []error {
 			p.Protocol, want, p.IPVersion)
 	}
 
-	if p.Action == "ALLOW" && p.AllowReturnTraffic && !consoleOwnedPolicy(p) {
-		if onlyReturnStates(p.ConnectionStates) {
-			fail("return-traffic-states", codeCantAllowReturnTraffic,
-				"allowReturnTraffic on a policy matching only ESTABLISHED and RELATED connections, "+
-					"which are the return traffic itself; set allowReturnTraffic: false")
-		}
-		for _, z := range []string{p.SourceZone, p.DestinationZone} {
-			if returnTrafficZones[z] {
-				fail("return-traffic-zone", codeCantAllowReturnTraffic,
-					"allowReturnTraffic on a policy to or from the built-in %s zone; set allowReturnTraffic: false", z)
-				break
-			}
-		}
+	if !consoleOwnedPolicy(p) {
+		errs = append(errs, returnTrafficViolations(p)...)
 	}
 
 	for _, end := range []struct {
@@ -165,6 +140,31 @@ func lintPolicy(p firewallPolicy) []error {
 				fail("ip-address-version", codeInvalidIPAddresses,
 					"%s address %s does not match ipVersion %s", end.name, it.Value, p.IPVersion)
 			}
+		}
+	}
+	return errs
+}
+
+// returnTrafficViolations applies the two rules on where an ALLOW may allow
+// return traffic. lintPolicy skips the console's own policies; the planning
+// pass applies them to every policy it is about to create, since a name alone
+// does not make a new policy the console's own.
+func returnTrafficViolations(p firewallPolicy) []error {
+	if p.Action != "ALLOW" || !p.AllowReturnTraffic {
+		return nil
+	}
+	var errs []error
+	object := fmt.Sprintf("firewall policy %q", p.key())
+	if onlyReturnStates(p.ConnectionStates) {
+		errs = append(errs, lintViolation{object: object, rule: "return-traffic-states", code: codeCantAllowReturnTraffic,
+			detail: "allowReturnTraffic on a policy matching only ESTABLISHED and RELATED connections, " +
+				"which are the return traffic itself; set allowReturnTraffic: false"})
+	}
+	for _, z := range []string{p.SourceZone, p.DestinationZone} {
+		if returnTrafficZones[z] {
+			errs = append(errs, lintViolation{object: object, rule: "return-traffic-zone", code: codeCantAllowReturnTraffic,
+				detail: fmt.Sprintf("allowReturnTraffic on a policy to or from the built-in %s zone; set allowReturnTraffic: false", z)})
+			break
 		}
 	}
 	return errs

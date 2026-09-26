@@ -22,10 +22,6 @@ var lintCases = []struct {
 		  "firewallZones":[{"name":"a","networks":["Guest"]},{"name":"b","networks":["Guest"]}]}`,
 	},
 	{
-		rule: "network-needs-zone",
-		site: `{"networks":[{"name":"Guest","vlanId":20}],"firewallZones":[{"name":"a","networks":[]}]}`,
-	},
-	{
 		rule: "tcp-udp-not-negated",
 		site: `{"firewallPolicies":[{"name":"p","action":"BLOCK","sourceZone":"iot","destinationZone":"internal",
 		  "ipVersion":"IPV4_AND_IPV6","protocol":"TCP_UDP","protocolMatchOpposite":true}]}`,
@@ -120,6 +116,26 @@ func TestLintAcceptsWhatTheConsoleAccepts(t *testing.T) {
 	f := newFakeConsole(t)
 	if out, stderr, code := run(t, f, accepted, nil, "lint"); code != 0 {
 		t.Errorf("lint exited %d:\n%s%s", code, out, stderr)
+	}
+}
+
+// TestCreatingAConsolePolicyNameIsChecked: lint lets the console's own policy
+// names hold return traffic, but a policy of that name the console lacks is a
+// create, and the console refuses it; sync refuses it before any write.
+func TestCreatingAConsolePolicyNameIsChecked(t *testing.T) {
+	f := newFakeConsole(t)
+	seedSite(f)
+	seedFirewall(f)
+	const declared = `{"firewallPolicies":[{"name":"Allow Return Traffic","enabled":true,"action":"ALLOW",
+	  "allowReturnTraffic":true,"sourceZone":"iot","destinationZone":"internal","ipVersion":"IPV4_AND_IPV6",
+	  "connectionStates":["ESTABLISHED","RELATED"]}]}`
+	mustRun(t, f, declared, nil, "lint")
+	_, stderr, code := run(t, f, declared, nil, "sync")
+	if code != 1 || !strings.Contains(stderr, ": return-traffic-states: ") {
+		t.Errorf("sync exited %d, want 1 naming return-traffic-states:\n%s", code, stderr)
+	}
+	if m := f.recorded(); len(m) != 0 {
+		t.Errorf("sync wrote before refusing: %v", m)
 	}
 }
 
