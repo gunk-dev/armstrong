@@ -109,6 +109,16 @@ func (r *reconciler) run() error {
 		fmt.Fprintln(r.out, "DRY RUN — no changes will be made")
 	}
 	r.candidates = map[string]bool{}
+	// A policy the console would refuse must fail the run before any step
+	// writes, not halfway through it.
+	for _, p := range r.want.FirewallPolicies {
+		if p.Protocol == "" {
+			continue
+		}
+		if _, err := protocolFilter(p.Protocol, p.ProtocolMatchOpposite); err != nil {
+			return fmt.Errorf("firewall policy %q: %w", p.key(), err)
+		}
+	}
 	for _, step := range []func() error{
 		// The mDNS service scope first, so that it is in force before a
 		// network in the same run starts to participate, and a failed write

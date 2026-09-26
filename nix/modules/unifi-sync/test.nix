@@ -9,10 +9,11 @@
 #     is asserted against what actually crossed the socket rather than against
 #     the tool's own account of itself.
 #
-# It then runs one real `unifi sync` against the fake, which enforces the
-# console's rule that a network is created into a firewall zone: a new
-# network in a new zone has to arrive as the zone's POST, then the network's
-# POST carrying that zone's id.
+# It then runs real `unifi sync`s against the fake, which enforces two of the
+# console's rules: a network is created into a firewall zone, so a new network
+# in a new zone has to arrive as the zone's POST, then the network's POST
+# carrying that zone's id; and a TCP_UDP firewall policy is sent as a PRESET
+# protocol filter, never a NAMED_PROTOCOL one.
 #
 # Everything real is real: the module's own systemd unit, the `unifi` package
 # this flake builds, `cue` resolving the schema out of the module the
@@ -81,6 +82,53 @@ let
           networks = [ "Lab" ];
         }
       ];
+    }
+  );
+  # A TCP_UDP policy, which the console takes only as a PRESET filter, beside
+  # a UDP one, which it takes as a NAMED_PROTOCOL. Sections it omits are left
+  # alone.
+  policySite = pkgs.writeText "policy-site.json" (
+    builtins.toJSON {
+      firewallPolicies =
+        map
+          (
+            p:
+            {
+              enabled = true;
+              action = "ALLOW";
+              allowReturnTraffic = true;
+              sourceZone = "Internal";
+              destinationZone = "Gateway";
+              ipVersion = "IPV4_AND_IPV6";
+            }
+            // p
+          )
+          [
+            {
+              name = "DNS";
+              protocol = "TCP_UDP";
+            }
+            {
+              name = "NTP";
+              protocol = "UDP";
+            }
+          ];
+    }
+  );
+  namedTcpUdpPolicy = pkgs.writeText "named-tcp-udp-policy.json" (
+    builtins.toJSON {
+      name = "refused";
+      action.type = "BLOCK";
+      source.zoneId = "zone-001";
+      destination.zoneId = "zone-002";
+      ipProtocolScope = {
+        ipVersion = "IPV4_AND_IPV6";
+        protocolFilter = {
+          type = "NAMED_PROTOCOL";
+          protocol.name = "TCP_UDP";
+          matchOpposite = false;
+        };
+      };
     }
   );
   zonelessNetwork = pkgs.writeText "zoneless-network.json" (
@@ -246,5 +294,31 @@ pkgs.testers.runNixOSTest {
 
       # And the result is converged: a second diff has nothing to do.
       machine.succeed(f"{env} ${unifi} diff < ${labSite}")
+
+      # ------------------------------------------------------ protocol filter
+      # The fake refuses TCP_UDP spelt as a NAMED_PROTOCOL, with the code a
+      # live console answers.
+      refused = machine.succeed(
+          "${pkgs.curl}/bin/curl -s -X POST -H 'Content-Type: application/json' "
+          "--data-binary @${namedTcpUdpPolicy} "
+          "http://127.0.0.1:8088/proxy/network/integration/v1/sites/site-0001/firewall/policies"
+      )
+      assert "api.request.unknown-type-id" in refused, refused
+
+      # A real sync sends TCP_UDP as the PRESET the console accepts, and reads
+      # it back as TCP_UDP: the second diff is clean.
+      machine.succeed("truncate -s 0 /var/lib/fake-console/requests.log")
+      out = machine.succeed(f"{env} ${unifi} sync < ${policySite}")
+      assert "CREATE firewall policy Internal -> Gateway / DNS" in out, out
+      assert "CREATE firewall policy Internal -> Gateway / NTP" in out, out
+      assert writes() == [
+          "POST /proxy/network/integration/v1/sites/site-0001/firewall/policies",
+          "POST /proxy/network/integration/v1/sites/site-0001/firewall/policies",
+      ], writes()
+      st = json.loads(machine.succeed("cat /var/lib/fake-console/state.json"))
+      filters = {p["name"]: p["ipProtocolScope"]["protocolFilter"] for p in st["policies"]}
+      assert filters["DNS"] == {"type": "PRESET", "preset": {"name": "TCP_UDP"}}, filters
+      assert filters["NTP"]["type"] == "NAMED_PROTOCOL", filters
+      machine.succeed(f"{env} ${unifi} diff < ${policySite}")
     '';
 }

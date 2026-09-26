@@ -182,10 +182,19 @@ package schema
 
 	ipVersion: "IPV4" | "IPV6" | "IPV4_AND_IPV6" | *"IPV4_AND_IPV6"
 
-	// IP protocol as the API spells it, upper-case: "TCP", "UDP", "TCP_UDP",
-	// "ICMP", "ICMPV6", "GRE", "ESP", … Omit to match every protocol.
+	// IP protocol as the API spells it, upper-case. Verified against a live
+	// console: "TCP", "UDP", "TCP_UDP" (sent as a PRESET filter), "ICMP",
+	// "ICMPV6". Omit to match every protocol.
 	protocol?:             string & !=""
 	protocolMatchOpposite: bool | *false
+
+	// The console refuses matchOpposite on a PRESET filter (400
+	// api.request.unknown-property), so TCP_UDP cannot be negated: declare one
+	// policy per other protocol (e.g. ICMP, ICMPV6) instead. The field name is
+	// the message `cue vet` prints. See docs/unifi-api-notes.md.
+	if protocol != _|_ if protocol == "TCP_UDP" {
+		_TCP_UDP_is_a_PRESET_filter_which_the_console_refuses_to_negate: protocolMatchOpposite & false
+	}
 
 	connectionStates?: [...("NEW" | "INVALID" | "ESTABLISHED" | "RELATED")]
 	loggingEnabled: bool | *false

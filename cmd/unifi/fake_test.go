@@ -360,6 +360,12 @@ func (f *fakeConsole) handleCollection(w http.ResponseWriter, r *http.Request, r
 				body["ttlSeconds"] = float64(0)
 			}
 		}
+		if coll == collPolicies {
+			if code, msg := protocolFilterFault(body); code != "" {
+				f.fail(w, http.StatusBadRequest, code, msg)
+				return
+			}
+		}
 		zoneID, _ := body["zoneId"].(string)
 		if coll == collNetworks && f.zbfConfigured && f.coll[collZones].byID[zoneID] == nil {
 			f.fail(w, http.StatusBadRequest, codeMissingZoneID, "zoneId must not be null")
@@ -391,6 +397,12 @@ func (f *fakeConsole) handleCollection(w http.ResponseWriter, r *http.Request, r
 			f.fail(w, http.StatusBadRequest, "api.invalid-payload", err.Error())
 			return
 		}
+		if coll == collPolicies {
+			if code, msg := protocolFilterFault(body); code != "" {
+				f.fail(w, http.StatusBadRequest, code, msg)
+				return
+			}
+		}
 		// A PUT replaces the writable fields; id and metadata stay server-owned.
 		updated := map[string]any{"id": obj["id"], "metadata": obj["metadata"]}
 		for k, v := range body {
@@ -419,6 +431,32 @@ func (f *fakeConsole) handleCollection(w http.ResponseWriter, r *http.Request, r
 		w.Header().Set("Allow", "GET, POST")
 		f.fail(w, http.StatusMethodNotAllowed, "api.method-not-allowed", r.Method)
 	}
+}
+
+// protocolFilterFault applies a live console's rules for a policy's
+// ipProtocolScope.protocolFilter, answering with the code and message it
+// sends: TCP_UDP exists only as a PRESET, never as a NAMED_PROTOCOL, and a
+// PRESET filter takes no matchOpposite. It returns "" for a body it accepts.
+func protocolFilterFault(body map[string]any) (code, message string) {
+	scope, _ := body["ipProtocolScope"].(map[string]any)
+	filter, _ := scope["protocolFilter"].(map[string]any)
+	if filter == nil {
+		return "", ""
+	}
+	switch filter["type"] {
+	case "NAMED_PROTOCOL":
+		proto, _ := filter["protocol"].(map[string]any)
+		if name, _ := proto["name"].(string); name == "TCP_UDP" {
+			return "api.request.unknown-type-id",
+				"Invalid $.ipProtocolScope.protocolFilter.type value 'TCP_UDP' (valid values: '')"
+		}
+	case "PRESET":
+		if _, ok := filter["matchOpposite"]; ok {
+			return "api.request.unknown-property",
+				"Unknown request body property '$.ipProtocolScope.protocolFilter.matchOpposite'"
+		}
+	}
+	return "", ""
 }
 
 // joinZoneLocked makes network netID a member of zone zoneID, and of no other

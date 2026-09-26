@@ -434,6 +434,9 @@ type apiFirewallPolicy struct {
 			Protocol struct {
 				Name string `json:"name"`
 			} `json:"protocol"`
+			Preset struct {
+				Name string `json:"name"`
+			} `json:"preset"`
 			MatchOpposite bool `json:"matchOpposite"`
 		} `json:"protocolFilter,omitempty"`
 	} `json:"ipProtocolScope"`
@@ -493,7 +496,36 @@ const (
 	filterTypeIPAddresses = "IP_ADDRESSES"
 	filterTypePorts       = "PORTS"
 	filterTypeNamedProto  = "NAMED_PROTOCOL"
+	filterTypePreset      = "PRESET"
 )
+
+// protocolPresets are the protocol names the console spells as a PRESET filter
+// rather than a NAMED_PROTOCOL one. TCP_UDP is the only preset seen on a live
+// console; as a NAMED_PROTOCOL it answers 400 api.request.unknown-type-id.
+var protocolPresets = map[string]bool{"TCP_UDP": true}
+
+// protocolFilter renders the ipProtocolScope.protocolFilter for a declared
+// protocol. The console rejects matchOpposite on a PRESET filter (400
+// api.request.unknown-property), so a negated preset is refused here rather
+// than sent; schema/unifi.cue refuses it too.
+func protocolFilter(protocol string, matchOpposite bool) (map[string]any, error) {
+	if !protocolPresets[protocol] {
+		return map[string]any{
+			"type":          filterTypeNamedProto,
+			"protocol":      map[string]any{"name": protocol},
+			"matchOpposite": matchOpposite,
+		}, nil
+	}
+	if matchOpposite {
+		return nil, fmt.Errorf("protocol %q with protocolMatchOpposite: the console expresses %s as a "+
+			"PRESET filter, which cannot be negated; declare one policy per other protocol "+
+			"(e.g. ICMP, ICMPV6) instead — see docs/unifi-api-notes.md", protocol, protocol)
+	}
+	return map[string]any{
+		"type":   filterTypePreset,
+		"preset": map[string]any{"name": protocol},
+	}, nil
+}
 
 // firewallPolicies lists the zone-based firewall policies. As with zones, the
 // bool distinguishes "feature not configured" from a genuine failure.
@@ -549,6 +581,9 @@ func (p apiFirewallPolicy) spec(zones, nets nameLookup) firewallPolicy {
 	}
 	if f := p.IPProtocolScope.ProtocolFilter; f != nil {
 		out.Protocol = f.Protocol.Name
+		if f.Type == filterTypePreset {
+			out.Protocol = f.Preset.Name
+		}
 		out.ProtocolMatchOpposite = f.MatchOpposite
 	}
 	if s := p.Schedule; s != nil {
@@ -639,11 +674,11 @@ func (p firewallPolicy) body(resolveZone, resolveNetwork func(string) (string, e
 
 	scope := map[string]any{"ipVersion": p.IPVersion}
 	if p.Protocol != "" {
-		scope["protocolFilter"] = map[string]any{
-			"type":          filterTypeNamedProto,
-			"protocol":      map[string]any{"name": p.Protocol},
-			"matchOpposite": p.ProtocolMatchOpposite,
+		filter, err := protocolFilter(p.Protocol, p.ProtocolMatchOpposite)
+		if err != nil {
+			return nil, err
 		}
+		scope["protocolFilter"] = filter
 	}
 
 	source, err := policyEndpoint(srcZone, p.Source, resolveNetwork)
