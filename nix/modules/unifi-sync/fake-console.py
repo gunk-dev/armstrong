@@ -19,7 +19,9 @@ policies, with the console's rules for them: while it has zones, `POST
 `api.network.validation.missing-zone-id`, and a created network joins that
 zone's `networkIds`. A policy's protocol filter spells TCP_UDP only as a PRESET:
 as a NAMED_PROTOCOL it answers 400 `api.request.unknown-type-id`, and a PRESET
-carrying `matchOpposite` answers 400 `api.request.unknown-property`. Every other
+carrying `matchOpposite` answers 400 `api.request.unknown-property`. Like the
+console, it does not keep the order of a policy's set-valued lists: it stores
+them reversed (see reorder_sets). Every other
 write is answered 405 rather than being quietly accepted, so a tool that tried
 one would fail loudly instead of looking like it had nothing to do.
 """
@@ -72,6 +74,30 @@ def protocol_filter_fault(body):
             "Unknown request body property '$.ipProtocolScope.protocolFilter.matchOpposite'",
         )
     return None
+
+
+def reorder_sets(policy):
+    """Store a policy's set-valued lists out of the order they were sent in,
+    as a live console does (it reads ["53", "853"] back as [853, 53]), so an
+    order-sensitive comparison shows up as a perpetual UPDATE."""
+
+    def flip(obj, *path):
+        for key in path[:-1]:
+            obj = obj.get(key) if isinstance(obj, dict) else None
+        if isinstance(obj, dict) and isinstance(obj.get(path[-1]), list):
+            obj[path[-1]] = obj[path[-1]][::-1]
+
+    for end in ("source", "destination"):
+        for path in (
+            ("networkFilter", "networkIds"),
+            ("ipAddressFilter", "items"),
+            ("portFilter", "items"),
+            ("macAddressFilter", "macAddresses"),
+            ("applicationFilter", "applicationIds"),
+        ):
+            flip(policy, end, "trafficFilter", *path)
+    flip(policy, "connectionStateFilter")
+    flip(policy, "schedule", "repeatOnDays")
 
 
 def join_zone(st, zone_id, network_id):
@@ -215,6 +241,7 @@ class Handler(BaseHTTPRequestHandler):
             if fault:
                 return self.fail(*fault)
             obj = dict(body, id=next_id(st, "policies"), index=len(st["policies"]))
+            reorder_sets(obj)
             obj["metadata"] = {"origin": "USER_DEFINED", "configurable": True}
             st["policies"].append(obj)
         else:
