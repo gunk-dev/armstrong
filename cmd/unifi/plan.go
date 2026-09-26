@@ -109,16 +109,6 @@ func (r *reconciler) run() error {
 		fmt.Fprintln(r.out, "DRY RUN — no changes will be made")
 	}
 	r.candidates = map[string]bool{}
-	// A policy the console would refuse must fail the run before any step
-	// writes, not halfway through it.
-	for _, p := range r.want.FirewallPolicies {
-		if p.Protocol == "" {
-			continue
-		}
-		if _, err := protocolFilter(p.Protocol, p.ProtocolMatchOpposite); err != nil {
-			return fmt.Errorf("firewall policy %q: %w", p.key(), err)
-		}
-	}
 	for _, step := range []func() error{
 		// The mDNS service scope first, so that it is in force before a
 		// network in the same run starts to participate, and a failed write
@@ -330,9 +320,9 @@ type zoneRef struct{ name, id string }
 // name, or nil when the zone-based firewall is not configured and networks
 // are created without a zone.
 //
-// It also checks the instance file before anything is written: a network is
-// declared in at most one zone, and a network still to be created in exactly
-// one, since the console places each network in a single zone.
+// It also refuses, before anything is written, a network still to be created
+// in no declared zone. lintZones checks that offline only when the instance
+// file declares zones; this needs the console to know the network is new.
 func (r *reconciler) createZones(liveNets map[string]actual[network]) (map[string]zoneRef, error) {
 	r.createdZones = map[string]string{}
 	r.placed = map[string]bool{}
@@ -344,13 +334,10 @@ func (r *reconciler) createZones(liveNets map[string]actual[network]) (map[strin
 		return nil, nil
 	}
 
+	// lintZones has already refused a network declared in two zones.
 	zoneOf := map[string]string{} // network name -> declared zone
 	for _, z := range r.want.FirewallZones {
 		for _, n := range z.Networks {
-			if other, ok := zoneOf[n]; ok && other != z.Name {
-				return nil, fmt.Errorf("network %q is declared in firewall zones %q and %q; "+
-					"the console places each network in exactly one zone", n, other, z.Name)
-			}
 			zoneOf[n] = z.Name
 		}
 	}

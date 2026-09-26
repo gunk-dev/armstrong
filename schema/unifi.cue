@@ -1,5 +1,10 @@
 package schema
 
+import (
+	"list"
+	"strings"
+)
+
 // UniFi Network Integration API config-as-code.
 //
 // These definitions model the official UniFi Network Integration API
@@ -169,7 +174,10 @@ package schema
 
 	action: "ALLOW" | "BLOCK" | "REJECT"
 	// Only meaningful for "ALLOW": permit the reply traffic of a matched flow.
-	allowReturnTraffic: bool | *true
+	// Defaults to true only where the console accepts it: an ALLOW whose
+	// connectionStates are not exactly ESTABLISHED and RELATED, and whose
+	// zones are neither Gateway nor External. See the rules below.
+	allowReturnTraffic: bool | *_returnTrafficAccepted
 
 	// Names of #FirewallZone entries. Zones the instance file does not declare
 	// may still be referenced: they are resolved against the live console.
@@ -199,6 +207,52 @@ package schema
 	connectionStates?: [...("NEW" | "INVALID" | "ESTABLISHED" | "RELATED")]
 	loggingEnabled: bool | *false
 
+	// Console validation rules. cmd/unifi/lint.go is the source of truth and
+	// `unifi lint` checks all of them; these catch the ones CUE can express at
+	// `cue vet` time. Each hidden field's name is the message `cue vet` prints.
+	// See docs/unifi-api-notes.md for the request behind each.
+
+	// ICMP is accepted only with ipVersion IPV4, ICMPV6 only with IPV6 (400
+	// api.request.unknown-type-id).
+	if protocol != _|_ if protocol == "ICMP" && ipVersion != "IPV4" {
+		_ICMP_is_accepted_only_with_ipVersion_IPV4: true & false
+	}
+	if protocol != _|_ if protocol == "ICMPV6" && ipVersion != "IPV6" {
+		_ICMPV6_is_accepted_only_with_ipVersion_IPV6: true & false
+	}
+
+	// Return traffic cannot be allowed (400
+	// api.firewall.policy.validation.cant-allow-return-traffic) on a policy
+	// that matches only ESTABLISHED and RELATED connections, or on one to or
+	// from the built-in Gateway or External zone. The console's own policies
+	// hold it anyway, so the rules skip their names, as `unifi lint` does.
+	_returnOnlyStates: *false | bool
+	if connectionStates != _|_ if len(connectionStates) == 2 && list.Contains(connectionStates, "ESTABLISHED") && list.Contains(connectionStates, "RELATED") {
+		_returnOnlyStates: true
+	}
+	_builtinZone: list.Contains(["Gateway", "External"], sourceZone) || list.Contains(["Gateway", "External"], destinationZone)
+	_returnTrafficAccepted: action == "ALLOW" && !_returnOnlyStates && !_builtinZone
+	_consoleOwned: list.Contains(_consolePolicyNames, name) || strings.HasSuffix(name, " (Return)")
+	if action == "ALLOW" && allowReturnTraffic && !_consoleOwned && _returnOnlyStates {
+		_return_traffic_cannot_be_allowed_when_connectionStates_are_only_ESTABLISHED_and_RELATED: true & false
+	}
+	if action == "ALLOW" && allowReturnTraffic && !_consoleOwned && _builtinZone {
+		_return_traffic_cannot_be_allowed_to_or_from_the_Gateway_or_External_zone: true & false
+	}
+
+	// IP address filter values belong to the family an IPV4 or IPV6 policy
+	// matches (400 api.firewall.policy.validation.invalid-ip-addresses).
+	_ipValues: [
+		if source != _|_ if source.ipAddressFilter != _|_ for i in source.ipAddressFilter.items {i.value},
+		if destination != _|_ if destination.ipAddressFilter != _|_ for i in destination.ipAddressFilter.items {i.value},
+	]
+	if ipVersion == "IPV4" {
+		_IP_address_filter_values_must_be_IPv4_addresses_for_ipVersion_IPV4: [for v in _ipValues {v & !~":"}]
+	}
+	if ipVersion == "IPV6" {
+		_IP_address_filter_values_must_be_IPv6_addresses_for_ipVersion_IPV6: [for v in _ipValues {v & =~":"}]
+	}
+
 	// When the policy is in force. Omit for "always".
 	schedule?: #FirewallSchedule
 
@@ -208,6 +262,20 @@ package schema
 	// SYSTEM_DEFINED policies are never reordered.
 	order?: int
 }
+
+// _consolePolicyNames are the names the console gives its own policies that
+// allow return traffic where a created policy may not; see
+// consolePolicyNames in cmd/unifi/lint.go.
+_consolePolicyNames: [
+	"Allow All Traffic", "Allow Return Traffic",
+	"Allow DHCP", "Allow DHCPv6", "Allow Link-Local DHCPv6",
+	"Allow DNS", "Allow Public DNS", "Allow mDNS",
+	"Allow ICMP", "Allow ICMPv6",
+	"Allow Neighbor Advertisements", "Allow Neighbor Solicitations",
+	"Allow Router Advertisements",
+	"Allow Hotspot Portal", "Allow Hotspot Portal Authentication",
+	"Allow Hotspot Portal Redirects",
+]
 
 // #TrafficFilter narrows one end of a policy. `type` names the filter the
 // console treats as primary; the other filters may be set alongside it (the

@@ -48,7 +48,7 @@ func newRootCmd() *cobra.Command {
 			"named by each SSID's passphraseEnv, and are redacted from all output.",
 		SilenceUsage: true,
 	}
-	root.AddCommand(newExportCmd(), newDiffCmd(), newSyncCmd(), newRestoreCmd())
+	root.AddCommand(newExportCmd(), newLintCmd(), newDiffCmd(), newSyncCmd(), newRestoreCmd())
 	return root
 }
 
@@ -72,6 +72,48 @@ func newExportCmd() *cobra.Command {
 				return err
 			}
 			return exportSite(c, s, cmd.OutOrStdout(), cmd.ErrOrStderr())
+		},
+	}
+}
+
+func newLintCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "lint",
+		Short: "Check a #Site document against the console's validation rules, offline",
+		Long: "Reads a #Site JSON document from stdin and checks it against every validation\n" +
+			"rule a live console is known to enforce on writes, without contacting a console\n" +
+			"and without credentials. Every violation is printed, naming the object, the rule\n" +
+			"and the console error code it prevents; the exit status is 1 if there is any.\n" +
+			"diff, sync and restore run the same checks before their first request.\n\n" +
+			"Rules:\n" +
+			"  network-in-one-zone    a network is declared in at most one firewall zone\n" +
+			"  network-needs-zone     with firewallZones declared, every network is in one of them\n" +
+			"  tcp-udp-not-negated    protocol TCP_UDP takes no protocolMatchOpposite\n" +
+			"  icmp-ip-version        ICMP only with ipVersion IPV4, ICMPV6 only with IPV6\n" +
+			"  return-traffic-states  no allowReturnTraffic when connectionStates is exactly\n" +
+			"                         ESTABLISHED and RELATED\n" +
+			"  return-traffic-zone    no allowReturnTraffic to or from the Gateway or External zone\n" +
+			"  ip-address-version     IP address filter values match an IPV4 or IPV6 ipVersion\n\n" +
+			"The return-traffic rules skip the console's own policies (\"Allow Return Traffic\",\n" +
+			"\"Allow All Traffic\", ...), which hold it by design, so an export passes. See\n" +
+			"docs/unifi-api-notes.md for the request behind each rule.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			want, err := readSite(cmd.InOrStdin())
+			if err != nil {
+				return err
+			}
+			errs := lintSite(want)
+			for _, e := range errs {
+				fmt.Fprintln(cmd.OutOrStdout(), e)
+			}
+			if len(errs) > 0 {
+				cmd.SilenceErrors = true
+				return fmt.Errorf("%d console validation rule violation(s)", len(errs))
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "no violations: %d networks, %d firewall zones, %d firewall policies checked\n",
+				len(want.Networks), len(want.FirewallZones), len(want.FirewallPolicies))
+			return nil
 		},
 	}
 }
@@ -110,7 +152,8 @@ func newSyncCmd() *cobra.Command {
 		Short: "Converge the site to the #Site JSON read from stdin",
 		Long: "Reads a #Site JSON document from stdin (pipe from: cue export ./unifi --out json -e site)\n" +
 			"and converges the UniFi site to match.\n\n" +
-			"The whole plan is worked out before anything is written, and the run is refused —\n" +
+			"The input is first checked offline against the console's validation rules, as by\n" +
+			"`unifi lint`. The whole plan is worked out before anything is written, and the run is refused —\n" +
 			"with the plan printed and nothing changed — when:\n" +
 			"  * --prune would delete an object whose key the input's `deletions` does not list, or\n" +
 			"  * the plan deletes, updates or reorders more than --max-changes objects (every firewall\n" +
@@ -201,13 +244,14 @@ func connect() (*client, siteRef, error) {
 // what makes a refusal fail closed: it happens before the first mutation, so
 // a refused run changes nothing at all.
 func reconcile(in io.Reader, out, errOut io.Writer, opts options) (bool, error) {
-	data, err := io.ReadAll(in)
+	want, err := readSite(in)
 	if err != nil {
-		return false, fmt.Errorf("read input: %w", err)
+		return false, err
 	}
-	var want site
-	if err := json.Unmarshal(data, &want); err != nil {
-		return false, fmt.Errorf("parse input: %w", err)
+	// A document the console would refuse fails here, before the first
+	// request, not halfway through a run.
+	if err := lintError(want); err != nil {
+		return false, err
 	}
 
 	c, s, err := connect()
@@ -260,6 +304,19 @@ func reconcile(in io.Reader, out, errOut io.Writer, opts options) (bool, error) 
 		return r.changed, err
 	}
 	return r.changed, nil
+}
+
+// readSite parses a #Site JSON document.
+func readSite(in io.Reader) (site, error) {
+	var want site
+	data, err := io.ReadAll(in)
+	if err != nil {
+		return want, fmt.Errorf("read input: %w", err)
+	}
+	if err := json.Unmarshal(data, &want); err != nil {
+		return want, fmt.Errorf("parse input: %w", err)
+	}
+	return want, nil
 }
 
 func formatRefusals(reasons []string) string {

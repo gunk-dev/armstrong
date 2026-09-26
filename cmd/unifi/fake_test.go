@@ -73,7 +73,9 @@ type fakeConsole struct {
 	// mutations records every non-GET request, so a test can assert that a
 	// dry run touched nothing.
 	mutations []mutation
-	nextID    int
+	// requests counts every request served, reads included.
+	requests int
+	nextID   int
 }
 
 // fault is a canned error response.
@@ -112,10 +114,6 @@ const (
 	collZones    = "firewall/zones"
 	collPolicies = "firewall/policies"
 )
-
-// codeMissingZoneID is the error a console running the zone-based firewall
-// returns from POST /networks when the body carries no valid zoneId.
-const codeMissingZoneID = "api.network.validation.missing-zone-id"
 
 func newFakeConsole(t *testing.T) *fakeConsole {
 	t.Helper()
@@ -246,6 +244,9 @@ func (f *fakeConsole) env() []string {
 func (f *fakeConsole) handle(w http.ResponseWriter, r *http.Request) {
 	// Read the body once up front: it is needed both by the mutation log and
 	// by the handler, and an http.Request body can only be consumed once.
+	f.mu.Lock()
+	f.requests++
+	f.mu.Unlock()
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
 		f.fail(w, http.StatusBadRequest, "api.invalid-payload", err.Error())
@@ -363,6 +364,10 @@ func (f *fakeConsole) handleCollection(w http.ResponseWriter, r *http.Request, r
 		}
 		if coll == collPolicies {
 			if code, msg := protocolFilterFault(body); code != "" {
+				f.fail(w, http.StatusBadRequest, code, msg)
+				return
+			}
+			if code, msg := f.policyCreateFaultLocked(body); code != "" {
 				f.fail(w, http.StatusBadRequest, code, msg)
 				return
 			}
@@ -485,13 +490,77 @@ func protocolFilterFault(body map[string]any) (code, message string) {
 	case "NAMED_PROTOCOL":
 		proto, _ := filter["protocol"].(map[string]any)
 		if name, _ := proto["name"].(string); name == "TCP_UDP" {
-			return "api.request.unknown-type-id",
+			return codeUnknownTypeID,
 				"Invalid $.ipProtocolScope.protocolFilter.type value 'TCP_UDP' (valid values: '')"
 		}
 	case "PRESET":
 		if _, ok := filter["matchOpposite"]; ok {
 			return "api.request.unknown-property",
 				"Unknown request body property '$.ipProtocolScope.protocolFilter.matchOpposite'"
+		}
+	}
+	return "", ""
+}
+
+// policyCreateFaultLocked applies the rules a live console enforced on the
+// policy creates probed against it (see docs/unifi-api-notes.md), answering
+// with its code and message, or "" for a body it accepts.
+func (f *fakeConsole) policyCreateFaultLocked(body map[string]any) (code, message string) {
+	action, _ := body["action"].(map[string]any)
+	scope, _ := body["ipProtocolScope"].(map[string]any)
+	ipVersion, _ := scope["ipVersion"].(string)
+
+	returnTraffic, set := action["allowReturnTraffic"].(bool)
+	if set && action["type"] != "ALLOW" {
+		return codeUnknownProperty, "Unknown request body property '$.action.allowReturnTraffic'"
+	}
+
+	filter, _ := scope["protocolFilter"].(map[string]any)
+	if filter["type"] == "NAMED_PROTOCOL" {
+		proto, _ := filter["protocol"].(map[string]any)
+		name, _ := proto["name"].(string)
+		if want, ok := protocolIPVersion[name]; ok && ipVersion != want {
+			valid := "''"
+			if other := map[string]string{"IPV4": "ICMP", "IPV6": "ICMPV6"}[ipVersion]; other != "" {
+				valid = "'" + other + "', ''"
+			}
+			return codeUnknownTypeID, fmt.Sprintf(
+				"Invalid $.ipProtocolScope.protocolFilter.type value '%s' (valid values: %s)", name, valid)
+		}
+	}
+
+	if returnTraffic {
+		var states []string
+		list, _ := body["connectionStateFilter"].([]any)
+		for _, s := range list {
+			states = append(states, s.(string))
+		}
+		zone := func(end string) string {
+			ep, _ := body[end].(map[string]any)
+			id, _ := ep["zoneId"].(string)
+			name, _ := f.coll[collZones].byID[id]["name"].(string)
+			return name
+		}
+		if onlyReturnStates(states) || returnTrafficZones[zone("source")] || returnTrafficZones[zone("destination")] {
+			return codeCantAllowReturnTraffic, "Return traffic can't be allowed"
+		}
+	}
+
+	for _, end := range []string{"source", "destination"} {
+		ep, _ := body[end].(map[string]any)
+		tf, _ := ep["trafficFilter"].(map[string]any)
+		ipf, _ := tf["ipAddressFilter"].(map[string]any)
+		var bad []string
+		items, _ := ipf["items"].([]any)
+		for _, it := range items {
+			v, _ := it.(map[string]any)["value"].(string)
+			if !ipMatchesVersion(v, ipVersion) {
+				bad = append(bad, v)
+			}
+		}
+		if len(bad) > 0 {
+			return codeInvalidIPAddresses, fmt.Sprintf(
+				"IP addresses [%s] are not valid or incompatible with IP version %s", strings.Join(bad, ", "), ipVersion)
 		}
 	}
 	return "", ""

@@ -20,6 +20,16 @@ const (
 // firewall returns from every /firewall/zones and /firewall/policies request.
 const codeZBFNotConfigured = "api.firewall.zone-based-firewall-not-configured"
 
+// Validation error codes a live console answers to a refused write. lint.go
+// checks for them before anything is sent.
+const (
+	codeMissingZoneID          = "api.network.validation.missing-zone-id"
+	codeCantAllowReturnTraffic = "api.firewall.policy.validation.cant-allow-return-traffic"
+	codeInvalidIPAddresses     = "api.firewall.policy.validation.invalid-ip-addresses"
+	codeUnknownTypeID          = "api.request.unknown-type-id"
+	codeUnknownProperty        = "api.request.unknown-property"
+)
+
 type metadata struct {
 	Origin       string `json:"origin"`
 	Configurable *bool  `json:"configurable,omitempty"`
