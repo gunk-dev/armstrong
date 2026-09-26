@@ -42,6 +42,28 @@ cue export ./unifi --out json -e site | unifi sync --prune
 it is the right first command to run against a console you have not synced
 before.
 
+### `unifi lint`: the pre-merge check
+
+```sh
+cue export ./unifi --out json -e site | unifi lint
+```
+
+`lint` checks a `#Site` document against every validation rule a live console
+is known to enforce on writes: a network in at most one declared zone, no
+negated `TCP_UDP`, `ICMP`/`ICMPV6` only with their own `ipVersion`, no
+`allowReturnTraffic` on a policy matching only `ESTABLISHED` and `RELATED` or on
+one to or from the `Gateway` or `External` zone, and IP address filter values of
+the policy's IP version. It needs no console and no credentials, prints every
+violation with the rule and the console error code it prevents, and exits 1 if
+there is any. `unifi lint --help` lists the rules, and docs/unifi-api-notes.md
+the requests that found them.
+
+Run it in a consumer repo's CI on every change to the instance file, next to
+`cue vet`. `schema/unifi.cue` encodes the rules CUE can express, so `cue vet`
+catches most of them too, but `lint` is the source of truth. `diff`, `sync` and
+`restore` run the same checks before their first request, so a document the
+console would refuse never gets a partial run.
+
 `diff` distinguishes its two failure modes on purpose: **exit 2** means "the
 plan is non-empty", **exit 1** means the command itself failed. A CI job that
 gates on drift should treat only 2 as "config has drifted".
@@ -200,6 +222,11 @@ Every list in a policy — filter items, networks, MAC addresses, application
 ids, `connectionStates`, schedule days — is a set: the console does not keep
 the order it was given, so order and duplicates never count as a change, and
 `unifi export` writes each list in a fixed canonical order.
+
+`allowReturnTraffic` defaults to `true` only where the console accepts it: on
+an `ALLOW` whose `connectionStates` are not exactly `ESTABLISHED` and `RELATED`,
+and whose zones are neither `Gateway` nor `External`. Elsewhere it defaults to
+`false`, and setting it `true` fails `cue vet` and `unifi lint`.
 
 `order` positions a policy among the `USER_DEFINED` policies **of its zone
 pair**: the console orders policies per pair, not site-wide, and its ordering

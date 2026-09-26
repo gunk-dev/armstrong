@@ -19,13 +19,18 @@ policies, with the console's rules for them: while it has zones, `POST
 `api.network.validation.missing-zone-id`, and a created network joins that
 zone's `networkIds`. A policy's protocol filter spells TCP_UDP only as a PRESET:
 as a NAMED_PROTOCOL it answers 400 `api.request.unknown-type-id`, and a PRESET
-carrying `matchOpposite` answers 400 `api.request.unknown-property`. Like the
-console, it does not keep the order of a policy's set-valued lists: it stores
-them reversed (see reorder_sets). Every other
+carrying `matchOpposite` answers 400 `api.request.unknown-property`. A policy
+create also gets the rules probed on a live console (docs/unifi-api-notes.md):
+ICMP only with IPV4 and ICMPV6 only with IPV6, no return traffic on a policy
+matching only ESTABLISHED and RELATED or touching the Gateway or External zone,
+no allowReturnTraffic on a non-ALLOW action, and IP address filter values of the
+policy's IP version. Like the console, it does not keep the order of a policy's
+set-valued lists: it stores them reversed (see reorder_sets). Every other
 write is answered 405 rather than being quietly accepted, so a tool that tried
 one would fail loudly instead of looking like it had nothing to do.
 """
 
+import ipaddress
 import json
 import os
 import sys
@@ -73,6 +78,40 @@ def protocol_filter_fault(body):
             "api.request.unknown-property",
             "Unknown request body property '$.ipProtocolScope.protocolFilter.matchOpposite'",
         )
+    return None
+
+
+def policy_create_fault(st, body):
+    """The (code, message) a live console answers for a policy create, beyond
+    its protocol filter, or None if it accepts it."""
+    action = body.get("action", {})
+    scope = body.get("ipProtocolScope", {})
+    ip_version = scope.get("ipVersion")
+    if "allowReturnTraffic" in action and action.get("type") != "ALLOW":
+        return ("api.request.unknown-property", "Unknown request body property '$.action.allowReturnTraffic'")
+    f = scope.get("protocolFilter") or {}
+    name = f.get("protocol", {}).get("name") if f.get("type") == "NAMED_PROTOCOL" else None
+    want = {"ICMP": "IPV4", "ICMPV6": "IPV6"}.get(name)
+    if want and ip_version != want:
+        other = {"IPV4": "'ICMP', ", "IPV6": "'ICMPV6', "}.get(ip_version, "")
+        return (
+            "api.request.unknown-type-id",
+            "Invalid $.ipProtocolScope.protocolFilter.type value '%s' (valid values: %s'')" % (name, other),
+        )
+    if action.get("allowReturnTraffic"):
+        zone_names = {z["id"]: z["name"] for z in st["zones"]}
+        ends = [zone_names.get(body.get(e, {}).get("zoneId")) for e in ("source", "destination")]
+        if sorted(body.get("connectionStateFilter") or []) == ["ESTABLISHED", "RELATED"] or {"Gateway", "External"} & set(ends):
+            return ("api.firewall.policy.validation.cant-allow-return-traffic", "Return traffic can't be allowed")
+    family = {"IPV4": 4, "IPV6": 6}.get(ip_version)
+    for end in ("source", "destination"):
+        items = body.get(end, {}).get("trafficFilter", {}).get("ipAddressFilter", {}).get("items", [])
+        bad = [i["value"] for i in items if family and ipaddress.ip_network(i["value"], strict=False).version != family]
+        if bad:
+            return (
+                "api.firewall.policy.validation.invalid-ip-addresses",
+                "IP addresses [%s] are not valid or incompatible with IP version %s" % (", ".join(bad), ip_version),
+            )
     return None
 
 
@@ -237,7 +276,7 @@ class Handler(BaseHTTPRequestHandler):
             if st["zones"]:
                 join_zone(st, zone_id, obj["id"])
         elif rest == "firewall/policies":
-            fault = protocol_filter_fault(body)
+            fault = protocol_filter_fault(body) or policy_create_fault(st, body)
             if fault:
                 return self.fail(*fault)
             obj = dict(body, id=next_id(st, "policies"), index=len(st["policies"]))

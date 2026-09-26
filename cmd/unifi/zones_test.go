@@ -195,7 +195,7 @@ func TestZonedNetworkNeedsExactlyOneZone(t *testing.T) {
 		},
 		"two zones": {
 			`{"name":"Things","networks":["IoT"]}`, `{"name":"Things","networks":["IoT","Guest"]}`,
-			`network "Guest" is declared in firewall zones "Things" and "Hotspot"`,
+			`network "Guest": network-in-one-zone: declared in firewall zones "Things" and "Hotspot"`,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

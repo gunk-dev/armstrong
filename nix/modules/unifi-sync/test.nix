@@ -87,7 +87,8 @@ let
   # A TCP_UDP policy, which the console takes only as a PRESET filter, beside
   # a UDP one, which it takes as a NAMED_PROTOCOL. The DNS policy carries
   # multi-item port, address and connection-state lists, which the console
-  # stores in an order of its own. Sections it omits are left alone.
+  # stores in an order of its own. Sections it omits are left alone. The
+  # console refuses return traffic on a policy to the Gateway zone.
   policySite = pkgs.writeText "policy-site.json" (
     builtins.toJSON {
       firewallPolicies =
@@ -97,7 +98,7 @@ let
             {
               enabled = true;
               action = "ALLOW";
-              allowReturnTraffic = true;
+              allowReturnTraffic = false;
               sourceZone = "Internal";
               destinationZone = "Gateway";
               ipVersion = "IPV4_AND_IPV6";
@@ -157,6 +158,39 @@ let
           matchOpposite = false;
         };
       };
+    }
+  );
+  # The same policy allowing return traffic: `unifi lint` refuses it offline,
+  # and the fake, like a live console, refuses its create.
+  returnTrafficSite = pkgs.writeText "return-traffic-site.json" (
+    builtins.toJSON {
+      firewallPolicies = [
+        {
+          name = "DNS";
+          enabled = true;
+          action = "ALLOW";
+          allowReturnTraffic = true;
+          sourceZone = "Internal";
+          destinationZone = "Gateway";
+          ipVersion = "IPV4_AND_IPV6";
+        }
+      ];
+    }
+  );
+  returnTrafficPolicy = pkgs.writeText "return-traffic-policy.json" (
+    builtins.toJSON {
+      name = "refused";
+      action = {
+        type = "ALLOW";
+        allowReturnTraffic = true;
+      };
+      source.zoneId = "zone-001";
+      destination.zoneId = "zone-002";
+      ipProtocolScope.ipVersion = "IPV4_AND_IPV6";
+      connectionStateFilter = [
+        "ESTABLISHED"
+        "RELATED"
+      ];
     }
   );
   zonelessNetwork = pkgs.writeText "zoneless-network.json" (
@@ -352,5 +386,21 @@ pkgs.testers.runNixOSTest {
       ports = [i["value"] for i in dns["destination"]["trafficFilter"]["portFilter"]["items"]]
       assert ports == [853, 53], ports
       machine.succeed(f"{env} ${unifi} diff < ${policySite}")
+
+      # ------------------------------------------------------ console rules
+      # `unifi lint` needs no console and no credentials; sync runs the same
+      # checks and refuses before its first request.
+      machine.succeed("${unifi} lint < ${policySite}")
+      lint = machine.fail("${unifi} lint < ${returnTrafficSite}")
+      assert "return-traffic-zone" in lint, lint
+      machine.succeed("truncate -s 0 /var/lib/fake-console/requests.log")
+      machine.fail(f"{env} ${unifi} sync < ${returnTrafficSite}")
+      assert machine.succeed("cat /var/lib/fake-console/requests.log") == "", "sync reached the console"
+      refused = machine.succeed(
+          "${pkgs.curl}/bin/curl -s -X POST -H 'Content-Type: application/json' "
+          "--data-binary @${returnTrafficPolicy} "
+          "http://127.0.0.1:8088/proxy/network/integration/v1/sites/site-0001/firewall/policies"
+      )
+      assert "api.firewall.policy.validation.cant-allow-return-traffic" in refused, refused
     '';
 }

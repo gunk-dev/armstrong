@@ -292,6 +292,81 @@ reads a PRESET back as `protocol: <preset name>`. `schema/unifi.cue` rejects
 refuses it before any write. To block everything except TCP and UDP, declare
 one policy per other protocol (`ICMP`, `ICMPV6`, …) instead.
 
+#### Validation rules on a policy create (probed 2026-09-26)
+
+A bounded probe session on 10.6.106 POSTed one disabled `armstrong-probe-<n>`
+policy per distinct policy shape of a consumer instance (15 shapes), plus one
+per candidate rule, with bodies exactly as `cmd/unifi` renders them. Each
+accepted probe was read back and deleted at once; the policy count was 171
+before and after. `cmd/unifi/lint.go` encodes each rejection below, and
+`unifi lint`, `diff`, `sync` and `restore` check them before any request.
+
+**Return traffic, by connection state.** `action: {type: "ALLOW",
+allowReturnTraffic: true}` with `connectionStateFilter` exactly
+`["ESTABLISHED","RELATED"]` (either order), in any zone pair:
+
+```
+400 {"code":"api.firewall.policy.validation.cant-allow-return-traffic",
+     "message":"Return traffic can't be allowed"}
+```
+
+The console accepts `allowReturnTraffic: true` with `["ESTABLISHED"]`,
+`["RELATED"]`, `["INVALID"]`, `["NEW","INVALID"]`,
+`["ESTABLISHED","RELATED","INVALID"]`, `["NEW","ESTABLISHED","RELATED"]` and
+with no `connectionStateFilter`. So the rule is "exactly ESTABLISHED and
+RELATED", not "NEW excluded".
+
+**Return traffic, by zone.** `allowReturnTraffic: true` on a policy whose source
+or destination is the built-in `Gateway` or `External` zone answers the same
+400, whatever the states, protocol and filters: refused for `Hotspot ->
+Gateway`, `Internal -> Gateway`, `Dmz -> Gateway`, `Internal -> External`,
+`Hotspot -> External` and `External -> External`; accepted for `Media ->
+Hotspot`, `Internal -> Hotspot`, `Vpn -> Hotspot`, `IoT -> Internal` and
+`People -> Media`. It does not follow the pair's default action (`Internal ->
+Hotspot` defaults to ALLOW and is accepted; `External -> External` defaults to
+BLOCK and is refused).
+
+The console's own policies break both rules: every zone pair from `External`
+has a SYSTEM_DEFINED `Allow Return Traffic` with `["RELATED","ESTABLISHED"]`,
+the `Gateway` and `External` pairs carry `Allow All Traffic`, `Allow DNS` and
+similar with `allowReturnTraffic: true`, and a policy that allows return
+traffic gets a DERIVED `<name> (Return)` policy in the reverse pair. `unifi
+export` includes them, so lint skips those names for the two return-traffic
+rules.
+
+**allowReturnTraffic on BLOCK/REJECT.** `action: {type: "BLOCK",
+allowReturnTraffic: true}` answers `400 api.request.unknown-property` ("Unknown
+request body property '$.action.allowReturnTraffic'"). `cmd/unifi` never sends
+it on a non-ALLOW action, so there is no lint rule; the schema defaults it to
+false there.
+
+**ICMP and the IP version.** `ICMP` is accepted only with `ipVersion: "IPV4"`,
+`ICMPV6` only with `"IPV6"`; `IPV4_AND_IPV6` takes neither:
+
+```
+400 {"code":"api.request.unknown-type-id",
+     "message":"Invalid $.ipProtocolScope.protocolFilter.type value 'ICMP' (valid values: 'ICMPV6', '')"}   // ipVersion IPV6
+400 {"code":"api.request.unknown-type-id",
+     "message":"Invalid $.ipProtocolScope.protocolFilter.type value 'ICMP' (valid values: '')"}             // IPV4_AND_IPV6
+```
+
+**IP address filter values and the IP version.** An IPv4 address in an `IPV6`
+policy, or an IPv6 address in an `IPV4` policy:
+
+```
+400 {"code":"api.firewall.policy.validation.invalid-ip-addresses",
+     "message":"IP addresses [fd00::53] are not valid or incompatible with IP version IPV4"}
+```
+
+`IPV4_AND_IPV6` accepts IPv4 addresses. The probes used `IP_ADDRESS` items;
+lint applies the same family check to `SUBNET` values.
+
+**Not rules.** A PORT traffic filter is accepted with protocol `ICMPV6`, with
+`TCP`, and with no protocol at all, so ports are not tied to TCP/UDP.
+
+**Read-back drift.** Every accepted probe read back with the fields it was sent,
+except for the order of its lists (see "List order is not preserved").
+
 #### Names are not unique; (source zone, destination zone, name) is
 
 The console's own defaults reuse 14 names across the 67 policies — `Allow All
