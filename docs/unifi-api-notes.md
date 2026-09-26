@@ -237,6 +237,27 @@ Corrections to what this file previously guessed:
 `"8000-8100"` range as `{"type":"PORT_NUMBER_RANGE","value":"8000-8100"}` by
 analogy with `PORT_NUMBER`; that is still **inferred**.
 
+#### List order is not preserved
+
+The console keeps a policy's list-valued fields as sets and reads them back in
+an order of its own. `Hotspot -> Media / Guest casting and printing` was
+created by `cmd/unifi` with destination ports `[53, 853]`; on 10.6.106 it reads
+back as
+
+```
+{"type":"PORT","portFilter":{"type":"PORTS","matchOpposite":true,"items":[{"type":"PORT_NUMBER","value":853},{"type":"PORT_NUMBER","value":53}]}}
+```
+
+and a PUT in the declared order does not change that. The same live GET shows
+the other lists scrambled too: `connectionStateFilter` as
+`["RELATED","ESTABLISHED","NEW"]`, `repeatOnDays` as
+`["SUNDAY","WEDNESDAY","TUESDAY","THURSDAY","MONDAY"]`, and IP items and
+MAC addresses in no sorted order. `cmd/unifi` therefore compares port items,
+IP address items, `networkIds`, MAC addresses, application ids, connection
+states and schedule days as sets (sorted, duplicates dropped), and `export`
+writes them in one canonical order: ports numerically, addresses by type then
+address, days Monday first, everything else lexically.
+
 #### The protocol filter is a NAMED_PROTOCOL or a PRESET
 
 A live `GET /firewall/policies` on 10.6.106 (168 policies) shows two shapes of

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -371,6 +372,9 @@ func (f *fakeConsole) handleCollection(w http.ResponseWriter, r *http.Request, r
 			f.fail(w, http.StatusBadRequest, codeMissingZoneID, "zoneId must not be null")
 			return
 		}
+		if coll == collPolicies {
+			reorderSets(body)
+		}
 		newID := f.insert(coll, originUser, body)
 		switch {
 		case coll == collNetworks && f.zbfConfigured:
@@ -403,6 +407,9 @@ func (f *fakeConsole) handleCollection(w http.ResponseWriter, r *http.Request, r
 				return
 			}
 		}
+		if coll == collPolicies {
+			reorderSets(body)
+		}
 		// A PUT replaces the writable fields; id and metadata stay server-owned.
 		updated := map[string]any{"id": obj["id"], "metadata": obj["metadata"]}
 		for k, v := range body {
@@ -431,6 +438,37 @@ func (f *fakeConsole) handleCollection(w http.ResponseWriter, r *http.Request, r
 		w.Header().Set("Allow", "GET, POST")
 		f.fail(w, http.StatusMethodNotAllowed, "api.method-not-allowed", r.Method)
 	}
+}
+
+// reorderSets stores a policy's set-valued lists reversed. A live console
+// does not keep the order they were sent in (["53", "853"] reads back as
+// [853, 53]), so an order-sensitive comparison shows up here as a perpetual
+// UPDATE.
+func reorderSets(policy map[string]any) {
+	flip := func(obj any, path ...string) {
+		for _, k := range path[:len(path)-1] {
+			m, _ := obj.(map[string]any)
+			obj = m[k]
+		}
+		if m, ok := obj.(map[string]any); ok {
+			if list, ok := m[path[len(path)-1]].([]any); ok {
+				slices.Reverse(list)
+			}
+		}
+	}
+	for _, end := range []string{"source", "destination"} {
+		for _, path := range [][]string{
+			{"networkFilter", "networkIds"},
+			{"ipAddressFilter", "items"},
+			{"portFilter", "items"},
+			{"macAddressFilter", "macAddresses"},
+			{"applicationFilter", "applicationIds"},
+		} {
+			flip(policy, append([]string{end, "trafficFilter"}, path...)...)
+		}
+	}
+	flip(policy, "connectionStateFilter")
+	flip(policy, "schedule", "repeatOnDays")
 }
 
 // protocolFilterFault applies a live console's rules for a policy's

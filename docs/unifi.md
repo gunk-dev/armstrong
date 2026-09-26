@@ -196,6 +196,11 @@ inverts them; the MAC-address and application filters do not. There is no name
 lookup for application ids in the Integration API, so `unifi export` is how you
 find the id of an application you picked in the console UI.
 
+Every list in a policy — filter items, networks, MAC addresses, application
+ids, `connectionStates`, schedule days — is a set: the console does not keep
+the order it was given, so order and duplicates never count as a change, and
+`unifi export` writes each list in a fixed canonical order.
+
 `order` positions a policy among the `USER_DEFINED` policies **of its zone
 pair**: the console orders policies per pair, not site-wide, and its ordering
 endpoint takes the pair as query parameters. Omit `order` to leave a policy

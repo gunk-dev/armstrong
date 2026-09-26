@@ -85,8 +85,9 @@ let
     }
   );
   # A TCP_UDP policy, which the console takes only as a PRESET filter, beside
-  # a UDP one, which it takes as a NAMED_PROTOCOL. Sections it omits are left
-  # alone.
+  # a UDP one, which it takes as a NAMED_PROTOCOL. The DNS policy carries
+  # multi-item port, address and connection-state lists, which the console
+  # stores in an order of its own. Sections it omits are left alone.
   policySite = pkgs.writeText "policy-site.json" (
     builtins.toJSON {
       firewallPolicies =
@@ -107,6 +108,33 @@ let
             {
               name = "DNS";
               protocol = "TCP_UDP";
+              connectionStates = [
+                "ESTABLISHED"
+                "NEW"
+              ];
+              destination = {
+                type = "IP_ADDRESS";
+                ipAddressFilter = {
+                  items = [
+                    {
+                      type = "IP_ADDRESS";
+                      value = "192.168.1.4";
+                    }
+                    {
+                      type = "IP_ADDRESS";
+                      value = "192.168.1.5";
+                    }
+                  ];
+                  matchOpposite = false;
+                };
+                portFilter = {
+                  items = [
+                    "53"
+                    "853"
+                  ];
+                  matchOpposite = false;
+                };
+              };
             }
             {
               name = "NTP";
@@ -306,7 +334,8 @@ pkgs.testers.runNixOSTest {
       assert "api.request.unknown-type-id" in refused, refused
 
       # A real sync sends TCP_UDP as the PRESET the console accepts, and reads
-      # it back as TCP_UDP: the second diff is clean.
+      # it back as TCP_UDP; the fake stores the DNS policy's lists reversed. The
+      # second diff is still clean.
       machine.succeed("truncate -s 0 /var/lib/fake-console/requests.log")
       out = machine.succeed(f"{env} ${unifi} sync < ${policySite}")
       assert "CREATE firewall policy Internal -> Gateway / DNS" in out, out
@@ -319,6 +348,9 @@ pkgs.testers.runNixOSTest {
       filters = {p["name"]: p["ipProtocolScope"]["protocolFilter"] for p in st["policies"]}
       assert filters["DNS"] == {"type": "PRESET", "preset": {"name": "TCP_UDP"}}, filters
       assert filters["NTP"]["type"] == "NAMED_PROTOCOL", filters
+      dns = next(p for p in st["policies"] if p["name"] == "DNS")
+      ports = [i["value"] for i in dns["destination"]["trafficFilter"]["portFilter"]["items"]]
+      assert ports == [853, 53], ports
       machine.succeed(f"{env} ${unifi} diff < ${policySite}")
     '';
 }
