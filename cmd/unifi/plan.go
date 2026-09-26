@@ -915,13 +915,20 @@ func policyMatches(got, want firewallPolicy) bool {
 }
 
 // normalizePolicy drops the differences that are not differences: the position
-// (reconciled by the ordering endpoint), the order of a set-valued list, and
-// allowReturnTraffic on an action that has no reply traffic to allow — the API
-// neither stores nor returns it there, so the schema default must not read as
-// drift on every run.
+// (reconciled by the ordering endpoint), the order of a set-valued list (see
+// canonicalPolicy), and allowReturnTraffic on an action that has no reply
+// traffic to allow — the API neither stores nor returns it there, so the schema
+// default must not read as drift on every run. An empty connectionStates or
+// repeatOnDays is not sent at all, so it reads back as absent.
 func normalizePolicy(p firewallPolicy) firewallPolicy {
+	p = canonicalPolicy(p)
 	p.Order = nil
-	p.ConnectionStates = sortedCopy(p.ConnectionStates)
+	if len(p.ConnectionStates) == 0 {
+		p.ConnectionStates = nil
+	}
+	if p.Schedule != nil && len(p.Schedule.RepeatOnDays) == 0 {
+		p.Schedule.RepeatOnDays = nil
+	}
 	if p.Action != "ALLOW" {
 		p.AllowReturnTraffic = false
 	}
@@ -939,13 +946,13 @@ func policyChanges(got, want firewallPolicy) string {
 	add(got.Enabled != want.Enabled, "enabled")
 	add(got.Description != want.Description, "description")
 	add(got.Action != want.Action || normalizePolicy(got).AllowReturnTraffic != normalizePolicy(want).AllowReturnTraffic, "action")
-	add(!reflect.DeepEqual(got.Source, want.Source), "source")
-	add(!reflect.DeepEqual(got.Destination, want.Destination), "destination")
+	add(!reflect.DeepEqual(normalizePolicy(got).Source, normalizePolicy(want).Source), "source")
+	add(!reflect.DeepEqual(normalizePolicy(got).Destination, normalizePolicy(want).Destination), "destination")
 	add(got.IPVersion != want.IPVersion, "ipVersion")
 	add(got.Protocol != want.Protocol || got.ProtocolMatchOpposite != want.ProtocolMatchOpposite, "protocol")
 	add(!sameStringSet(got.ConnectionStates, want.ConnectionStates), "connectionStates")
 	add(got.LoggingEnabled != want.LoggingEnabled, "loggingEnabled")
-	add(!reflect.DeepEqual(got.Schedule, want.Schedule), "schedule")
+	add(!reflect.DeepEqual(normalizePolicy(got).Schedule, normalizePolicy(want).Schedule), "schedule")
 	if len(fields) == 0 {
 		return "changed"
 	}

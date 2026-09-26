@@ -1291,10 +1291,14 @@ func TestFirewallPolicyOrdering(t *testing.T) {
 	}
 
 	// "443" and "8000-8100" must reach the API as the two different item
-	// shapes it distinguishes, both under `value`.
-	iotZone := f.objectNamed(collZones, "iot")["id"].(string)
-	internalZone := f.objectNamed(collZones, "internal")["id"].(string)
-	policy := f.policyNamed("zulu-runs-first", iotZone, internalZone)
+	// shapes it distinguishes, both under `value`. The request body is checked
+	// rather than the stored policy, which the fake keeps in its own order.
+	var policy map[string]any
+	for _, m := range f.recorded() {
+		if m.Method == "POST" && m.Path == collPolicies && m.Body["name"] == "zulu-runs-first" {
+			policy = m.Body
+		}
+	}
 	dst, _ := policy["destination"].(map[string]any)
 	tf, _ := dst["trafficFilter"].(map[string]any)
 	pf, _ := tf["portFilter"].(map[string]any)

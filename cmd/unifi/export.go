@@ -158,7 +158,8 @@ func buildExport(c *client, ref siteRef, legacy legacySections, warn io.Writer) 
 // exportPolicies renders the live policies. `order` is emitted only for
 // USER_DEFINED policies — those are the only ones the console lets anyone
 // reorder — and counts from 10 within each zone pair, which is the bucket the
-// ordering endpoint works on.
+// ordering endpoint works on. Set-valued lists are emitted in canonical order
+// (see canonicalPolicy), since the console's own order is not stable.
 func exportPolicies(policies []actual[apiFirewallPolicy], zoneNames, netNames nameLookup, warn io.Writer) []firewallPolicy {
 	var out []firewallPolicy
 	nextOrder := map[string]int{}
@@ -169,6 +170,7 @@ func exportPolicies(policies []actual[apiFirewallPolicy], zoneNames, netNames na
 				"Declaring it would plan a PUT that drops those fields.\n", p.key(), lossy)
 			continue
 		}
+		p = canonicalPolicy(p)
 		if a.Origin != originSystem {
 			nextOrder[p.zonePair()] += 10
 			order := nextOrder[p.zonePair()]
