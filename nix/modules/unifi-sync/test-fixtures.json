@@ -12,6 +12,7 @@
       "internetAccessEnabled": true,
       "cellularBackupEnabled": false,
       "mdnsForwardingEnabled": true,
+      "zoneId": "zone-001",
       "ipv4Configuration": {
         "autoScaleEnabled": false,
         "hostIpAddress": "10.0.0.1",

@@ -9,6 +9,11 @@
 #     is asserted against what actually crossed the socket rather than against
 #     the tool's own account of itself.
 #
+# It then runs one real `unifi sync` against the fake, which enforces the
+# console's rule that a network is created into a firewall zone: a new
+# network in a new zone has to arrive as the zone's POST, then the network's
+# POST carrying that zone's id.
+#
 # Everything real is real: the module's own systemd unit, the `unifi` package
 # this flake builds, `cue` resolving the schema out of the module the
 # derivation assembles in the store, and the credential and EnvironmentFile
@@ -20,6 +25,70 @@
 
 let
   fixtures = ./test-fixtures.json;
+
+  # The fixture's Default network, as the #Site the zone phase feeds `unifi`.
+  defaultNetwork = {
+    name = "Default";
+    management = "GATEWAY";
+    enabled = true;
+    vlanId = 1;
+    isolationEnabled = false;
+    internetAccessEnabled = true;
+    cellularBackupEnabled = false;
+    mdnsForwardingEnabled = true;
+    ipv4 = {
+      hostIpAddress = "10.0.0.1";
+      prefixLength = 24;
+      autoScaleEnabled = false;
+      dhcp = {
+        mode = "SERVER";
+        rangeStart = "10.0.0.10";
+        rangeStop = "10.0.0.200";
+        leaseTimeSeconds = 86400;
+        domainName = "test.invalid";
+        pingConflictDetectionEnabled = true;
+      };
+    };
+  };
+  # Default as it stands, plus a Lab network in a Lab zone, neither of which
+  # exists yet. Sections it omits are left alone.
+  labSite = pkgs.writeText "lab-site.json" (
+    builtins.toJSON {
+      networks = [
+        defaultNetwork
+        (
+          defaultNetwork
+          // {
+            name = "Lab";
+            vlanId = 30;
+            ipv4 = defaultNetwork.ipv4 // {
+              hostIpAddress = "10.0.30.1";
+              dhcp = defaultNetwork.ipv4.dhcp // {
+                rangeStart = "10.0.30.10";
+                rangeStop = "10.0.30.200";
+              };
+            };
+          }
+        )
+      ];
+      firewallZones = [
+        {
+          name = "Internal";
+          networks = [ "Default" ];
+        }
+        {
+          name = "Lab";
+          networks = [ "Lab" ];
+        }
+      ];
+    }
+  );
+  zonelessNetwork = pkgs.writeText "zoneless-network.json" (
+    builtins.toJSON {
+      name = "Nowhere";
+      vlanId = 99;
+    }
+  );
 in
 pkgs.testers.runNixOSTest {
   name = "unifi-sync";
@@ -71,73 +140,111 @@ pkgs.testers.runNixOSTest {
       systemd.timers.unifi-sync.enable = lib.mkForce false;
     };
 
-  testScript = ''
-    machine.wait_for_unit("fake-console.service")
-    machine.wait_for_open_port(8088, "127.0.0.1")
+  testScript =
+    { nodes, ... }:
+    let
+      unifi = "${nodes.machine.modules.unifi-sync.package}/bin/unifi";
+    in
+    ''
+      machine.wait_for_unit("fake-console.service")
+      machine.wait_for_open_port(8088, "127.0.0.1")
 
-    def writes():
-        """Every non-GET request the fake console has seen so far."""
-        log = machine.succeed("cat /var/lib/fake-console/requests.log")
-        return [l for l in log.splitlines() if not l.startswith("GET ")]
+      def writes():
+          """Every non-GET request the fake console has seen so far."""
+          log = machine.succeed("cat /var/lib/fake-console/requests.log")
+          return [l for l in log.splitlines() if not l.startswith("GET ")]
 
-    # ---------------------------------------------------------------- clean
-    # The console matches the instance file, so the plan is empty and the unit
-    # succeeds.
-    machine.succeed("systemctl start unifi-sync.service")
-    plan = machine.succeed("journalctl -u unifi-sync.service --no-pager")
-    assert "OK     network        Default" in plan, plan
-    assert "OK     wifi           test-ssid" in plan, plan
-    assert "OK     dns policy     A_RECORD host.test.invalid" in plan, plan
-    assert "OK     firewall zone  Internal" in plan, plan
+      # ---------------------------------------------------------------- clean
+      # The console matches the instance file, so the plan is empty and the unit
+      # succeeds.
+      machine.succeed("systemctl start unifi-sync.service")
+      plan = machine.succeed("journalctl -u unifi-sync.service --no-pager")
+      assert "OK     network        Default" in plan, plan
+      assert "OK     wifi           test-ssid" in plan, plan
+      assert "OK     dns policy     A_RECORD host.test.invalid" in plan, plan
+      assert "OK     firewall zone  Internal" in plan, plan
 
-    # It really did talk to the console rather than short-circuiting: the
-    # detail GETs the overview/detail split forces are in the log.
-    requests = machine.succeed("cat /var/lib/fake-console/requests.log")
-    assert "GET /proxy/network/integration/v1/sites/site-0001/networks/network-001" in requests
-    assert "GET /proxy/network/integration/v1/sites/site-0001/wifi/broadcasts/wifi-001" in requests
+      # It really did talk to the console rather than short-circuiting: the
+      # detail GETs the overview/detail split forces are in the log.
+      requests = machine.succeed("cat /var/lib/fake-console/requests.log")
+      assert "GET /proxy/network/integration/v1/sites/site-0001/networks/network-001" in requests
+      assert "GET /proxy/network/integration/v1/sites/site-0001/wifi/broadcasts/wifi-001" in requests
 
-    assert writes() == [], f"diff mode issued writes: {writes()}"
+      assert writes() == [], f"diff mode issued writes: {writes()}"
 
-    # ---------------------------------------------------------------- drift
-    # Change the console out from under the instance file: the DNS record now
-    # points somewhere else, and mDNS forwarding has been turned off.
-    machine.succeed(
-        "${pkgs.jq}/bin/jq '.dns[0].ipv4Address = \"10.0.0.99\" "
-        "| .networks[0].mdnsForwardingEnabled = false' "
-        "/var/lib/fake-console/state.json > /tmp/drifted.json"
-    )
-    machine.succeed("mv /tmp/drifted.json /var/lib/fake-console/state.json")
-    machine.succeed("truncate -s 0 /var/lib/fake-console/requests.log")
+      # ---------------------------------------------------------------- drift
+      # Change the console out from under the instance file: the DNS record now
+      # points somewhere else, and mDNS forwarding has been turned off.
+      machine.succeed(
+          "${pkgs.jq}/bin/jq '.dns[0].ipv4Address = \"10.0.0.99\" "
+          "| .networks[0].mdnsForwardingEnabled = false' "
+          "/var/lib/fake-console/state.json > /tmp/drifted.json"
+      )
+      machine.succeed("mv /tmp/drifted.json /var/lib/fake-console/state.json")
+      machine.succeed("truncate -s 0 /var/lib/fake-console/requests.log")
 
-    # `unifi diff` exits 2 when the plan is non-empty, so the unit fails and
-    # the drift is visible in systemctl status rather than buried.
-    machine.fail("systemctl start unifi-sync.service")
-    # `systemctl is-failed` exits 0 only when the unit is in the failed state,
-    # so this asserts the unit was left failed and not merely that the start
-    # command returned non-zero.
-    assert machine.succeed("systemctl is-failed unifi-sync.service").strip() == "failed"
+      # `unifi diff` exits 2 when the plan is non-empty, so the unit fails and
+      # the drift is visible in systemctl status rather than buried.
+      machine.fail("systemctl start unifi-sync.service")
+      # `systemctl is-failed` exits 0 only when the unit is in the failed state,
+      # so this asserts the unit was left failed and not merely that the start
+      # command returned non-zero.
+      assert machine.succeed("systemctl is-failed unifi-sync.service").strip() == "failed"
 
-    # The plan naming what drifted is in the journal, which is the whole point
-    # of failing rather than just returning non-zero.
-    plan = machine.succeed("journalctl -u unifi-sync.service --no-pager | tail -n 40")
-    assert "UPDATE network        Default (mdnsForwardingEnabled)" in plan, plan
-    assert "UPDATE dns policy     A_RECORD host.test.invalid" in plan, plan
+      # The plan naming what drifted is in the journal, which is the whole point
+      # of failing rather than just returning non-zero.
+      plan = machine.succeed("journalctl -u unifi-sync.service --no-pager | tail -n 40")
+      assert "UPDATE network        Default (mdnsForwardingEnabled)" in plan, plan
+      assert "UPDATE dns policy     A_RECORD host.test.invalid" in plan, plan
 
-    # Still read-only. This is the assertion that matters most: the tool found
-    # work to do and did not do any of it.
-    assert writes() == [], f"diff mode issued writes on drift: {writes()}"
+      # Still read-only. This is the assertion that matters most: the tool found
+      # work to do and did not do any of it.
+      assert writes() == [], f"diff mode issued writes on drift: {writes()}"
 
-    # ------------------------------------------------------------ unifi-plan
-    # The human-facing wrapper runs the same pipeline as `sync --dry-run`, and
-    # is likewise read-only. Nothing is handed to it: it has to read the API
-    # key from the file directly rather than from a systemd credential, and
-    # load the SSID passphrase out of the same secrets file the unit gets as an
-    # EnvironmentFile. The clean `OK wifi` line below is what proves it did —
-    # without the passphrase that line would read UPDATE.
-    plan = machine.succeed("unifi-plan")
-    assert "DRY RUN" in plan, plan
-    assert "OK     wifi           test-ssid" in plan, plan
-    assert "UPDATE dns policy     A_RECORD host.test.invalid" in plan, plan
-    assert writes() == [], f"unifi-plan issued writes: {writes()}"
-  '';
+      # ------------------------------------------------------------ unifi-plan
+      # The human-facing wrapper runs the same pipeline as `sync --dry-run`, and
+      # is likewise read-only. Nothing is handed to it: it has to read the API
+      # key from the file directly rather than from a systemd credential, and
+      # load the SSID passphrase out of the same secrets file the unit gets as an
+      # EnvironmentFile. The clean `OK wifi` line below is what proves it did —
+      # without the passphrase that line would read UPDATE.
+      plan = machine.succeed("unifi-plan")
+      assert "DRY RUN" in plan, plan
+      assert "OK     wifi           test-ssid" in plan, plan
+      assert "UPDATE dns policy     A_RECORD host.test.invalid" in plan, plan
+      assert writes() == [], f"unifi-plan issued writes: {writes()}"
+
+      # ------------------------------------------------------------ zone rule
+      # The fake enforces the console's rule directly: a network create without
+      # a zone id is refused with the code a live console answers.
+      machine.succeed("install -m 0644 ${fixtures} /var/lib/fake-console/state.json")
+      refused = machine.succeed(
+          "${pkgs.curl}/bin/curl -s -X POST -H 'Content-Type: application/json' "
+          "--data-binary @${zonelessNetwork} "
+          "http://127.0.0.1:8088/proxy/network/integration/v1/sites/site-0001/networks"
+      )
+      assert "api.network.validation.missing-zone-id" in refused, refused
+
+      # A real sync creating a network in a zone that does not exist yet: the
+      # zone first, then the network carrying its id.
+      machine.succeed("truncate -s 0 /var/lib/fake-console/requests.log")
+      env = "UNIFI_URL=http://127.0.0.1:8088 UNIFI_SITE=Default UNIFI_API_KEY=test-api-key"
+      out = machine.succeed(f"{env} ${unifi} sync < ${labSite}")
+      assert "CREATE firewall zone  Lab (1 networks)" in out, out
+      assert "CREATE network        Lab (vlan 30, zone Lab)" in out, out
+      assert writes() == [
+          "POST /proxy/network/integration/v1/sites/site-0001/firewall/zones",
+          "POST /proxy/network/integration/v1/sites/site-0001/networks",
+      ], writes()
+
+      import json
+      st = json.loads(machine.succeed("cat /var/lib/fake-console/state.json"))
+      lab_net = next(n for n in st["networks"] if n["name"] == "Lab")
+      lab_zone = next(z for z in st["zones"] if z["name"] == "Lab")
+      assert lab_net["zoneId"] == lab_zone["id"], st
+      assert lab_zone["networkIds"] == [lab_net["id"]], st
+
+      # And the result is converged: a second diff has nothing to do.
+      machine.succeed(f"{env} ${unifi} diff < ${labSite}")
+    '';
 }

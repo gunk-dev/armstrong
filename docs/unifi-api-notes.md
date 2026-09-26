@@ -109,6 +109,29 @@ Note the nesting names: `ipv4Configuration` (not `ipv4`) and
 `ipAddressRange: {start, stop}` object rather than two flat fields. The schema
 in this repo flattens these for readability; `cmd/unifi/api.go` translates.
 
+**On a console with the zone-based firewall, `POST /networks` requires
+`zoneId`.** Confirmed on a UDM Pro running UniFi Network 10.6.106: a
+create body without it is refused before anything is created.
+
+```
+POST /sites/{siteId}/networks
+{"management":"GATEWAY","name":"People","enabled":true,"vlanId":10,
+ "isolationEnabled":false,"internetAccessEnabled":true,
+ "cellularBackupEnabled":false,"mdnsForwardingEnabled":true,
+ "ipv4Configuration":{...}}
+
+400 {"statusCode":400,"statusName":"BAD_REQUEST",
+     "code":"api.network.validation.missing-zone-id",
+     "message":"zoneId must not be null", ...}
+```
+
+The create body carries `"zoneId": "<firewall zone id>"`, and the network is
+created as a member of that zone: it appears in that zone's `networkIds`. A
+network belongs to exactly one zone. `cmd/unifi` therefore creates a declared
+zone the console lacks before the networks that join it, then creates each
+network with its zone's id; `cmd/unifi/fake_test.go` and the VM test's
+`fake-console.py` both refuse a zoneless create with the same code.
+
 `pxeConfiguration` is not modelled by `schema/unifi.cue` — nothing here needs
 PXE, and the tool never sends the key, so the console keeps whatever is set.
 

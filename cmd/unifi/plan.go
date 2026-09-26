@@ -16,8 +16,11 @@ import (
 
 // reconciler converges one site to the desired #Site document. The mDNS proxy
 // setting goes first (see run); resource types then follow in dependency
-// order: networks, then firewall zones (which reference networks), then wifi
-// / firewall policies / DNS policies / DHCP reservations.
+// order. On a console with the zone-based firewall a network is created into
+// its zone, so the declared zones that do not exist yet are created first,
+// holding only the member networks that already exist; then networks, each
+// new one carrying its zone's id; then the membership of every declared zone;
+// then wifi / firewall policies / DNS policies / DHCP reservations.
 type reconciler struct {
 	client     *client
 	siteID     string
@@ -36,8 +39,17 @@ type reconciler struct {
 
 	networkIDs map[string]string // network name -> id
 	zoneIDs    map[string]string // zone name -> id
-	deletes    int
-	updates    int
+	// createdZones maps each zone this pass created to its id (pendingID in
+	// a dry run), so the zone pass neither creates it again nor needs it in
+	// the live list.
+	createdZones map[string]string
+	// placed names the networks this pass put into their declared zone by
+	// creating something: a network created with its zone's id, or an
+	// existing network listed in a zone created with it. The zone pass counts
+	// their membership as satisfied, which a dry run cannot read back.
+	placed  map[string]bool
+	deletes int
+	updates int
 	// moved counts firewall policies an ordering write changes the position
 	// of. It is guarded like deletes and updates: one ordering request can
 	// rearrange a whole zone pair.
@@ -227,15 +239,27 @@ func (r *reconciler) syncNetworks() error {
 		r.networkIDs[a.Spec.Name] = a.ID
 	}
 
+	homes, err := r.createZones(byName)
+	if err != nil {
+		return err
+	}
+
 	seen := map[string]bool{}
 	base := "/sites/" + r.siteID + "/networks"
 	for _, want := range r.want.Networks {
 		seen[want.Name] = true
 		got, ok := byName[want.Name]
 		if !ok {
-			r.logf("CREATE", "network", want.Name, "vlan %d", want.VlanID)
+			body := want.body()
+			if home, ok := homes[want.Name]; ok {
+				r.logf("CREATE", "network", want.Name, "vlan %d, zone %s", want.VlanID, home.name)
+				body["zoneId"] = home.id
+				r.placed[want.Name] = true
+			} else {
+				r.logf("CREATE", "network", want.Name, "vlan %d", want.VlanID)
+			}
 			var created apiNetwork
-			if err := r.mutate(http.MethodPost, base, want.body(), &created); err != nil {
+			if err := r.mutate(http.MethodPost, base, body, &created); err != nil {
 				return fmt.Errorf("create network %q: %w", want.Name, err)
 			}
 			r.networkIDs[want.Name] = newID(created.ID, r.dryRun)
@@ -249,6 +273,11 @@ func (r *reconciler) syncNetworks() error {
 		body, err := want.updateBody(got)
 		if err != nil {
 			return err
+		}
+		// got was read before createZones moved this network into a new
+		// zone; sending its old zoneId back would undo the move.
+		if home, ok := homes[want.Name]; ok {
+			body["zoneId"] = home.id
 		}
 		if err := r.mutate(http.MethodPut, base+"/"+got.ID, body, nil); err != nil {
 			return fmt.Errorf("update network %q: %w", want.Name, err)
@@ -279,6 +308,112 @@ func normalizeNetwork(n network) network {
 
 // ----------------------------------------------------------- firewall zones
 
+// zoneRef is a firewall zone as a network create refers to it.
+type zoneRef struct{ name, id string }
+
+// createZones runs before any network is written. On a console with the
+// zone-based firewall, POST /networks requires the id of the zone the network
+// joins, so every declared zone missing from the console is created here,
+// holding the declared member networks that already exist; the network
+// creates that follow add the rest. It returns the zone each new network
+// joins, and each existing network a created zone took, keyed by network
+// name, or nil when the zone-based firewall is not configured and networks
+// are created without a zone.
+//
+// It also checks the instance file before anything is written: a network is
+// declared in at most one zone, and a network still to be created in exactly
+// one, since the console places each network in a single zone.
+func (r *reconciler) createZones(liveNets map[string]actual[network]) (map[string]zoneRef, error) {
+	r.createdZones = map[string]string{}
+	r.placed = map[string]bool{}
+	existing, available, err := r.client.zones(r.siteID)
+	if err != nil {
+		return nil, err
+	}
+	if !available {
+		return nil, nil
+	}
+
+	zoneOf := map[string]string{} // network name -> declared zone
+	for _, z := range r.want.FirewallZones {
+		for _, n := range z.Networks {
+			if other, ok := zoneOf[n]; ok && other != z.Name {
+				return nil, fmt.Errorf("network %q is declared in firewall zones %q and %q; "+
+					"the console places each network in exactly one zone", n, other, z.Name)
+			}
+			zoneOf[n] = z.Name
+		}
+	}
+	declared := map[string]bool{}
+	for _, n := range r.want.Networks {
+		declared[n.Name] = true
+		if _, live := liveNets[n.Name]; !live && zoneOf[n.Name] == "" {
+			return nil, fmt.Errorf("network %q is in no declared firewall zone; the console "+
+				"creates a network only into a zone, so list it in exactly one "+
+				"firewallZones entry's networks", n.Name)
+		}
+	}
+
+	zoneIDs := map[string]string{}
+	liveZoneOf := map[string]string{} // network id -> zone name
+	for _, a := range existing {
+		zoneIDs[a.Spec.Name] = a.ID
+		for _, id := range a.Spec.NetworkIDs {
+			liveZoneOf[id] = a.Spec.Name
+		}
+	}
+	base := "/sites/" + r.siteID + "/firewall/zones"
+	for _, want := range r.want.FirewallZones {
+		if _, ok := zoneIDs[want.Name]; ok {
+			continue
+		}
+		var members []string
+		for _, n := range want.Networks {
+			switch {
+			case liveNets[n].ID != "":
+				members = append(members, n)
+			case !declared[n]:
+				return nil, fmt.Errorf("firewall zone %q: unknown network %q", want.Name, n)
+			}
+		}
+		ids, err := r.resolveNetworks(members)
+		if err != nil {
+			return nil, fmt.Errorf("firewall zone %q: %w", want.Name, err)
+		}
+		// An existing member leaves the zone it is in now. That changes what
+		// the network is allowed to reach, so each move counts towards
+		// --max-changes as an update, though the create carries it out.
+		detail := fmt.Sprintf("%d networks", len(want.Networks))
+		for _, n := range members {
+			if from := liveZoneOf[liveNets[n].ID]; from != "" {
+				detail += fmt.Sprintf("; moves %s from %s", n, from)
+				r.updates++
+			}
+		}
+		r.logf("CREATE", "firewall zone", want.Name, "%s", detail)
+		var created apiZone
+		body := map[string]any{"name": want.Name, "networkIds": ids}
+		if err := r.mutate(http.MethodPost, base, body, &created); err != nil {
+			return nil, fmt.Errorf("create firewall zone %q: %w", want.Name, err)
+		}
+		zoneIDs[want.Name] = newID(created.ID, r.dryRun)
+		r.createdZones[want.Name] = zoneIDs[want.Name]
+		for _, n := range members {
+			r.placed[n] = true
+		}
+	}
+
+	homes := map[string]zoneRef{}
+	for _, n := range r.want.Networks {
+		if _, live := liveNets[n.Name]; !live || r.placed[n.Name] {
+			homes[n.Name] = zoneRef{name: zoneOf[n.Name], id: zoneIDs[zoneOf[n.Name]]}
+		}
+	}
+	return homes, nil
+}
+
+// syncZones reconciles the membership of every declared zone, after
+// createZones and the network pass have created what was missing.
 func (r *reconciler) syncZones() error {
 	existing, available, err := r.client.zones(r.siteID)
 	if err != nil {
@@ -302,6 +437,11 @@ func (r *reconciler) syncZones() error {
 		byName[a.Spec.Name] = a
 		r.zoneIDs[a.Spec.Name] = a.ID
 	}
+	for name, id := range r.createdZones {
+		if _, ok := r.zoneIDs[name]; !ok {
+			r.zoneIDs[name] = id
+		}
+	}
 
 	seen := map[string]bool{}
 	base := "/sites/" + r.siteID + "/firewall/zones"
@@ -311,20 +451,39 @@ func (r *reconciler) syncZones() error {
 		if err != nil {
 			return fmt.Errorf("firewall zone %q: %w", want.Name, err)
 		}
-		body := map[string]any{"name": want.Name, "networkIds": ids}
 
+		_, created := r.createdZones[want.Name]
 		got, ok := byName[want.Name]
 		if !ok {
-			r.logf("CREATE", "firewall zone", want.Name, "%d networks", len(ids))
-			var created apiZone
-			if err := r.mutate(http.MethodPost, base, body, &created); err != nil {
-				return fmt.Errorf("create firewall zone %q: %w", want.Name, err)
+			if created {
+				// Created by this dry run: its CREATE line is already out,
+				// and its membership is what the creates made it.
+				continue
 			}
-			r.zoneIDs[want.Name] = newID(created.ID, r.dryRun)
-			continue
+			return fmt.Errorf("firewall zone %q is missing from the console", want.Name)
 		}
-		if sameStringSet(got.Spec.NetworkIDs, ids) {
-			r.logf("OK", "firewall zone", want.Name, "")
+		// Placed networks are members by construction. A dry run cannot
+		// read that back from the console, so neither pass compares them.
+		var wantRest []string
+		for _, n := range want.Networks {
+			if !r.placed[n] {
+				wantRest = append(wantRest, n)
+			}
+		}
+		wantRestIDs, err := r.resolveNetworks(wantRest)
+		if err != nil {
+			return fmt.Errorf("firewall zone %q: %w", want.Name, err)
+		}
+		var gotRest []string
+		for _, id := range got.Spec.NetworkIDs {
+			if !r.placed[netNames.name(id)] {
+				gotRest = append(gotRest, id)
+			}
+		}
+		if sameStringSet(gotRest, wantRestIDs) {
+			if !created {
+				r.logf("OK", "firewall zone", want.Name, "")
+			}
 			continue
 		}
 		// A zone whose members GET /networks does not return (the console's
@@ -340,6 +499,7 @@ func (r *reconciler) syncZones() error {
 				"it cannot be changed", want.Name)
 		}
 		r.logf("UPDATE", "firewall zone", want.Name, "member networks changed")
+		body := map[string]any{"name": want.Name, "networkIds": ids}
 		if err := r.mutate(http.MethodPut, base+"/"+got.ID, body, nil); err != nil {
 			return fmt.Errorf("update firewall zone %q: %w", want.Name, err)
 		}
