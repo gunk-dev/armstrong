@@ -11,9 +11,14 @@ Two things make it a useful test double rather than a mock:
   * the served state is a JSON file the test rewrites, so "the console drifted"
     is a real change to what the API returns, not a stubbed return value;
   * every request is appended to a log, including its method, so the test can
-    assert that a diff-mode run issued no POST/PUT/DELETE. Writes are answered
-    405 rather than being quietly accepted, so a tool that tried one would fail
-    loudly instead of looking like it had nothing to do.
+    assert that a diff-mode run issued no POST/PUT/DELETE.
+
+The only writes it serves are creates of networks and firewall zones, with the
+console's rule between them: while it has zones, `POST /networks` without the
+id of one of them answers 400 `api.network.validation.missing-zone-id`, and a
+created network joins that zone's `networkIds`. Every other write is answered
+405 rather than being quietly accepted, so a tool that tried one would fail
+loudly instead of looking like it had nothing to do.
 """
 
 import json
@@ -32,6 +37,32 @@ PORT = int(os.environ["FAKE_CONSOLE_PORT"])
 def state():
     with open(STATE) as f:
         return json.load(f)
+
+
+def save(st):
+    with open(STATE + ".tmp", "w") as f:
+        json.dump(st, f)
+    os.replace(STATE + ".tmp", STATE)
+
+
+def next_id(st, kind):
+    """A fresh id in the fixture's `<kind>-NNN` style."""
+    prefix = {"networks": "network", "zones": "zone"}[kind]
+    taken = [int(o["id"].rsplit("-", 1)[1]) for o in st[kind] if o["id"].startswith(prefix + "-")]
+    return "%s-%03d" % (prefix, max(taken, default=0) + 1)
+
+
+def join_zone(st, zone_id, network_id):
+    """Make a network a member of exactly one zone, keeping the network's
+    zoneId and the zones' networkIds in step, as the console does."""
+    for zone in st["zones"]:
+        members = [n for n in zone["networkIds"] if n != network_id]
+        if zone["id"] == zone_id:
+            members.append(network_id)
+        zone["networkIds"] = members
+    for network in st["networks"]:
+        if network["id"] == network_id:
+            network["zoneId"] = zone_id
 
 
 # The fields the real API omits from a list response. The tool has to follow up
@@ -136,7 +167,36 @@ class Handler(BaseHTTPRequestHandler):
             {"statusCode": 405, "code": "api.method-not-allowed", "message": self.command}, 405
         )
 
-    do_POST = refuse
+    def fail(self, code, message):
+        self.reply(
+            {"statusCode": 400, "statusName": "BAD_REQUEST", "code": code, "message": message}, 400
+        )
+
+    def do_POST(self):
+        rest = self.path.split("?")[0][len(PREFIX + "/sites/%s/" % SITE_ID) :]
+        if rest not in ("networks", "firewall/zones"):
+            return self.refuse()
+        self.record()
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        st = state()
+        if rest == "networks":
+            zone_id = body.get("zoneId")
+            if st["zones"] and zone_id not in [z["id"] for z in st["zones"]]:
+                return self.fail("api.network.validation.missing-zone-id", "zoneId must not be null")
+            obj = dict(body, id=next_id(st, "networks"), default=False)
+            obj["metadata"] = {"origin": "USER_DEFINED", "configurable": True}
+            st["networks"].append(obj)
+            if st["zones"]:
+                join_zone(st, zone_id, obj["id"])
+        else:
+            obj = dict(body, id=next_id(st, "zones"))
+            obj["metadata"] = {"origin": "USER_DEFINED", "configurable": True}
+            st["zones"].append(obj)
+            for network_id in list(obj.get("networkIds", [])):
+                join_zone(st, obj["id"], network_id)
+        save(st)
+        self.reply(obj, 201)
+
     do_PUT = refuse
     do_DELETE = refuse
     do_PATCH = refuse

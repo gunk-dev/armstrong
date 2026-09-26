@@ -153,10 +153,22 @@ string regex cannot express. A port it cannot parse fails the sync rather than
 being sent as 0.
 
 **Reconciliation runs in dependency order:** the mDNS proxy's service scope (see
-[mDNS proxy](#mdns-proxy)) → networks → firewall zones → wifi, firewall
-policies, DNS policies and DHCP reservations. Zones reference networks
-by name, and policies reference zones by name, so the ids exist by the time
-they are needed.
+[mDNS proxy](#mdns-proxy)) → new firewall zones → networks → zone membership →
+wifi, firewall policies, DNS policies and DHCP reservations. Zones reference
+networks by name, and policies reference zones by name, so the ids exist by
+the time they are needed.
+
+On a console with the zone-based firewall, the console creates a network only
+into a zone, so each network the run creates must be listed in exactly one
+`firewallZones` entry; an instance file that lists it in none, or in two, is
+refused before anything is written. A declared zone the console lacks is
+created first, holding its members that already exist; each new network is
+then created carrying its zone's id, which makes it a member. The zone pass
+that follows sees that membership in place, so a zone that only gains new
+networks plans `OK`, not `UPDATE`, and a created zone is printed once. A
+created zone that takes an existing network from another zone names the move
+on its `CREATE` line, and each such move counts towards `--max-changes` as an
+update.
 
 A policy may reference a zone the instance file does not declare: zone names
 are resolved against the live console, not against `firewallZones`.

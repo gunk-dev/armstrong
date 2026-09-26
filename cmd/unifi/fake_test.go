@@ -17,8 +17,9 @@ import (
 // It reproduces the behaviours cmd/unifi actually depends on, as recorded in
 // docs/unifi-api-notes.md: the API key header, offset/limit paging capped at
 // 200, list responses that are overviews rather than full objects,
-// server-assigned ids and metadata, and the 400 the zone-based firewall
-// endpoints return on a console still running the legacy firewall.
+// server-assigned ids and metadata, the 400 the zone-based firewall
+// endpoints return on a console still running the legacy firewall, and, on a
+// console running it, the 400 a network create without a zoneId gets.
 type fakeConsole struct {
 	*httptest.Server
 
@@ -110,6 +111,10 @@ const (
 	collZones    = "firewall/zones"
 	collPolicies = "firewall/policies"
 )
+
+// codeMissingZoneID is the error a console running the zone-based firewall
+// returns from POST /networks when the body carries no valid zoneId.
+const codeMissingZoneID = "api.network.validation.missing-zone-id"
 
 func newFakeConsole(t *testing.T) *fakeConsole {
 	t.Helper()
@@ -355,7 +360,18 @@ func (f *fakeConsole) handleCollection(w http.ResponseWriter, r *http.Request, r
 				body["ttlSeconds"] = float64(0)
 			}
 		}
+		zoneID, _ := body["zoneId"].(string)
+		if coll == collNetworks && f.zbfConfigured && f.coll[collZones].byID[zoneID] == nil {
+			f.fail(w, http.StatusBadRequest, codeMissingZoneID, "zoneId must not be null")
+			return
+		}
 		newID := f.insert(coll, originUser, body)
+		switch {
+		case coll == collNetworks && f.zbfConfigured:
+			f.joinZoneLocked(zoneID, newID)
+		case coll == collZones:
+			f.claimNetworksLocked(newID)
+		}
 		w.WriteHeader(http.StatusCreated)
 		writeJSON(w, c.byID[newID])
 
@@ -381,6 +397,13 @@ func (f *fakeConsole) handleCollection(w http.ResponseWriter, r *http.Request, r
 			updated[k] = v
 		}
 		c.byID[id] = updated
+		zoneID, _ := body["zoneId"].(string)
+		switch {
+		case coll == collZones:
+			f.claimNetworksLocked(id)
+		case coll == collNetworks && f.coll[collZones].byID[zoneID] != nil:
+			f.joinZoneLocked(zoneID, id)
+		}
 		writeJSON(w, updated)
 
 	case r.Method == http.MethodDelete:
@@ -396,6 +419,44 @@ func (f *fakeConsole) handleCollection(w http.ResponseWriter, r *http.Request, r
 		w.Header().Set("Allow", "GET, POST")
 		f.fail(w, http.StatusMethodNotAllowed, "api.method-not-allowed", r.Method)
 	}
+}
+
+// joinZoneLocked makes network netID a member of zone zoneID, and of no other
+// zone: the console keeps a network's zoneId and its zone's networkIds in step.
+func (f *fakeConsole) joinZoneLocked(zoneID, netID string) {
+	for id, zone := range f.coll[collZones].byID {
+		members := zoneMembers(zone)
+		members = remove(members, netID)
+		if id == zoneID {
+			members = append(members, netID)
+		}
+		zone["networkIds"] = members
+	}
+	if net := f.coll[collNetworks].byID[netID]; net != nil {
+		net["zoneId"] = zoneID
+	}
+}
+
+// claimNetworksLocked moves every network a zone write listed into that zone.
+func (f *fakeConsole) claimNetworksLocked(zoneID string) {
+	for _, netID := range zoneMembers(f.coll[collZones].byID[zoneID]) {
+		f.joinZoneLocked(zoneID, netID)
+	}
+}
+
+func zoneMembers(zone map[string]any) []string {
+	var out []string
+	switch ids := zone["networkIds"].(type) {
+	case []string:
+		out = append(out, ids...)
+	case []any:
+		for _, v := range ids {
+			if id, ok := v.(string); ok {
+				out = append(out, id)
+			}
+		}
+	}
+	return out
 }
 
 func (f *fakeConsole) handleOrdering(w http.ResponseWriter, r *http.Request, raw []byte) {
