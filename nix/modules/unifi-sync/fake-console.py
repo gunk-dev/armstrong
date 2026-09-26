@@ -13,12 +13,15 @@ Two things make it a useful test double rather than a mock:
   * every request is appended to a log, including its method, so the test can
     assert that a diff-mode run issued no POST/PUT/DELETE.
 
-The only writes it serves are creates of networks and firewall zones, with the
-console's rule between them: while it has zones, `POST /networks` without the
-id of one of them answers 400 `api.network.validation.missing-zone-id`, and a
-created network joins that zone's `networkIds`. Every other write is answered
-405 rather than being quietly accepted, so a tool that tried one would fail
-loudly instead of looking like it had nothing to do.
+The only writes it serves are creates of networks, firewall zones and firewall
+policies, with the console's rules for them: while it has zones, `POST
+/networks` without the id of one of them answers 400
+`api.network.validation.missing-zone-id`, and a created network joins that
+zone's `networkIds`. A policy's protocol filter spells TCP_UDP only as a PRESET:
+as a NAMED_PROTOCOL it answers 400 `api.request.unknown-type-id`, and a PRESET
+carrying `matchOpposite` answers 400 `api.request.unknown-property`. Every other
+write is answered 405 rather than being quietly accepted, so a tool that tried
+one would fail loudly instead of looking like it had nothing to do.
 """
 
 import json
@@ -47,9 +50,28 @@ def save(st):
 
 def next_id(st, kind):
     """A fresh id in the fixture's `<kind>-NNN` style."""
-    prefix = {"networks": "network", "zones": "zone"}[kind]
+    prefix = {"networks": "network", "zones": "zone", "policies": "policy"}[kind]
     taken = [int(o["id"].rsplit("-", 1)[1]) for o in st[kind] if o["id"].startswith(prefix + "-")]
     return "%s-%03d" % (prefix, max(taken, default=0) + 1)
+
+
+def protocol_filter_fault(body):
+    """The (code, message) a live console answers for a policy's protocol
+    filter, or None if it accepts it."""
+    f = body.get("ipProtocolScope", {}).get("protocolFilter")
+    if not f:
+        return None
+    if f.get("type") == "NAMED_PROTOCOL" and f.get("protocol", {}).get("name") == "TCP_UDP":
+        return (
+            "api.request.unknown-type-id",
+            "Invalid $.ipProtocolScope.protocolFilter.type value 'TCP_UDP' (valid values: '')",
+        )
+    if f.get("type") == "PRESET" and "matchOpposite" in f:
+        return (
+            "api.request.unknown-property",
+            "Unknown request body property '$.ipProtocolScope.protocolFilter.matchOpposite'",
+        )
+    return None
 
 
 def join_zone(st, zone_id, network_id):
@@ -174,7 +196,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         rest = self.path.split("?")[0][len(PREFIX + "/sites/%s/" % SITE_ID) :]
-        if rest not in ("networks", "firewall/zones"):
+        if rest not in ("networks", "firewall/zones", "firewall/policies"):
             return self.refuse()
         self.record()
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
@@ -188,6 +210,13 @@ class Handler(BaseHTTPRequestHandler):
             st["networks"].append(obj)
             if st["zones"]:
                 join_zone(st, zone_id, obj["id"])
+        elif rest == "firewall/policies":
+            fault = protocol_filter_fault(body)
+            if fault:
+                return self.fail(*fault)
+            obj = dict(body, id=next_id(st, "policies"), index=len(st["policies"]))
+            obj["metadata"] = {"origin": "USER_DEFINED", "configurable": True}
+            st["policies"].append(obj)
         else:
             obj = dict(body, id=next_id(st, "zones"))
             obj["metadata"] = {"origin": "USER_DEFINED", "configurable": True}

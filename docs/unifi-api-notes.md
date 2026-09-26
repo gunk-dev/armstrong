@@ -211,7 +211,8 @@ source|destination: {
   }
 },
 ipProtocolScope: {ipVersion: "IPV4"|"IPV6"|"IPV4_AND_IPV6",
-                  protocolFilter: {type: "NAMED_PROTOCOL", protocol: {name: "UDP"}, matchOpposite}},
+                  protocolFilter: {type: "NAMED_PROTOCOL", protocol: {name: "UDP"}, matchOpposite}
+                                | {type: "PRESET", preset: {name: "TCP_UDP"}}},
 connectionStateFilter: ["NEW"|"INVALID"|"ESTABLISHED"|"RELATED"],
 loggingEnabled,
 schedule: {mode: "EVERY_DAY"|"CUSTOM"|…,
@@ -222,8 +223,9 @@ schedule: {mode: "EVERY_DAY"|"CUSTOM"|…,
 Corrections to what this file previously guessed:
 
 - port items carry **`value`**, not `port` / `startPort` / `endPort`;
-- the protocol filter is `{type: "NAMED_PROTOCOL", protocol: {name}}`, not
+- a single protocol is `{type: "NAMED_PROTOCOL", protocol: {name}}`, not
   `{type: "NAMED", name}`, and the name is upper-case (`UDP`, `ICMPV6`);
+  TCP-or-UDP is a different shape, a `PRESET` (see below);
 - there is an `ipAddressFilter` and an `applicationFilter` and a
   `macAddressFilter`, and both endpoints of one policy can carry several
   filters at once (`Allow mDNS` matches an IP set *and* a port);
@@ -234,6 +236,40 @@ Corrections to what this file previously guessed:
 `PORT_NUMBER_RANGE` was not present on the console. `cmd/unifi` renders a
 `"8000-8100"` range as `{"type":"PORT_NUMBER_RANGE","value":"8000-8100"}` by
 analogy with `PORT_NUMBER`; that is still **inferred**.
+
+#### The protocol filter is a NAMED_PROTOCOL or a PRESET
+
+A live `GET /firewall/policies` on 10.6.106 (168 policies) shows two shapes of
+`ipProtocolScope.protocolFilter`:
+
+```
+{"type":"NAMED_PROTOCOL","protocol":{"name":"UDP"},"matchOpposite":false}   // also TCP, ICMP, ICMPV6
+{"type":"PRESET","preset":{"name":"TCP_UDP"}}                                // SYSTEM_DEFINED "Allow DNS", "Allow Public DNS"
+```
+
+`TCP_UDP` is a preset, not a named protocol, and the PRESET objects carry no
+`matchOpposite`. `TCP_UDP` is the only preset seen. Sending it as a named
+protocol answers:
+
+```
+400 {"code":"api.request.unknown-type-id",
+     "message":"Invalid $.ipProtocolScope.protocolFilter.type value 'TCP_UDP' (valid values: '')"}
+```
+
+A PRESET cannot be negated. One bounded probe (a disabled BLOCK policy
+`Cameras -> Media`, no traffic filters) POSTed
+`{"type":"PRESET","preset":{"name":"TCP_UDP"},"matchOpposite":true}` and got:
+
+```
+400 {"code":"api.request.unknown-property",
+     "message":"Unknown request body property '$.ipProtocolScope.protocolFilter.matchOpposite'"}
+```
+
+Nothing was created. `cmd/unifi` sends `protocol: "TCP_UDP"` as the PRESET and
+reads a PRESET back as `protocol: <preset name>`. `schema/unifi.cue` rejects
+`protocol: "TCP_UDP"` with `protocolMatchOpposite: true`, and `cmd/unifi`
+refuses it before any write. To block everything except TCP and UDP, declare
+one policy per other protocol (`ICMP`, `ICMPV6`, …) instead.
 
 #### Names are not unique; (source zone, destination zone, name) is
 
