@@ -149,6 +149,20 @@ deliberately a separate decision from adopting the module. Whatever `mode` is,
 `unifi-plan` prints the plan without changing anything: it is always `sync
 --dry-run`.
 
+### Planning a PR
+
+`unifi-plan [INSTANCE_DIR]` plans the deployed instance by default. Given a
+directory, it plans that instead, so a change can be reviewed before merge
+applies it: check out the PR branch on the host, run
+
+```sh
+sudo unifi-plan ~/src/<repo>/net/unifi
+```
+
+and paste the output into the PR. The first stderr line names the tree that
+was planned. The directory is evaluated with this generation's schema and
+`unifi`, so a branch that also bumps armstrong is planned with the old tool.
+
 ### Options
 
 All under `modules.unifi-sync`:
