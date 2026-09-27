@@ -438,3 +438,11 @@ ExecStart = "${pkgs.writeShellScript "unifi-sync" ''
 
 with the API key and SSID passphrases supplied through
 `systemd`'s `LoadCredential=` or an `EnvironmentFile=` outside the store.
+
+`nixosModules.unifi-sync` packages that unit, plus `unifi-plan [INSTANCE_DIR]`,
+a `sync --dry-run` wrapper that loads the same secrets. With no argument it
+plans the deployed instance; to review a PR, check out its branch on the host,
+run `sudo unifi-plan <checkout>/<instance dir>` and paste the output into the
+PR. It plans with the deployed generation's schema and `unifi`, so a branch
+that bumps armstrong is planned with the old tool. See the README's
+[NixOS module](../README.md#nixos-module) section.

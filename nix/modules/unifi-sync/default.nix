@@ -48,10 +48,15 @@ let
   # Nothing armstrong owns is checked into the consumer's git tree:
   # `cue.mod/pkg/gunk.dev/armstrong` exists only in the store, built from the
   # same input as `package`.
+  # `dir` is a quoted shell word; shared with `unifi-plan DIR`'s runtime tree.
+  cueModule = dir: ''
+    mkdir -p ${dir}/cue.mod/pkg/gunk.dev
+    cp ${cfg.moduleFile} ${dir}/cue.mod/module.cue
+    ln -s ${cfg.schema}/cue.mod/pkg/gunk.dev/armstrong ${dir}/cue.mod/pkg/gunk.dev/armstrong
+  '';
+
   instanceTree = pkgs.runCommand "unifi-instance" { } ''
-    mkdir -p "$out/cue.mod/pkg/gunk.dev"
-    cp ${cfg.moduleFile} "$out/cue.mod/module.cue"
-    ln -s ${cfg.schema}/cue.mod/pkg/gunk.dev/armstrong "$out/cue.mod/pkg/gunk.dev/armstrong"
+    ${cueModule ''"$out"''}
     cp -r ${cfg.instance} "$out/instance"
   '';
 
@@ -78,8 +83,8 @@ let
   '';
 
   # The pipeline, shared by the unit and the `unifi-plan` wrapper. Both go
-  # through the same builder so a human's dry run cannot diverge from what the
-  # timer actually does.
+  # through the same export and argument list so a human's dry run cannot
+  # diverge from what the timer actually does.
   #
   # `unifi diff` exits 2 for "changes are needed" and 1 for "the command
   # failed"; the caller decides what to do with that, so nothing is swallowed
@@ -105,57 +110,91 @@ let
         export UNIFI_API_KEY
   '';
 
-  pipeline =
-    {
-      name,
-      args,
-      preamble ? "",
-    }:
-    pkgs.writeShellApplication {
-      inherit name;
-      runtimeInputs = [
-        pkgs.cue
-        cfg.package
-      ];
-      text = ''
-        ${connection}
+  pipe = args: ''
+    cue export ./instance --out json -e site \
+      | unifi ${lib.escapeShellArgs args}
+  '';
 
-        ${preamble}
+  runtimeInputs = [
+    pkgs.cue
+    cfg.package
+  ];
 
-        cd ${instanceTree}
-        cue export ./instance --out json -e site \
-          | unifi ${lib.escapeShellArgs args}
-      '';
-    };
-
-  syncScript = pipeline {
+  # Always `cd ${instanceTree}`: the unit runs exactly the tree the host
+  # converged to, never a path on disk.
+  syncScript = pkgs.writeShellApplication {
     name = "unifi-sync-run";
-    args = [
-      cfg.mode
-      "--max-changes"
-      (toString cfg.maxChanges)
-    ]
-    ++ lib.optional cfg.prune "--prune"
-    ++ lib.optionals (cfg.mode == "sync") [
-      "--snapshot-dir"
-      cfg.snapshotDir
-      "--snapshot-keep"
-      (toString cfg.snapshotKeep)
-    ];
+    inherit runtimeInputs;
+    text = ''
+      ${connection}
+
+      cd ${instanceTree}
+      ${pipe (
+        [
+          cfg.mode
+          "--max-changes"
+          (toString cfg.maxChanges)
+        ]
+        ++ lib.optional cfg.prune "--prune"
+        ++ lib.optionals (cfg.mode == "sync") [
+          "--snapshot-dir"
+          cfg.snapshotDir
+          "--snapshot-keep"
+          (toString cfg.snapshotKeep)
+        ]
+      )}
+    '';
   };
 
   # What a human runs to see the plan. Always `sync --dry-run`, whatever `mode`
   # is set to, so asking "what would change?" can never change anything.
-  planScript = pipeline {
+  # `unifi-plan DIR`: plan DIR (e.g. a PR checkout) in a temp tree laid out
+  # like `instanceTree`, with this generation's schema and binary.
+  planScript = pkgs.writeShellApplication {
     name = "unifi-plan";
-    preamble = loadSecrets;
-    args = [
-      "sync"
-      "--dry-run"
-      "--max-changes"
-      (toString cfg.maxChanges)
-    ]
-    ++ lib.optional cfg.prune "--prune";
+    inherit runtimeInputs;
+    text = ''
+      usage() { echo "usage: unifi-plan [INSTANCE_DIR]"; }
+      if [ $# -gt 1 ]; then
+        usage >&2
+        exit 64
+      fi
+      case "''${1:-}" in
+        -h | --help) usage; exit 0 ;;
+      esac
+      if [ $# -eq 1 ] && ! { [ -d "$1" ] && [ -r "$1" ] && [ -x "$1" ]; }; then
+        echo "unifi-plan: not a readable directory: $1" >&2
+        usage >&2
+        exit 64
+      fi
+
+      if [ $# -eq 1 ]; then
+        src=$(realpath -- "$1")
+        tree=$(mktemp -d -t unifi-plan.XXXXXX)
+        trap 'rm -rf "$tree"' EXIT
+        ${cueModule ''"$tree"''}
+        cp -R --no-preserve=mode -- "$src" "$tree/instance"
+        echo "unifi-plan: planning $src" >&2
+        echo "unifi-plan: with this generation's schema and unifi; a branch bumping armstrong is planned with the old tool" >&2
+      else
+        tree=${instanceTree}
+        echo "unifi-plan: planning deployed ${instanceTree}/instance" >&2
+      fi
+
+      ${connection}
+      ${loadSecrets}
+
+      cd "$tree"
+      ${pipe (
+        [
+          "sync"
+          "--dry-run"
+          "--max-changes"
+          (toString cfg.maxChanges)
+        ]
+        ++ lib.optional cfg.prune "--prune"
+      )}
+    '';
   };
 
   # Puts the site back to a snapshot: `unifi-restore [--dry-run] [--prune

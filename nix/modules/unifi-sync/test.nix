@@ -193,6 +193,13 @@ let
       ];
     }
   );
+  # test-instance plus one DNS record: what `unifi-plan DIR` plans for a PR.
+  prInstance = pkgs.runCommand "pr-instance" { } ''
+    cp -r ${./test-instance} $out
+    chmod -R u+w $out
+    substituteInPlace $out/site.cue --replace-fail 'dnsPolicies: [' 'dnsPolicies: [
+      {type: "A_RECORD", enabled: true, domain: "pr.test.invalid", ipv4Address: "10.0.0.6", ttlSeconds: 0},'
+  '';
   zonelessNetwork = pkgs.writeText "zoneless-network.json" (
     builtins.toJSON {
       name = "Nowhere";
@@ -323,6 +330,30 @@ pkgs.testers.runNixOSTest {
       assert "OK     wifi           test-ssid" in plan, plan
       assert "UPDATE dns policy     A_RECORD host.test.invalid" in plan, plan
       assert writes() == [], f"unifi-plan issued writes: {writes()}"
+      assert "pr.test.invalid" not in plan, plan
+
+      # `unifi-plan DIR` plans a tree that is not deployed, e.g. a PR checkout,
+      # with the same secrets: still OK wifi, still no writes.
+      machine.succeed("cp -r ${prInstance} /tmp/pr && chmod -R a-w /tmp/pr")
+      plan = machine.succeed("unifi-plan /tmp/pr 2>&1")
+      assert "planning /tmp/pr" in plan, plan
+      assert "CREATE dns policy     A_RECORD pr.test.invalid" in plan, plan
+      assert "OK     wifi           test-ssid" in plan, plan
+      # Relative to the caller's cwd, and the temp tree is cleaned up.
+      plan = machine.succeed("cd /tmp && unifi-plan ./pr 2>&1")
+      assert "planning /tmp/pr" in plan, plan
+      assert "CREATE dns policy     A_RECORD pr.test.invalid" in plan, plan
+      machine.fail("ls -d /tmp/unifi-plan.*")
+      assert "planning deployed /nix/store/" in machine.succeed("unifi-plan 2>&1 >/dev/null")
+      assert writes() == [], f"unifi-plan DIR issued writes: {writes()}"
+
+      # Anything but one readable directory is a usage error, before any request.
+      machine.succeed("truncate -s 0 /var/lib/fake-console/requests.log")
+      for bad in ["/tmp/nonexistent", "/tmp/pr/site.cue", "/tmp/pr /tmp/pr", "--help /tmp/pr"]:
+          status, out = machine.execute(f"unifi-plan {bad} 2>&1")
+          assert status == 64 and "usage: unifi-plan" in out, (bad, status, out)
+      assert "usage: unifi-plan" in machine.succeed("unifi-plan --help")
+      assert machine.succeed("cat /var/lib/fake-console/requests.log") == "", "bad argument reached the console"
 
       # ------------------------------------------------------------ zone rule
       # The fake enforces the console's rule directly: a network create without
