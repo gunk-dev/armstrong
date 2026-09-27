@@ -349,7 +349,7 @@ pkgs.testers.runNixOSTest {
 
       # Anything but one readable directory is a usage error, before any request.
       machine.succeed("truncate -s 0 /var/lib/fake-console/requests.log")
-      for bad in ["/tmp/nonexistent", "/tmp/pr/site.cue", "/tmp/pr /tmp/pr"]:
+      for bad in ["/tmp/nonexistent", "/tmp/pr/site.cue", "/tmp/pr /tmp/pr", "--help /tmp/pr"]:
           status, out = machine.execute(f"unifi-plan {bad} 2>&1")
           assert status == 64 and "usage: unifi-plan" in out, (bad, status, out)
       assert "usage: unifi-plan" in machine.succeed("unifi-plan --help")

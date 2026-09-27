@@ -155,11 +155,15 @@ let
     inherit runtimeInputs;
     text = ''
       usage() { echo "usage: unifi-plan [INSTANCE_DIR]"; }
+      if [ $# -gt 1 ]; then
+        usage >&2
+        exit 64
+      fi
       case "''${1:-}" in
         -h | --help) usage; exit 0 ;;
       esac
-      if [ $# -gt 1 ] || { [ $# -eq 1 ] && ! { [ -d "$1" ] && [ -r "$1" ] && [ -x "$1" ]; }; }; then
-        [ $# -eq 1 ] && echo "unifi-plan: not a readable directory: $1" >&2
+      if [ $# -eq 1 ] && ! { [ -d "$1" ] && [ -r "$1" ] && [ -x "$1" ]; }; then
+        echo "unifi-plan: not a readable directory: $1" >&2
         usage >&2
         exit 64
       fi
