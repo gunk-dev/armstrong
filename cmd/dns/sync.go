@@ -147,9 +147,29 @@ func syncZones(client porkbunMutator, zones []dnsInput, prune, dryRun bool, out 
 	return nil
 }
 
+// syncOp is one line of a zone's sync plan: an OK, or a write and the text
+// that announces it. write is nil for OK.
+type syncOp struct {
+	line  string
+	write func() error
+}
+
+// syncRecords converges one zone. It plans every create, update and delete
+// before making any write, refuses a plan that would break the CNAME rule
+// (RFC 1034: a CNAME cannot coexist with any other record at its name), and
+// then runs the writes in an order where no create meets a conflicting record:
+//
+//  1. deletes that clear a name for a create that conflicts with them — the
+//     pruned records at a name that gains a CNAME, and a pruned CNAME at a
+//     name that gains any other record;
+//  2. creates and updates, in input order;
+//  3. every other delete, so an ordinary content change keeps its old record
+//     until the new one exists.
+//
+// --dry-run prints the same lines in the same order without writing.
 func syncRecords(client porkbunMutator, input dnsInput, prune, dryRun bool, out io.Writer) error {
-	if dryRun {
-		fmt.Fprintln(out, "DRY RUN — no changes will be made")
+	if err := checkDesiredCNAMEs(input.Records); err != nil {
+		return fmt.Errorf("%s: %w", input.Domain, err)
 	}
 
 	existing, err := client.retrieve(input.Domain)
@@ -157,7 +177,6 @@ func syncRecords(client porkbunMutator, input dnsInput, prune, dryRun bool, out 
 		return err
 	}
 
-	// Build lookup of existing records: key -> []porkbunRecord
 	type recordKey struct {
 		Type    string
 		Name    string
@@ -175,7 +194,8 @@ func syncRecords(client porkbunMutator, input dnsInput, prune, dryRun bool, out 
 	// Track which existing records are accounted for
 	matched := map[string]bool{} // by record ID
 
-	// Create or update desired records
+	var upserts []syncOp
+	var creates []dnsRecord
 	for _, want := range input.Records {
 		key := recordKey{Type: want.Type, Name: want.Name, Content: normalizeContent(want.Type, want.Content)}
 		if got, ok := existingByKey[key]; ok {
@@ -188,7 +208,6 @@ func syncRecords(client porkbunMutator, input dnsInput, prune, dryRun bool, out 
 				wantPrio = *want.Priority
 			}
 			if gotTTL != want.TTL || (want.Priority != nil && gotPrio != wantPrio) {
-				fmt.Fprintf(out, "UPDATE %s %s -> %s (ttl=%d%s)\n", want.Type, displayName(want.Name), want.Content, want.TTL, prioSuffix(want.Priority))
 				req := editRequest{
 					Content: want.Content,
 					TTL:     strconv.Itoa(want.TTL),
@@ -196,16 +215,20 @@ func syncRecords(client porkbunMutator, input dnsInput, prune, dryRun bool, out 
 				if want.Priority != nil {
 					req.Priority = strconv.Itoa(*want.Priority)
 				}
-				if !dryRun {
-					if err := client.editByNameType(input.Domain, want.Type, want.Name, req); err != nil {
-						return fmt.Errorf("update %s %s: %w", want.Type, displayName(want.Name), err)
-					}
-				}
+				upserts = append(upserts, syncOp{
+					line: fmt.Sprintf("UPDATE %s %s -> %s (ttl=%d%s)", want.Type, displayName(want.Name), want.Content, want.TTL, prioSuffix(want.Priority)),
+					write: func() error {
+						if err := client.editByNameType(input.Domain, want.Type, want.Name, req); err != nil {
+							return fmt.Errorf("update %s %s: %w", want.Type, displayName(want.Name), err)
+						}
+						return nil
+					},
+				})
 			} else {
-				fmt.Fprintf(out, "OK     %s %s -> %s\n", want.Type, displayName(want.Name), want.Content)
+				upserts = append(upserts, syncOp{line: fmt.Sprintf("OK     %s %s -> %s", want.Type, displayName(want.Name), want.Content)})
 			}
 		} else {
-			fmt.Fprintf(out, "CREATE %s %s -> %s (ttl=%d%s)\n", want.Type, displayName(want.Name), want.Content, want.TTL, prioSuffix(want.Priority))
+			creates = append(creates, want)
 			req := createRequest{
 				Type:    want.Type,
 				Name:    want.Name,
@@ -215,38 +238,115 @@ func syncRecords(client porkbunMutator, input dnsInput, prune, dryRun bool, out 
 			if want.Priority != nil {
 				req.Priority = strconv.Itoa(*want.Priority)
 			}
-			if !dryRun {
-				if err := client.create(input.Domain, req); err != nil {
-					return fmt.Errorf("create %s %s: %w", want.Type, displayName(want.Name), err)
-				}
+			upserts = append(upserts, syncOp{
+				line: fmt.Sprintf("CREATE %s %s -> %s (ttl=%d%s)", want.Type, displayName(want.Name), want.Content, want.TTL, prioSuffix(want.Priority)),
+				write: func() error {
+					if err := client.create(input.Domain, req); err != nil {
+						return fmt.Errorf("create %s %s: %w", want.Type, displayName(want.Name), err)
+					}
+					return nil
+				},
+			})
+		}
+	}
+
+	// prunable reports whether --prune deletes r: every unmatched record
+	// except NS, SOA and preview-*.
+	prunable := func(r porkbunRecord) bool {
+		if matched[r.ID] || r.Type == "NS" || r.Type == "SOA" {
+			return false
+		}
+		return !strings.HasPrefix(stripDomain(r.Name, input.Domain), "preview-")
+	}
+	pruned := map[string]bool{} // by record ID
+	if prune {
+		for _, r := range existing {
+			if prunable(r) {
+				pruned[r.ID] = true
 			}
 		}
 	}
 
-	// Prune records not in desired state
-	if prune {
+	// Every create that meets a conflicting existing record needs that record
+	// deleted first. If the plan doesn't delete it, refuse before any write.
+	early := map[string]bool{} // by record ID
+	for _, want := range creates {
 		for _, r := range existing {
-			if matched[r.ID] {
-				continue
-			}
-			// Never prune NS or SOA
-			if r.Type == "NS" || r.Type == "SOA" {
-				continue
-			}
-			// Never prune preview-* records
 			name := stripDomain(r.Name, input.Domain)
-			if strings.HasPrefix(name, "preview-") {
+			if !cnameConflict(want.Type, want.Name, r.Type, name) {
 				continue
 			}
-			fmt.Fprintf(out, "DELETE %s %s -> %s (id=%s)\n", r.Type, displayName(name), r.Content, r.ID)
-			if !dryRun {
+			if !pruned[r.ID] {
+				hint := ""
+				if !prune && prunable(r) {
+					hint = " (run with --prune to replace it)"
+				}
+				return fmt.Errorf("%s: CNAME conflict: desired %s %s -> %s conflicts with existing %s %s -> %s (id=%s), which this sync would not delete%s",
+					input.Domain, want.Type, displayName(want.Name), want.Content, r.Type, displayName(name), r.Content, r.ID, hint)
+			}
+			early[r.ID] = true
+		}
+	}
+
+	var first, last []syncOp
+	for _, r := range existing {
+		if !pruned[r.ID] {
+			continue
+		}
+		op := syncOp{
+			line: fmt.Sprintf("DELETE %s %s -> %s (id=%s)", r.Type, displayName(stripDomain(r.Name, input.Domain)), r.Content, r.ID),
+			write: func() error {
 				if err := client.deleteByID(input.Domain, r.ID); err != nil {
 					return fmt.Errorf("delete %s (id=%s): %w", r.Type, r.ID, err)
 				}
-			}
+				return nil
+			},
+		}
+		if early[r.ID] {
+			first = append(first, op)
+		} else {
+			last = append(last, op)
 		}
 	}
 
+	if dryRun {
+		fmt.Fprintln(out, "DRY RUN — no changes will be made")
+	}
+	for _, phase := range [][]syncOp{first, upserts, last} {
+		for _, op := range phase {
+			fmt.Fprintln(out, op.line)
+			if dryRun || op.write == nil {
+				continue
+			}
+			if err := op.write(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// cnameConflict reports whether records of these types and names can't
+// coexist: they share a name and at least one of them is a CNAME.
+func cnameConflict(typeA, nameA, typeB, nameB string) bool {
+	if !strings.EqualFold(nameA, nameB) {
+		return false
+	}
+	return typeA == "CNAME" || typeB == "CNAME"
+}
+
+// checkDesiredCNAMEs refuses a desired zone that itself breaks the CNAME rule:
+// a CNAME alongside any other record at the same name. The CUE schema checks
+// each record on its own, so this is the first place the rule can be checked.
+func checkDesiredCNAMEs(records []dnsRecord) error {
+	for i, a := range records {
+		for _, b := range records[i+1:] {
+			if cnameConflict(a.Type, a.Name, b.Type, b.Name) {
+				return fmt.Errorf("CNAME conflict in desired records: %s %s -> %s and %s %s -> %s share a name",
+					a.Type, displayName(a.Name), a.Content, b.Type, displayName(b.Name), b.Content)
+			}
+		}
+	}
 	return nil
 }
 
