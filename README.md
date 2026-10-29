@@ -266,7 +266,7 @@ A CLI tool (`cmd/dns/`) that manages DNS records via the Porkbun API. It can man
 
 Commands:
 
-- `dns sync` — Reads a JSON DNS definition from stdin and converges Porkbun records to match. Use `--prune` to delete records not in the definition (skips NS, SOA, and preview-* records). Pass `--dry-run` to print the planned changes without calling the Porkbun API.
+- `dns sync` — Reads a JSON DNS definition from stdin and converges Porkbun records to match. Use `--prune` to delete records not in the definition (skips NS, SOA, and preview-* records). Pass `--dry-run` to print the planned changes without calling the Porkbun API. Sync plans the whole zone before any write and orders the writes around the CNAME rule (a CNAME can't share its name with another record): with `--prune`, the records it replaces are deleted before the CNAME is created, and a pruned CNAME before the records replacing it; every other delete runs last. A desired zone that breaks the rule, or a create that conflicts with a record the sync won't delete (without `--prune`, or an NS, SOA or preview-* record), is refused before any write. `--dry-run` prints the writes in the order they'd run.
 - `dns preview create <app> <pr-number>` — Creates a preview CNAME record for PR environments (gunk.dev only).
 - `dns preview delete <app> <pr-number>` — Deletes a preview CNAME record.
 
