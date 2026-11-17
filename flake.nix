@@ -22,13 +22,29 @@
       # after a go.mod/go.sum change.
       vendorHash = "sha256-7K17JaXFsjf163g5PXCb5ng2gYdotnZ2IDKk8KFjNj0=";
 
+      # Every Go derivation builds from the same source and module set. The
+      # vendored-module derivation is named without the revision, so it has one
+      # fixed-output store path: the modules are fetched once and shared by the
+      # packages and the checks, across commits, until vendorHash changes.
+      mkGo =
+        pkgs: args:
+        pkgs.buildGoModule (
+          {
+            inherit version vendorHash;
+            src = ./.;
+            overrideModAttrs = _: { name = "armstrong-go-modules"; };
+          }
+          // args
+        );
+
+      # The tests run once, in checks.go-test, rather than again in each
+      # package's checkPhase.
       mkTool =
         pkgs: name:
-        pkgs.buildGoModule {
+        mkGo pkgs {
           pname = name;
-          inherit version vendorHash;
-          src = ./.;
           subPackages = [ "cmd/${name}" ];
+          doCheck = false;
           meta = {
             description = "armstrong ${name} CLI";
             mainProgram = name;
@@ -37,21 +53,29 @@
         };
 
       # A derivation that runs `cmd` in a configured Go build environment and
-      # succeeds by producing an empty $out.
+      # succeeds by producing an empty $out. cue is on PATH because the unifi
+      # tests shell out to it to check the schema's own rules, and skip without
+      # it.
       mkGoCheck =
         pkgs: name: cmd:
-        pkgs.buildGoModule {
+        mkGo pkgs {
           pname = "armstrong-${name}";
-          inherit version vendorHash;
-          src = ./.;
+          nativeBuildInputs = [ pkgs.cue ];
           buildPhase = ''
             runHook preBuild
+            export CUE_CACHE_DIR=$TMPDIR/cue
             ${cmd}
             runHook postBuild
           '';
           doCheck = false;
           installPhase = "touch $out";
         };
+
+      # .github alone, so the workflow linters rebuild only when it changes.
+      githubSrc = nixpkgs.lib.fileset.toSource {
+        root = ./.;
+        fileset = ./.github;
+      };
     in
     {
       packages = forAllSystems (
@@ -183,6 +207,17 @@
             cp "$unit" $out
           '';
 
+        yamllint = pkgs.runCommand "armstrong-yamllint" { nativeBuildInputs = [ pkgs.yamllint ]; } ''
+          yamllint -d "{extends: default, rules: {line-length: disable, truthy: disable}}" \
+            ${githubSrc}/.github/workflows
+          touch $out
+        '';
+
+        zizmor = pkgs.runCommand "armstrong-zizmor" { nativeBuildInputs = [ pkgs.zizmor ]; } ''
+          zizmor --offline ${githubSrc}
+          touch $out
+        '';
+
         nixfmt = pkgs.runCommand "armstrong-nixfmt" { nativeBuildInputs = [ pkgs.nixfmt ]; } ''
           find ${self} -name '*.nix' -print0 | xargs -0 nixfmt --check
           touch $out
@@ -200,6 +235,7 @@
         };
       });
 
-      formatter = forAllSystems (pkgs: pkgs.nixfmt);
+      # treefmt around nixfmt: `nix fmt` with no arguments formats the tree.
+      formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);
     };
 }

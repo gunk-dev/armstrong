@@ -24,7 +24,7 @@ Outputs, for `x86_64-linux` and `aarch64-linux`:
 | `packages.<system>.schema` | `schema/*.cue` laid out as a CUE module package path |
 | `devShells.<system>.default` | go, cue, nixfmt, gh |
 | `nixosModules.unifi-sync` | the NixOS unit that keeps a UniFi site converged (also `nixosModules.default`) |
-| `checks.<system>` | `go vet`, `go test ./...`, `cue vet ./schema`, `nixfmt --check`, a build of `examples/unifi` against `packages.schema`, and the `unifi-sync` module's VM test |
+| `checks.<system>` | everything CI tests: see [Running the checks](#running-the-checks) |
 
 ### The CLIs
 
@@ -235,6 +235,29 @@ write. It needs KVM, which GitHub-hosted `ubuntu-latest` runners have;
 `nix flake check` on a machine without `/dev/kvm` will not be able to build it.
 `checks.<system>.unifi-sync-eval` imports the module into a scratch
 `nixosSystem` and needs no VM.
+
+## Running the checks
+
+Every test and lint CI runs is a flake check that builds in the nix sandbox,
+with no network and no secrets. Build one by name:
+
+```sh
+nix build .#checks.x86_64-linux.go-test
+```
+
+| Check | Covers |
+| --- | --- |
+| `unifi`, `dns` | the CLIs build |
+| `go-test` | `go test ./...`, with `cue` on `PATH` so the schema-rule tests run |
+| `go-vet` | `go vet ./...` |
+| `schema` | `packages.schema` builds |
+| `cue-vet` | `cue vet ./schema` |
+| `schema-consumer` | `examples/unifi` evaluates against `packages.schema` |
+| `unifi-sync-eval` | the NixOS module evaluates and renders its unit |
+| `unifi-sync-vm` | the NixOS module's VM test (needs `/dev/kvm`) |
+| `nixfmt` | every `.nix` file is formatted |
+| `yamllint` | the workflow YAML lints clean |
+| `zizmor` | the workflows pass zizmor's offline audits |
 
 ## CUE Schemas
 
