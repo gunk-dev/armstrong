@@ -1,12 +1,14 @@
 # armstrong
 
-Platform schema and reusable deploy workflows for the gunk-dev org. Provides shared CUE schemas for Fly.io app configuration and GitHub Actions workflows for staging, production, and preview deployments.
+Platform schema and reusable deploy workflows for the gunk-dev org. Provides shared CUE schemas for
+Fly.io app configuration and GitHub Actions workflows for staging, production, and preview
+deployments.
 
 ## Consuming from Nix
 
-This repo is a flake, so a consumer gets the CLIs and the CUE schemas from one
-pinned input — no `flake = false`, no hand-maintained `vendorHash`, and no
-`.cue` files vendored into the consumer's git tree.
+This repo is a flake, so a consumer gets the CLIs and the CUE schemas from one pinned input — no
+`flake = false`, no hand-maintained `vendorHash`, and no `.cue` files vendored into the consumer's
+git tree.
 
 ```nix
 {
@@ -17,14 +19,15 @@ pinned input — no `flake = false`, no hand-maintained `vendorHash`, and no
 
 Outputs, for `x86_64-linux` and `aarch64-linux`:
 
-| Output | Contents |
-| --- | --- |
-| `packages.<system>.unifi` | the `unifi` CLI (also `packages.<system>.default`) |
-| `packages.<system>.dns` | the `dns` CLI |
-| `packages.<system>.schema` | `schema/*.cue` laid out as a CUE module package path |
-| `devShells.<system>.default` | go, cue, nixfmt, gh |
-| `nixosModules.unifi-sync` | the NixOS unit that keeps a UniFi site converged (also `nixosModules.default`) |
-| `checks.<system>` | everything CI tests: see [Running the checks](#running-the-checks) |
+| Output                       | Contents                                                                         |
+| ---------------------------- | -------------------------------------------------------------------------------- |
+| `packages.<system>.unifi`    | the `unifi` CLI (also `packages.<system>.default`)                               |
+| `packages.<system>.dns`      | the `dns` CLI                                                                    |
+| `packages.<system>.deploy`   | the `deploy` runner, with its pinned tools (see [Deploy Runner](#deploy-runner)) |
+| `packages.<system>.schema`   | `schema/*.cue` laid out as a CUE module package path                             |
+| `devShells.<system>.default` | go, cue, nixfmt, gh                                                              |
+| `nixosModules.unifi-sync`    | the NixOS unit that keeps a UniFi site converged (also `nixosModules.default`)   |
+| `checks.<system>`            | everything CI tests: see [Running the checks](#running-the-checks)               |
 
 ### The CLIs
 
@@ -45,14 +48,13 @@ Or reference the package directly:
 }
 ```
 
-To actually run `unifi` on a schedule, import
-[`nixosModules.unifi-sync`](#nixos-module) rather than writing the unit by
-hand.
+To actually run `unifi` on a schedule, import [`nixosModules.unifi-sync`](#nixos-module) rather than
+writing the unit by hand.
 
 ### The schema
 
-`packages.<system>.schema` is a derivation whose output is already shaped like a
-CUE module's package directory:
+`packages.<system>.schema` is a derivation whose output is already shaped like a CUE module's
+package directory:
 
 ```
 $out/cue.mod/pkg/gunk.dev/armstrong/VERSION       # the armstrong git rev, for provenance
@@ -60,8 +62,8 @@ $out/cue.mod/pkg/gunk.dev/armstrong/schema/*.cue
 ```
 
 So a consumer assembles its `cue.mod/pkg` at build time and keeps it out of git.
-`cue.mod/module.cue` stays in the consumer repo; only the vendored package tree
-comes from the flake:
+`cue.mod/module.cue` stays in the consumer repo; only the vendored package tree comes from the
+flake:
 
 ```nix
 { pkgs, inputs, ... }:
@@ -78,8 +80,8 @@ pkgs.runCommand "unifi-site.json" { nativeBuildInputs = [ pkgs.cue ]; } ''
 ''
 ```
 
-The consumer's `cue.mod/module.cue` must declare a `language: version` — `cue`
-refuses to resolve `cue.mod/pkg` without one.
+The consumer's `cue.mod/module.cue` must declare a `language: version` — `cue` refuses to resolve
+`cue.mod/pkg` without one.
 
 The consumer's CUE then imports the schemas by module path as usual:
 
@@ -89,26 +91,25 @@ import "gunk.dev/armstrong/schema"
 site: schema.#Site & { /* ... */ }
 ```
 
-Bumping the schemas is `nix flake update armstrong` — the CLIs and the CUE
-definitions move together, and `VERSION` records which rev is in use.
+Bumping the schemas is `nix flake update armstrong` — the CLIs and the CUE definitions move
+together, and `VERSION` records which rev is in use.
 
 ## NixOS module
 
-`nixosModules.unifi-sync` is the actuator for `#Site`: a hardened oneshot that
-runs the same pipeline a human runs by hand —
+`nixosModules.unifi-sync` is the actuator for `#Site`: a hardened oneshot that runs the same
+pipeline a human runs by hand —
 
 ```sh
 cue export ./instance --out json -e site | unifi <diff|sync> [--prune]
 ```
 
-— plus a daily drift timer and a `unifi-plan` wrapper on `PATH`. It is meant
-for a **LAN host**: the console is only reachable on the local network.
+— plus a daily drift timer and a `unifi-plan` wrapper on `PATH`. It is meant for a **LAN host**: the
+console is only reachable on the local network.
 
-`instance` is a path inside *your* flake, so it is copied to the store at build
-time and the unit runs against the exact tree the host converged to — there is
-no second copy of the desired state on the machine to drift from the
-repository. The schema the instance is validated against and the binary that
-consumes the export both come from the pinned `armstrong` input, so they cannot
+`instance` is a path inside _your_ flake, so it is copied to the store at build time and the unit
+runs against the exact tree the host converged to — there is no second copy of the desired state on
+the machine to drift from the repository. The schema the instance is validated against and the
+binary that consumes the export both come from the pinned `armstrong` input, so they cannot
 disagree.
 
 ### Minimal host
@@ -132,9 +133,8 @@ disagree.
 }
 ```
 
-That host is in **diff mode**: it never writes. `unifi diff` exits 2 when the
-plan is non-empty, so drift leaves `unifi-sync.service` failed with the plan
-itself in the journal:
+That host is in **diff mode**: it never writes. `unifi diff` exits 2 when the plan is non-empty, so
+drift leaves `unifi-sync.service` failed with the plan itself in the journal:
 
 ```console
 $ systemctl status unifi-sync
@@ -144,120 +144,115 @@ UPDATE network        Default (mdnsForwardingEnabled)
 UPDATE dns policy     A_RECORD host.example.invalid
 ```
 
-Turning the detector into an actuator is one line — `mode = "sync"` — and is
-deliberately a separate decision from adopting the module. Whatever `mode` is,
-`unifi-plan` prints the plan without changing anything: it is always `sync
---dry-run`.
+Turning the detector into an actuator is one line — `mode = "sync"` — and is deliberately a separate
+decision from adopting the module. Whatever `mode` is, `unifi-plan` prints the plan without changing
+anything: it is always `sync --dry-run`.
 
 ### Planning a PR
 
-`unifi-plan [INSTANCE_DIR]` plans the deployed instance by default. Given a
-directory, it plans that instead, so a change can be reviewed before merge
-applies it: check out the PR branch on the host, run
+`unifi-plan [INSTANCE_DIR]` plans the deployed instance by default. Given a directory, it plans that
+instead, so a change can be reviewed before merge applies it: check out the PR branch on the host,
+run
 
 ```sh
 sudo unifi-plan ~/src/<repo>/net/unifi
 ```
 
-and paste the output into the PR. The first stderr line names the tree that
-was planned. The directory is evaluated with this generation's schema and
-`unifi`, so a branch that also bumps armstrong is planned with the old tool.
+and paste the output into the PR. The first stderr line names the tree that was planned. The
+directory is evaluated with this generation's schema and `unifi`, so a branch that also bumps
+armstrong is planned with the old tool.
 
 ### Options
 
 All under `modules.unifi-sync`:
 
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `enable` | `false` | Install the unit and the timer. |
-| `consoleUrl` | — | Base URL of the console; the Integration API lives under `/proxy/network/integration/v1` on it. |
-| `site` | `"Default"` | Site name, as shown in the console's site list. |
-| `instance` | — | CUE package directory holding `site: schema.#Site & {…}`. |
-| `mode` | `"diff"` | `diff` never writes and fails on drift; `sync` applies the plan. |
-| `prune` | `false` | Delete `USER_DEFINED` objects the instance file does not declare. |
-| `apiKeyFile` | — | File holding the Integration API key. Reaches the unit as a systemd credential. |
-| `secretsFile` | `null` | `EnvironmentFile` of SSID passphrases, one `NAME=value` per `passphraseEnv`. |
-| `caFile` | `null` | PEM bundle pinning the console's certificate (`UNIFI_CA_FILE`). |
-| `insecureTls` | `false` | Skip certificate verification instead (`UNIFI_INSECURE_TLS=1`). |
-| `onSuccessOf` | `[ ]` | Unit names (no `.service`) whose success triggers a run. |
-| `after` | `[ "network-online.target" ]` | `After=` for the unit; the default target also gets a matching `Wants=`. |
-| `wantedBy` | `[ ]` | `WantedBy=` for the unit. |
-| `checkAt` | `"05:30"` | `OnCalendar` for the daily drift check, or `null` for no timer. |
-| `package` | `packages.<system>.unifi` | The `unifi` build to run. |
-| `schema` | `packages.<system>.schema` | Where `gunk.dev/armstrong/schema` is resolved from. |
-| `moduleFile` | armstrong's own | The `cue.mod/module.cue` the store module is assembled around. |
+| Option        | Default                       | Meaning                                                                                         |
+| ------------- | ----------------------------- | ----------------------------------------------------------------------------------------------- |
+| `enable`      | `false`                       | Install the unit and the timer.                                                                 |
+| `consoleUrl`  | —                             | Base URL of the console; the Integration API lives under `/proxy/network/integration/v1` on it. |
+| `site`        | `"Default"`                   | Site name, as shown in the console's site list.                                                 |
+| `instance`    | —                             | CUE package directory holding `site: schema.#Site & {…}`.                                       |
+| `mode`        | `"diff"`                      | `diff` never writes and fails on drift; `sync` applies the plan.                                |
+| `prune`       | `false`                       | Delete `USER_DEFINED` objects the instance file does not declare.                               |
+| `apiKeyFile`  | —                             | File holding the Integration API key. Reaches the unit as a systemd credential.                 |
+| `secretsFile` | `null`                        | `EnvironmentFile` of SSID passphrases, one `NAME=value` per `passphraseEnv`.                    |
+| `caFile`      | `null`                        | PEM bundle pinning the console's certificate (`UNIFI_CA_FILE`).                                 |
+| `insecureTls` | `false`                       | Skip certificate verification instead (`UNIFI_INSECURE_TLS=1`).                                 |
+| `onSuccessOf` | `[ ]`                         | Unit names (no `.service`) whose success triggers a run.                                        |
+| `after`       | `[ "network-online.target" ]` | `After=` for the unit; the default target also gets a matching `Wants=`.                        |
+| `wantedBy`    | `[ ]`                         | `WantedBy=` for the unit.                                                                       |
+| `checkAt`     | `"05:30"`                     | `OnCalendar` for the daily drift check, or `null` for no timer.                                 |
+| `package`     | `packages.<system>.unifi`     | The `unifi` build to run.                                                                       |
+| `schema`      | `packages.<system>.schema`    | Where `gunk.dev/armstrong/schema` is resolved from.                                             |
+| `moduleFile`  | armstrong's own               | The `cue.mod/module.cue` the store module is assembled around.                                  |
 
-`package` and `schema` default to this flake's outputs, so the module works
-with nothing but an import; override them to run a different build of either.
-`moduleFile` exists because `cue` finds a module by walking up from the working
-directory, so the CUE module has to be reassembled in the store around
-`instance` rather than pointed at — set it to your repository's own
-`cue.mod/module.cue` if you want the instance evaluated under exactly the
-module identity and language version you use elsewhere.
+`package` and `schema` default to this flake's outputs, so the module works with nothing but an
+import; override them to run a different build of either. `moduleFile` exists because `cue` finds a
+module by walking up from the working directory, so the CUE module has to be reassembled in the
+store around `instance` rather than pointed at — set it to your repository's own
+`cue.mod/module.cue` if you want the instance evaluated under exactly the module identity and
+language version you use elsewhere.
 
-A console reached over `https` serves a certificate no public CA signed, so
-exactly one of `caFile` or `insecureTls` has to be set: an assertion fails the
-build otherwise, because silently pinning nothing is the failure mode a TLS
-option must never have.
+A console reached over `https` serves a certificate no public CA signed, so exactly one of `caFile`
+or `insecureTls` has to be set: an assertion fails the build otherwise, because silently pinning
+nothing is the failure mode a TLS option must never have.
 
 ### Secrets
 
 Two files, both outside the store, both typically agenix or sops-nix paths:
 
-- `apiKeyFile` — the Integration API key (Settings → Control Plane →
-  Integrations). It is passed as a systemd `LoadCredential`, never through the
-  unit's environment where anything able to read `/proc` could lift it.
-- `secretsFile` — an `EnvironmentFile` with one line per SSID passphrase, named
-  by the `passphraseEnv` of the matching `#WiFi`:
+- `apiKeyFile` — the Integration API key (Settings → Control Plane → Integrations). It is passed as
+  a systemd `LoadCredential`, never through the unit's environment where anything able to read
+  `/proc` could lift it.
+- `secretsFile` — an `EnvironmentFile` with one line per SSID passphrase, named by the
+  `passphraseEnv` of the matching `#WiFi`:
 
   ```sh
   # SSID passphrases, by passphraseEnv.
   UNIFI_PSK_HOME=correct-horse-battery
   ```
 
-  Required whenever the instance declares a non-OPEN SSID — `unifi` fails
-  rather than write an empty passphrase.
+  Required whenever the instance declares a non-OPEN SSID — `unifi` fails rather than write an empty
+  passphrase.
 
-`unifi-plan`, run by hand, reads both files directly, so it needs enough
-privilege to; run under `sudo` or it will report every SSID as needing a
-passphrase update (and say so on stderr).
+`unifi-plan`, run by hand, reads both files directly, so it needs enough privilege to; run under
+`sudo` or it will report every SSID as needing a passphrase update (and say so on stderr).
 
-The unit runs `DynamicUser`, `ProtectSystem=strict`, with an empty capability
-bounding set and no address families beyond `AF_UNIX`/`AF_INET`/`AF_INET6`: it
-talks to one endpoint and writes nothing to disk.
+The unit runs `DynamicUser`, `ProtectSystem=strict`, with an empty capability bounding set and no
+address families beyond `AF_UNIX`/`AF_INET`/`AF_INET6`: it talks to one endpoint and writes nothing
+to disk.
 
 ### Testing it
 
-`checks.<system>.unifi-sync-vm` boots a host running the real unit against a
-fake console and asserts that a clean site succeeds, a drifted site leaves the
-unit failed with the plan in the journal, and that neither run issues a single
-write. It needs KVM, which GitHub-hosted `ubuntu-latest` runners have;
-`nix flake check` on a machine without `/dev/kvm` will not be able to build it.
-`checks.<system>.unifi-sync-eval` imports the module into a scratch
-`nixosSystem` and needs no VM.
+`checks.<system>.unifi-sync-vm` boots a host running the real unit against a fake console and
+asserts that a clean site succeeds, a drifted site leaves the unit failed with the plan in the
+journal, and that neither run issues a single write. It needs KVM, which GitHub-hosted
+`ubuntu-latest` runners have; `nix flake check` on a machine without `/dev/kvm` will not be able to
+build it. `checks.<system>.unifi-sync-eval` imports the module into a scratch `nixosSystem` and
+needs no VM.
 
 ## Running the checks
 
-Every test and lint CI runs is a flake check that builds in the nix sandbox,
-with no network and no secrets. Build one by name:
+Every test and lint CI runs is a flake check that builds in the nix sandbox, with no network and no
+secrets. Build one by name:
 
 ```sh
 nix build .#checks.x86_64-linux.go-test
 ```
 
-| Check | Covers |
-| --- | --- |
-| `unifi`, `dns` | the CLIs build |
-| `go-test` | `go test ./...`, with `cue` on `PATH` so the schema-rule tests run |
-| `go-vet` | `go vet ./...` |
-| `schema` | `packages.schema` builds |
-| `cue-vet` | `cue vet ./schema` |
-| `schema-consumer` | `examples/unifi` evaluates against `packages.schema` |
-| `unifi-sync-eval` | the NixOS module evaluates and renders its unit |
-| `unifi-sync-vm` | the NixOS module's VM test (needs `/dev/kvm`) |
-| `nixfmt` | every `.nix` file is formatted |
-| `yamllint` | the workflow YAML lints clean |
-| `zizmor` | the workflows pass zizmor's offline audits |
+| Check                    | Covers                                                                                                      |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| `unifi`, `dns`, `deploy` | the CLIs build; `deploy` also prints its stamped version                                                    |
+| `go-test`                | `go test ./...`, with `cue`, `git`, `skopeo` and `flyctl` on `PATH` so the schema-rule and deploy tests run |
+| `go-vet`                 | `go vet ./...`                                                                                              |
+| `schema`                 | `packages.schema` builds                                                                                    |
+| `cue-vet`                | `cue vet ./schema`                                                                                          |
+| `schema-consumer`        | `examples/unifi` evaluates against `packages.schema`                                                        |
+| `unifi-sync-eval`        | the NixOS module evaluates and renders its unit                                                             |
+| `unifi-sync-vm`          | the NixOS module's VM test (needs `/dev/kvm`)                                                               |
+| `nixfmt`                 | every `.nix` file is formatted                                                                              |
+| `yamllint`               | the workflow YAML lints clean                                                                               |
+| `zizmor`                 | the workflows pass zizmor's offline audits                                                                  |
 
 ## CUE Schemas
 
@@ -281,16 +276,31 @@ Available definitions:
 - `#HttpService` — HTTP service settings (port, auto-stop, auto-start, health checks)
 - `#HttpCheck` — HTTP health check configuration
 - `#DNSRecord` — DNS record definition (A, AAAA, CNAME, MX, NS, SRV, TXT)
-- `#Site` — a UniFi Network site (see `schema/unifi.cue`), holding `#Network`, `#FirewallZone`, `#WiFi`, `#FirewallPolicy`, `#DNSPolicy` and `#Reservation` lists and the `#MDNS` proxy service scope. `#FirewallPolicy` models the full policy: `#TrafficFilter` on either end (networks, IP addresses/subnets, ports, MAC addresses, applications), `#FirewallSchedule`, connection states, protocol and logging
+- `#Site` — a UniFi Network site (see `schema/unifi.cue`), holding `#Network`, `#FirewallZone`,
+  `#WiFi`, `#FirewallPolicy`, `#DNSPolicy` and `#Reservation` lists and the `#MDNS` proxy service
+  scope. `#FirewallPolicy` models the full policy: `#TrafficFilter` on either end (networks, IP
+  addresses/subnets, ports, MAC addresses, applications), `#FirewallSchedule`, connection states,
+  protocol and logging
 
 ## DNS Tool
 
-A CLI tool (`cmd/dns/`) that manages DNS records via the Porkbun API. It can manage one or several zones.
+A CLI tool (`cmd/dns/`) that manages DNS records via the Porkbun API. It can manage one or several
+zones.
 
 Commands:
 
-- `dns sync` — Reads a JSON DNS definition from stdin and converges Porkbun records to match. Use `--prune` to delete records not in the definition (skips NS, SOA, and preview-* records). Pass `--dry-run` to print the planned changes without calling the Porkbun API. Sync plans the whole zone before any write and orders the writes around the CNAME rule (a CNAME can't share its name with another record): with `--prune`, the records it replaces are deleted before the CNAME is created, and a pruned CNAME before the records replacing it; every other delete runs last. A desired zone that breaks the rule, or a create that conflicts with a record the sync won't delete (without `--prune`, or an NS, SOA or preview-* record), is refused before any write. `--dry-run` prints the writes in the order they'd run.
-- `dns preview create <app> <pr-number>` — Creates a preview CNAME record for PR environments (gunk.dev only).
+- `dns sync` — Reads a JSON DNS definition from stdin and converges Porkbun records to match. It
+  exits 3 when it fails before attempting any write, leaving the records unchanged, and 1 on any
+  other failure. Use `--prune` to delete records not in the definition (skips NS, SOA, and preview-*
+  records). Pass `--dry-run` to print the planned changes without calling the Porkbun API. Sync
+  plans the whole zone before any write and orders the writes around the CNAME rule (a CNAME can't
+  share its name with another record): with `--prune`, the records it replaces are deleted before
+  the CNAME is created, and a pruned CNAME before the records replacing it; every other delete runs
+  last. A desired zone that breaks the rule, or a create that conflicts with a record the sync won't
+  delete (without `--prune`, or an NS, SOA or preview-* record), is refused before any write.
+  `--dry-run` prints the writes in the order they'd run.
+- `dns preview create <app> <pr-number>` — Creates a preview CNAME record for PR environments
+  (gunk.dev only).
 - `dns preview delete <app> <pr-number>` — Deletes a preview CNAME record.
 
 `dns sync` accepts either a single zone object:
@@ -308,22 +318,60 @@ or a JSON array of those objects, one per zone:
 ]
 ```
 
-Zones are synced in the order given, each preceded by a `== <domain> ==` header, and the run stops at the first zone that fails.
+Zones are synced in the order given, each preceded by a `== <domain> ==` header, and the run stops
+at the first zone that fails.
 
-Domains must be unique across the input (compared case-insensitively and ignoring a trailing dot): a duplicate — or an empty `domain` — fails the run before any change is made, since with `--prune` each entry would delete the records declared only by the other.
+Domains must be unique across the input (compared case-insensitively and ignoring a trailing dot): a
+duplicate — or an empty `domain` — fails the run before any change is made, since with `--prune`
+each entry would delete the records declared only by the other.
 
-Requires `PORKBUN_API_KEY` and `PORKBUN_SECRET_KEY` environment variables. `PORKBUN_API_BASE` overrides the API endpoint (used by tests).
+Requires `PORKBUN_API_KEY` and `PORKBUN_SECRET_KEY` environment variables. `PORKBUN_API_BASE`
+overrides the API endpoint (used by tests).
+
+## Deploy Runner
+
+`deploy` (`cmd/deploy/`) runs one deployment from an exact commit of an infra repository and records
+what it did:
+
+```sh
+export DEPLOY_STATE_DIR=/var/lib/deploy
+rev=$(git -C ~/src/infra rev-parse origin/main)
+deploy app flux --infra https://example.com/infra.git --rev "$rev" --fly-token-file /run/secrets/fly-token
+deploy dns-sync --infra ~/src/infra --rev "$rev" \
+  --porkbun-api-key-file /run/secrets/porkbun-key \
+  --porkbun-secret-key-file /run/secrets/porkbun-secret --dry-run
+```
+
+`deploy app <name>` builds the infra flake's `deploy-<name>-config` (a directory holding only
+`fly.json`) and `deploy-<name>-image` (a single-platform OCI archive whose build runs the image's
+smoke check). It pushes the image to the Fly registry, deploys it by digest, and verifies the app.
+`deploy dns-sync` vets and exports the CUE zones under `dns/` and runs `dns sync --prune` once over
+all of them.
+
+Only committed content at `--rev` is used. One attempt runs at a time per state directory. Each
+attempt prints the path of its record, `runs/<attempt-id>/record.json`. It exits 0 when completed, 2
+on a usage error, 75 when another attempt holds the lock, 129, 130 or 143 when interrupted, and 1
+when anything else fails or is uncertain. An `uncertain` record means a write may have landed: look
+at the target before running again.
+
+The infra layout, phases, record fields and credential handling are in
+[docs/deploy.md](docs/deploy.md).
 
 ## Reusable Workflows
 
 ### dns-sync.yml
 
-Syncs DNS records from a CUE definition to Porkbun. Checks out the caller repo and armstrong, builds the DNS tool, vets the CUE, then runs the sync.
+Syncs DNS records from a CUE definition to Porkbun. Checks out the caller repo and armstrong, builds
+the DNS tool, vets the CUE, then runs the sync.
 
 The caller repo holds its zones under `dns/`, in either layout:
 
-- **Per zone directory** (use this for more than one domain): `dns/<zone>/` — each directory is its own CUE package `dns` declaring `domain` and `records`, e.g. `dns/gunk.dev/` and `dns/broken.dev/`. The workflow vets and exports each directory in sorted order and syncs them all in one run.
-- **Flat** (single zone): `.cue` files directly in `dns/`, all unifying into one `domain` + `records` struct. Still supported.
+- **Per zone directory** (use this for more than one domain): `dns/<zone>/` — each directory is its
+  own CUE package `dns` declaring `domain` and `records`, e.g. `dns/gunk.dev/` and
+  `dns/broken.dev/`. The workflow vets and exports each directory in sorted order and syncs them all
+  in one run.
+- **Flat** (single zone): `.cue` files directly in `dns/`, all unifying into one `domain` +
+  `records` struct. Still supported.
 
 ```yaml
 jobs:
@@ -380,96 +428,95 @@ jobs:
 
 ## UniFi Tool
 
-A CLI tool (`cmd/unifi/`) that manages a UniFi Network site via the official
-**Integration API** served by the console at
-`https://<console>/proxy/network/integration/v1`. It is the sibling of the DNS
-tool: it reads a JSON document on stdin (pipe from `cue export`) and converges
-the console to match. DHCP reservations and the site-wide mDNS proxy setting,
-which the Integration API does not expose, go through the console's legacy
-controller API (`/proxy/network/api/s/<site>/rest/user`, `rest/setting`) with
-the same API key.
+A CLI tool (`cmd/unifi/`) that manages a UniFi Network site via the official **Integration API**
+served by the console at `https://<console>/proxy/network/integration/v1`. It is the sibling of the
+DNS tool: it reads a JSON document on stdin (pipe from `cue export`) and converges the console to
+match. DHCP reservations and the site-wide mDNS proxy setting, which the Integration API does not
+expose, go through the console's legacy controller API (`/proxy/network/api/s/<site>/rest/user`,
+`rest/setting`) with the same API key.
 
 Commands:
 
-- `unifi export` — Dumps the live site as `#Site`-shaped JSON so a consumer repo can bootstrap its instance file from real state. WiFi passphrases are never included; each SSID gets a `passphraseEnv` name instead. Objects the schema cannot express faithfully are skipped and named on stderr.
-- `unifi diff` — Reads `#Site` JSON from stdin and prints the plan without changing anything. Exits 2 when a change would be made and 1 on failure, so CI can tell drift apart from a broken run. Pass `--prune` to include deletions in the plan.
-- `unifi sync [--prune] [--dry-run] [--force] [--max-changes N] [--snapshot-dir DIR] [--snapshot-keep K]` — Reads `#Site` JSON from stdin and converges the site. `--prune` deletes `USER_DEFINED` objects absent from the input and clears undeclared DHCP reservations (the client record is kept), but only those the input's `deletions` lists; `--dry-run` prints the plan without calling the API. See [Guards, snapshots and restore](#guards-snapshots-and-restore).
-- `unifi restore [--dry-run] [--prune --force] <snapshot.json>` — Converges the site back to a snapshot `sync` wrote, through the same reconciler and guards.
+- `unifi export` — Dumps the live site as `#Site`-shaped JSON so a consumer repo can bootstrap its
+  instance file from real state. WiFi passphrases are never included; each SSID gets a
+  `passphraseEnv` name instead. Objects the schema cannot express faithfully are skipped and named
+  on stderr.
+- `unifi diff` — Reads `#Site` JSON from stdin and prints the plan without changing anything. Exits
+  2 when a change would be made and 1 on failure, so CI can tell drift apart from a broken run. Pass
+  `--prune` to include deletions in the plan.
+- `unifi sync [--prune] [--dry-run] [--force] [--max-changes N] [--snapshot-dir DIR] [--snapshot-keep K]`
+  — Reads `#Site` JSON from stdin and converges the site. `--prune` deletes `USER_DEFINED` objects
+  absent from the input and clears undeclared DHCP reservations (the client record is kept), but
+  only those the input's `deletions` lists; `--dry-run` prints the plan without calling the API. See
+  [Guards, snapshots and restore](#guards-snapshots-and-restore).
+- `unifi restore [--dry-run] [--prune --force] <snapshot.json>` — Converges the site back to a
+  snapshot `sync` wrote, through the same reconciler and guards.
 
 Environment:
 
-| Variable | Meaning |
-| --- | --- |
-| `UNIFI_URL` | Console base URL, e.g. `https://unifi.lan` |
-| `UNIFI_API_KEY` | Integration API key (Settings → Control Plane → Integrations). Never printed. |
-| `UNIFI_SITE` | Site name, default `Default`. The legacy API uses the site's `internalReference` (e.g. `default`), read from `GET /sites` |
-| `UNIFI_CA_FILE` | PEM bundle for the console's self-signed certificate |
-| `UNIFI_INSECURE_TLS` | Set to `1` to skip certificate verification instead |
-| `UNIFI_WIFI_*` | Whatever `passphraseEnv` names your `#WiFi` entries reference |
+| Variable             | Meaning                                                                                                                   |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `UNIFI_URL`          | Console base URL, e.g. `https://unifi.lan`                                                                                |
+| `UNIFI_API_KEY`      | Integration API key (Settings → Control Plane → Integrations). Never printed.                                             |
+| `UNIFI_SITE`         | Site name, default `Default`. The legacy API uses the site's `internalReference` (e.g. `default`), read from `GET /sites` |
+| `UNIFI_CA_FILE`      | PEM bundle for the console's self-signed certificate                                                                      |
+| `UNIFI_INSECURE_TLS` | Set to `1` to skip certificate verification instead                                                                       |
+| `UNIFI_WIFI_*`       | Whatever `passphraseEnv` names your `#WiFi` entries reference                                                             |
 
 ### Rules
 
-- **Names are the identity.** Ids are server-assigned and must never appear in a
-  consumer repo, so desired and actual objects are matched by `name`. Two kinds
-  need more: DNS policies have no name and are matched by type plus domain, and
-  firewall policies are matched by **(source zone, destination zone, name)** —
-  a stock console reuses `Allow All Traffic` nineteen times. DHCP reservations
-  are matched by MAC address.
-- **Nothing is written back lossily.** Before planning an update, `unifi`
-  re-renders the live object from its own projection and compares. If the
-  console holds a firewall policy using something `#FirewallPolicy` does not
-  model, `diff` and `sync` fail naming the field instead of `PUT`ting the
-  policy back without it, and `export` leaves it out rather than emitting a
-  version that would become that write.
-- **`SYSTEM_DEFINED` objects are never deleted**, not even with `--prune`. Their
-  configurable fields are updated when the instance file declares them, so you
-  can manage the console's own default LAN.
-- **`--prune` only acts on resource types the instance file declares.** An empty
-  `wifi` list deletes no SSIDs — an instance file that simply forgot a section
-  must not wipe it.
-- **Secrets stay out of git.** `#WiFiSecurity` carries `passphraseEnv` — the name
-  of an environment variable — not the passphrase. Passphrases and the API key
-  are redacted from all output, including API error responses.
-- **DHCP reservations** (`reservations: [...#Reservation]`, each
-  `{mac, name?, fixedIp, network}`) exist only where `use_fixedip` is true; a
-  `fixed_ip` left on a client with `use_fixedip: false` is not a reservation.
-  Networks are joined by name, since legacy and Integration API ids differ.
-  `--prune` clears a reservation with `use_fixedip: false` (once `deletions`
-  lists `reservation <mac>`) and never forgets the client.
-- **The mDNS proxy** (`mdns: #MDNS`) is the service scope of the gateway's one
-  site-wide proxy: `mode` (`all` or `custom`) and, in `custom`, an allow-list
-  of predefined `services` and `customServices` (`{name, address}`). Which
-  networks take part is each network's `mdnsForwardingEnabled`. It is only
-  ever updated, never pruned. See
+- **Names are the identity.** Ids are server-assigned and must never appear in a consumer repo, so
+  desired and actual objects are matched by `name`. Two kinds need more: DNS policies have no name
+  and are matched by type plus domain, and firewall policies are matched by **(source zone,
+  destination zone, name)** — a stock console reuses `Allow All Traffic` nineteen times. DHCP
+  reservations are matched by MAC address.
+- **Nothing is written back lossily.** Before planning an update, `unifi` re-renders the live object
+  from its own projection and compares. If the console holds a firewall policy using something
+  `#FirewallPolicy` does not model, `diff` and `sync` fail naming the field instead of `PUT`ting the
+  policy back without it, and `export` leaves it out rather than emitting a version that would
+  become that write.
+- **`SYSTEM_DEFINED` objects are never deleted**, not even with `--prune`. Their configurable fields
+  are updated when the instance file declares them, so you can manage the console's own default LAN.
+- **`--prune` only acts on resource types the instance file declares.** An empty `wifi` list deletes
+  no SSIDs — an instance file that simply forgot a section must not wipe it.
+- **Secrets stay out of git.** `#WiFiSecurity` carries `passphraseEnv` — the name of an environment
+  variable — not the passphrase. Passphrases and the API key are redacted from all output, including
+  API error responses.
+- **DHCP reservations** (`reservations: [...#Reservation]`, each `{mac, name?, fixedIp, network}`)
+  exist only where `use_fixedip` is true; a `fixed_ip` left on a client with `use_fixedip: false` is
+  not a reservation. Networks are joined by name, since legacy and Integration API ids differ.
+  `--prune` clears a reservation with `use_fixedip: false` (once `deletions` lists
+  `reservation <mac>`) and never forgets the client.
+- **The mDNS proxy** (`mdns: #MDNS`) is the service scope of the gateway's one site-wide proxy:
+  `mode` (`all` or `custom`) and, in `custom`, an allow-list of predefined `services` and
+  `customServices` (`{name, address}`). Which networks take part is each network's
+  `mdnsForwardingEnabled`. It is only ever updated, never pruned. See
   [`docs/unifi.md`](docs/unifi.md#mdns-proxy).
-- Resources are reconciled in dependency order: the mDNS service scope first
-  (so it is in force before a network joins, and a failed write to it changes
-  nothing else), then networks → firewall zones → wifi, firewall policies,
-  DNS policies, DHCP reservations.
+- Resources are reconciled in dependency order: the mDNS service scope first (so it is in force
+  before a network joins, and a failed write to it changes nothing else), then networks → firewall
+  zones → wifi, firewall policies, DNS policies, DHCP reservations.
 
 ### Running it
 
-`unifi sync` is meant to run on a **LAN host**, not in GitHub Actions: the
-console is only reachable on the local network and presents a self-signed
-certificate.
+`unifi sync` is meant to run on a **LAN host**, not in GitHub Actions: the console is only reachable
+on the local network and presents a self-signed certificate.
 
 ```sh
 cue export ./unifi --out json -e site | unifi sync --prune
 ```
 
-On NixOS, `nixosModules.unifi-sync` runs exactly that pipeline as a hardened
-oneshot on a timer — see [NixOS module](#nixos-module).
+On NixOS, `nixosModules.unifi-sync` runs exactly that pipeline as a hardened oneshot on a timer —
+see [NixOS module](#nixos-module).
 
 ### Guards, snapshots and restore
 
-`sync` runs unattended after every converge, so a wrong plan has to fail
-closed and be undoable. `sync` works out the whole plan before it writes
-anything, and refuses the run (exit 1, plan printed, **nothing written** — not
-even the creates) when either guard trips:
+`sync` runs unattended after every converge, so a wrong plan has to fail closed and be undoable.
+`sync` works out the whole plan before it writes anything, and refuses the run (exit 1, plan
+printed, **nothing written** — not even the creates) when either guard trips:
 
-- **Undeclared deletions.** `--prune` deletes an object only if the instance
-  file lists its key in `deletions`. The key is the kind and identity exactly
-  as the plan prints them, joined by one space:
+- **Undeclared deletions.** `--prune` deletes an object only if the instance file lists its key in
+  `deletions`. The key is the kind and identity exactly as the plan prints them, joined by one
+  space:
 
   ```cue
   site: schema.#Site & {
@@ -482,61 +529,52 @@ even the creates) when either guard trips:
   }
   ```
 
-  The refusal names each unlisted key, ready to paste in. `diff --prune` marks
-  every delete as `(listed in deletions)` or `(NOT listed in deletions)`. A
-  listed key that matches nothing — typically an object already deleted — only
-  prints a `WARN`, so the list can be emptied at leisure. Clearing a DHCP
-  reservation is a deletion too, keyed `reservation <mac>` (lower-case MAC).
-- **Mass change.** A plan that deletes or updates more than `--max-changes`
-  objects (default 10) is refused. Creates do not count. DHCP reservation
-  updates and clears count like any other; reservation creates do not. An mDNS
-  proxy update counts too.
-  Reorders do: every firewall policy whose position changes counts as one,
-  and the plan shows it as `ORDER firewall policy <pair> (N moved)`.
+  The refusal names each unlisted key, ready to paste in. `diff --prune` marks every delete as
+  `(listed in deletions)` or `(NOT listed in deletions)`. A listed key that matches nothing —
+  typically an object already deleted — only prints a `WARN`, so the list can be emptied at leisure.
+  Clearing a DHCP reservation is a deletion too, keyed `reservation <mac>` (lower-case MAC).
 
-`--force` overrides both. It is for a human at a shell; the NixOS module never
-passes it.
+- **Mass change.** A plan that deletes or updates more than `--max-changes` objects (default 10) is
+  refused. Creates do not count. DHCP reservation updates and clears count like any other;
+  reservation creates do not. An mDNS proxy update counts too. Reorders do: every firewall policy
+  whose position changes counts as one, and the plan shows it as
+  `ORDER firewall policy <pair> (N moved)`.
 
-**Snapshots.** With `--snapshot-dir`, a `sync` that is about to write first
-saves the live site there as `snapshot-<UTC timestamp>.json` — the same
-document `unifi export` prints — prints the path, and keeps the newest
-`--snapshot-keep` (default 10). A run with nothing to write takes no snapshot.
-A snapshot never holds a passphrase: each SSID carries a `passphraseEnv` (the
-instance file's own name for it where the instance file declares the SSID,
-otherwise export's generated `UNIFI_WIFI_<SSID>`). When the instance file
-declares `reservations`, the snapshot holds them too, by MAC and network name,
-so `restore` can recreate, change back or clear them; without that section the
-run cannot touch reservations and the snapshot leaves them out. The mDNS proxy
-setting follows the same rule, keyed on `mdns`.
+`--force` overrides both. It is for a human at a shell; the NixOS module never passes it.
+
+**Snapshots.** With `--snapshot-dir`, a `sync` that is about to write first saves the live site
+there as `snapshot-<UTC timestamp>.json` — the same document `unifi export` prints — prints the
+path, and keeps the newest `--snapshot-keep` (default 10). A run with nothing to write takes no
+snapshot. A snapshot never holds a passphrase: each SSID carries a `passphraseEnv` (the instance
+file's own name for it where the instance file declares the SSID, otherwise export's generated
+`UNIFI_WIFI_<SSID>`). When the instance file declares `reservations`, the snapshot holds them too,
+by MAC and network name, so `restore` can recreate, change back or clear them; without that section
+the run cannot touch reservations and the snapshot leaves them out. The mDNS proxy setting follows
+the same rule, keyed on `mdns`.
 
 **The review workflow:**
 
-1. Edit the CUE instance. Anything removed from a declared section is a prune
-   candidate; add its key to `deletions` (the `diff --prune` output, or a
-   refused run, names it).
-2. Open a PR. The `deletions` list is in the diff, so reviewing and merging it
-   *is* the acknowledgement of each deletion.
+1. Edit the CUE instance. Anything removed from a declared section is a prune candidate; add its key
+   to `deletions` (the `diff --prune` output, or a refused run, names it).
+2. Open a PR. The `deletions` list is in the diff, so reviewing and merging it _is_ the
+   acknowledgement of each deletion.
 3. Merge; the host converges and `unifi-sync` runs.
 4. `sync` plans, checks the guards, snapshots the live site, then applies.
 
-**Restoring.** `unifi restore <snapshot.json>` applies a snapshot as the
-desired state through the same reconciler and guards — objects matched by
-identity, `SYSTEM_DEFINED` objects never deleted. Set each SSID's
-`passphraseEnv` in the environment, as for `sync`. Start with `--dry-run`. A
-snapshot lists no deletions, so removing objects created since it was taken
-needs `--prune --force`:
+**Restoring.** `unifi restore <snapshot.json>` applies a snapshot as the desired state through the
+same reconciler and guards — objects matched by identity, `SYSTEM_DEFINED` objects never deleted.
+Set each SSID's `passphraseEnv` in the environment, as for `sync`. Start with `--dry-run`. A
+snapshot lists no deletions, so removing objects created since it was taken needs `--prune --force`:
 
 ```sh
 unifi restore --dry-run /var/lib/unifi-sync/snapshots/snapshot-20260914T182700.000000000Z.json
 unifi restore --prune --force /var/lib/unifi-sync/snapshots/snapshot-20260914T182700.000000000Z.json
 ```
 
-On a NixOS host, `sudo unifi-restore …` does the same with the module's
-console settings, API key and secrets file already loaded. Restoring puts the
-console back, not the instance file: revert the PR too, or the next converge
-applies the change again.
+On a NixOS host, `sudo unifi-restore …` does the same with the module's console settings, API key
+and secrets file already loaded. Restoring puts the console back, not the instance file: revert the
+PR too, or the next converge applies the change again.
 
-See `examples/unifi/site.cue` for a complete example instance (RFC 5737
-documentation addresses), `docs/unifi.md` for the full guide, and
-`docs/unifi-api-notes.md` for the API shapes — including which are confirmed
-against a live console and which are documented but not yet exercised.
+See `examples/unifi/site.cue` for a complete example instance (RFC 5737 documentation addresses),
+`docs/unifi.md` for the full guide, and `docs/unifi-api-notes.md` for the API shapes — including
+which are confirmed against a live console and which are documented but not yet exercised.

@@ -8,6 +8,7 @@ project: {
 	// built for the runner's own system.
 	let ownChecks = [
 		"cue-vet",
+		"deploy",
 		"dns",
 		"go-test",
 		"go-vet",
@@ -38,6 +39,7 @@ project: {
 	// linters read only .github/.
 	classes: source: {
 		paths: "cmd/**":      true
+		paths: "internal/**": true
 		paths: "go.mod":      true
 		paths: "go.sum":      true
 		paths: "schema/**":   true
@@ -54,8 +56,8 @@ project: {
 	}
 
 	// flake.nix defines every check, flake.lock pins the nixpkgs each is
-	// built from, and this policy decides which of them a change owes. An
-	// approval of a change here carries across no landing.
+	// built from, and this policy decides which of them a change requires.
+	// An approval of a change here carries across no landing.
 	classes: "flake-and-policy": {
 		paths: "flake.nix":  true
 		paths: "flake.lock": true

@@ -40,27 +40,62 @@
       # The tests run once, in checks.go-test, rather than again in each
       # package's checkPhase.
       mkTool =
-        pkgs: name:
-        mkGo pkgs {
-          pname = name;
-          subPackages = [ "cmd/${name}" ];
-          doCheck = false;
-          meta = {
-            description = "armstrong ${name} CLI";
-            mainProgram = name;
-            homepage = "https://github.com/gunk-dev/armstrong";
-          };
+        pkgs: name: extra:
+        mkGo pkgs (
+          {
+            pname = name;
+            subPackages = [ "cmd/${name}" ];
+            doCheck = false;
+            meta = {
+              description = "armstrong ${name} CLI";
+              mainProgram = name;
+              homepage = "https://github.com/gunk-dev/armstrong";
+            };
+          }
+          // extra
+        );
+
+      # The deploy runner. Its children run with exactly the PATH stamped in
+      # here, so it uses these locked tools and never the host's.
+      mkDeploy =
+        pkgs: dns:
+        mkTool pkgs "deploy" {
+          ldflags = [
+            "-X main.version=${version}"
+            "-X main.nixSystem=${pkgs.stdenv.hostPlatform.system}"
+            "-X main.storeDir=${builtins.storeDir}"
+            "-X main.toolPath=${
+              pkgs.lib.makeBinPath [
+                pkgs.gitMinimal
+                pkgs.nix
+                pkgs.cue
+                pkgs.flyctl
+                pkgs.skopeo
+                dns
+              ]
+            }"
+          ];
+          doInstallCheck = true;
+          installCheckPhase = ''
+            $out/bin/deploy --version | grep -qF ${version}
+          '';
         };
 
       # A derivation that runs `cmd` in a configured Go build environment and
       # succeeds by producing an empty $out. cue is on PATH because the unifi
-      # tests shell out to it to check the schema's own rules, and skip without
-      # it.
+      # tests shell out to it to check the schema's own rules; the deploy tests
+      # drive real git and cue, and check deploy's invocations against the
+      # skopeo and flyctl it pins. Tests skip what is missing.
       mkGoCheck =
         pkgs: name: cmd:
         mkGo pkgs {
           pname = "armstrong-${name}";
-          nativeBuildInputs = [ pkgs.cue ];
+          nativeBuildInputs = [
+            pkgs.cue
+            pkgs.gitMinimal
+            pkgs.skopeo
+            pkgs.flyctl
+          ];
           buildPhase = ''
             runHook preBuild
             export CUE_CACHE_DIR=$TMPDIR/cue
@@ -76,16 +111,23 @@
         root = ./.;
         fileset = ./.github;
       };
+
+      # The tracked Markdown alone, for prose-format.
+      markdownSrc = nixpkgs.lib.fileset.toSource {
+        root = ./.;
+        fileset = nixpkgs.lib.fileset.fileFilter (file: file.hasExt "md") ./.;
+      };
     in
     {
       packages = forAllSystems (
         pkgs:
         let
-          unifi = mkTool pkgs "unifi";
+          unifi = mkTool pkgs "unifi" { };
+          dns = mkTool pkgs "dns" { };
         in
         {
-          inherit unifi;
-          dns = mkTool pkgs "dns";
+          inherit unifi dns;
+          deploy = mkDeploy pkgs dns;
           default = unifi;
 
           # The schema/ directory laid out as a CUE module package path, so a
@@ -112,7 +154,12 @@
       };
 
       checks = forAllSystems (pkgs: {
-        inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) unifi dns schema;
+        inherit (self.packages.${pkgs.stdenv.hostPlatform.system})
+          unifi
+          dns
+          deploy
+          schema
+          ;
 
         go-vet = mkGoCheck pkgs "go-vet" "go vet ./...";
         go-test = mkGoCheck pkgs "go-test" "go test ./...";
@@ -217,6 +264,16 @@
           zizmor --offline ${githubSrc}
           touch $out
         '';
+
+        # The platform offers no shared definition of the floor's prose-format check, so its command is restated here.
+        prose-format =
+          pkgs.runCommand "armstrong-prose-format" { nativeBuildInputs = [ pkgs.prettier ]; }
+            ''
+              cd ${markdownSrc}
+              find . -name '*.md' -exec prettier --prose-wrap always --print-width 100 \
+                --embedded-language-formatting off --check {} +
+              touch $out
+            '';
 
         nixfmt = pkgs.runCommand "armstrong-nixfmt" { nativeBuildInputs = [ pkgs.nixfmt ]; } ''
           find ${self} -name '*.nix' -print0 | xargs -0 nixfmt --check

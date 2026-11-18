@@ -42,7 +42,8 @@ func newSyncCmd() *cobra.Command {
 		Use:   "sync",
 		Short: "Sync DNS records from CUE definition to Porkbun",
 		Long: "Reads JSON from stdin (pipe from: cue export ./dns --out json) and converges Porkbun records to match.\n" +
-			"Accepts either a single zone object or a JSON array of zone objects, which are synced in order.",
+			"Accepts either a single zone object or a JSON array of zone objects, which are synced in order.\n" +
+			"Exits 3 when it fails before attempting any write, so the records are unchanged; 1 on any other failure.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runSync(prune, dryRun, cmd.InOrStdin(), cmd.OutOrStdout())
 		},
@@ -53,23 +54,64 @@ func newSyncCmd() *cobra.Command {
 	return cmd
 }
 
+// errNoWrite marks a sync that failed before it attempted any write, so the
+// records are as they were: `dns sync` then exits with exitNoWrite.
+type errNoWrite struct{ error }
+
+func (e errNoWrite) Unwrap() error { return e.error }
+
+const exitNoWrite = 3
+
 func runSync(prune, dryRun bool, stdin io.Reader, out io.Writer) error {
 	data, err := io.ReadAll(stdin)
 	if err != nil {
-		return fmt.Errorf("read stdin: %w", err)
+		return errNoWrite{fmt.Errorf("read stdin: %w", err)}
 	}
 
 	zones, err := parseZones(data)
 	if err != nil {
-		return err
+		return errNoWrite{err}
 	}
 
 	client, err := newPorkbunClient()
 	if err != nil {
-		return err
+		return errNoWrite{err}
 	}
 
-	return syncZones(client, zones, prune, dryRun, out)
+	return syncCounted(client, zones, prune, dryRun, out)
+}
+
+// syncCounted syncs the zones and marks a failure before the first write
+// attempt as errNoWrite. A write that was attempted counts even if it failed:
+// its request may have landed.
+func syncCounted(client porkbunMutator, zones []dnsInput, prune, dryRun bool, out io.Writer) error {
+	counted := &countingMutator{porkbunMutator: client}
+	err := syncZones(counted, zones, prune, dryRun, out)
+	if err != nil && counted.writes == 0 {
+		return errNoWrite{err}
+	}
+	return err
+}
+
+// countingMutator counts the write requests sync attempts.
+type countingMutator struct {
+	porkbunMutator
+	writes int
+}
+
+func (c *countingMutator) create(domain string, req createRequest) error {
+	c.writes++
+	return c.porkbunMutator.create(domain, req)
+}
+
+func (c *countingMutator) editByNameType(domain, recordType, subdomain string, req editRequest) error {
+	c.writes++
+	return c.porkbunMutator.editByNameType(domain, recordType, subdomain, req)
+}
+
+func (c *countingMutator) deleteByID(domain, id string) error {
+	c.writes++
+	return c.porkbunMutator.deleteByID(domain, id)
 }
 
 // parseZones accepts either a single zone object (one domain) or a JSON array
