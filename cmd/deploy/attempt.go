@@ -72,7 +72,21 @@ type secrets struct {
 	porkbunSecret string
 }
 
-// attempt is one invocation from lock to final record.
+// session holds the state acquired once per deploy invocation, under one lock.
+type session struct {
+	system         string
+	verifyTimeout  time.Duration
+	verifyInterval time.Duration
+	tools          map[string]string
+	secrets        secrets
+	stateDir       string
+	lock           *os.File
+	gate           *startGate
+	stdout         io.Writer
+	stderr         io.Writer
+}
+
+// attempt is one deployment attempt from record creation to final record.
 type attempt struct {
 	req     request
 	system  string
@@ -87,6 +101,13 @@ type attempt struct {
 
 	verifyTimeout  time.Duration
 	verifyInterval time.Duration
+
+	// checkSkip enables converge's skip rule during inspect for an app attempt.
+	checkSkip bool
+	// Set by inspectApp when checkSkip is true.
+	skipped          bool   // app is already at this commit's outputs
+	skipAfterInspect string // reason for skipping upload, apply and verify
+	deployReason     string // why an app would deploy (dry-run summary)
 
 	// Learned during the attempt.
 	app        string // Fly app named by fly.json
@@ -220,46 +241,71 @@ func executeAttempt(ctx context.Context, gate *startGate, req request, stdout, s
 	// still holds the inherited descriptor, and with it the lock.
 	defer lock.Close()
 
-	a := &attempt{
-		req:            req,
+	sess := &session{
 		system:         system,
-		secrets:        sec,
-		stdout:         stdout,
-		stderr:         stderr,
 		verifyTimeout:  vTimeout,
 		verifyInterval: vInterval,
+		tools:          tools,
+		secrets:        sec,
+		stateDir:       req.stateDir,
+		lock:           lock,
+		gate:           gate,
+		stdout:         stdout,
+		stderr:         stderr,
 	}
-	if err := a.create(); err != nil {
+	if req.verb == verbConverge {
+		return runConverge(ctx, sess, req)
+	}
+	a, err := runAttempt(ctx, sess, req, false)
+	if err != nil {
 		return fail("create record: %v", err)
 	}
+	if a.recordFailed || a.rec.Outcome != outcomeCompleted {
+		return exitFailure
+	}
+	return exitOK
+}
+
+// runAttempt runs one ordinary app or dns-sync attempt under sess's lock.
+func runAttempt(ctx context.Context, sess *session, req request, checkSkip bool) (*attempt, error) {
+	a := &attempt{
+		req:            req,
+		system:         sess.system,
+		secrets:        sess.secrets,
+		stdout:         sess.stdout,
+		stderr:         sess.stderr,
+		verifyTimeout:  sess.verifyTimeout,
+		verifyInterval: sess.verifyInterval,
+		checkSkip:      checkSkip,
+	}
+	if err := a.create(); err != nil {
+		return nil, err
+	}
 	a.r = &runner{
-		tools:   tools,
+		tools:   sess.tools,
 		path:    toolPath,
 		home:    filepath.Join(a.work, "home"),
 		runtime: filepath.Join(a.work, "run"),
 		tmp:     filepath.Join(a.work, "tmp"),
-		lock:    lock,
+		lock:    sess.lock,
 		grace:   killGrace,
-		gate:    gate,
+		gate:    sess.gate,
 		logs:    filepath.Join(a.runDir, "logs"),
 		red:     a.redactor(),
-		stderr:  stderr,
+		stderr:  sess.stderr,
 	}
 	// An operator who cannot see where the record is gets no work done.
-	if _, err := fmt.Fprintln(stdout, filepath.Join(a.runDir, "record.json")); err != nil {
+	if _, err := fmt.Fprintln(sess.stdout, filepath.Join(a.runDir, "record.json")); err != nil {
 		var stop context.CancelCauseFunc
 		ctx, stop = context.WithCancelCause(ctx)
 		stop(fmt.Errorf("could not print the record path: %w", err))
 	}
 
 	a.runPhases(ctx, a.steps())
-	fmt.Fprintf(stderr, "deploy: attempt %s%s\n", a.rec.Outcome, map[string]string{
+	fmt.Fprintf(sess.stderr, "deploy: attempt %s%s\n", a.rec.Outcome, map[string]string{
 		outcomeUncertain: ": a change to the target may not have settled; look at the target before running again",
 	}[a.rec.Outcome])
-	if a.recordFailed || a.rec.Outcome != outcomeCompleted {
-		return exitFailure
-	}
-	return exitOK
+	return a, nil
 }
 
 var errContended = errors.New("lock held")
@@ -352,9 +398,14 @@ func resolveTools(verb string) (map[string]string, error) {
 	if toolPath == "" {
 		return nil, errors.New("this build has no pinned tool path; use the packaged deploy")
 	}
-	need := []string{"git", "nix", "flyctl", "skopeo"}
-	if verb == verbDNS {
+	var need []string
+	switch verb {
+	case verbApp:
+		need = []string{"git", "nix", "flyctl", "skopeo"}
+	case verbDNS:
 		need = []string{"git", "cue", "dns"}
+	default:
+		need = []string{"git", "nix", "cue", "flyctl", "skopeo", "dns"}
 	}
 	tools := map[string]string{}
 	for _, name := range need {
@@ -388,14 +439,17 @@ func readSecret(path, flag string) (string, error) {
 func readSecrets(req request) (secrets, error) {
 	var s secrets
 	var err error
-	if req.verb == verbApp {
-		s.flyToken, err = readSecret(req.flyTokenFile, "--fly-token-file")
-		return s, err
+	if req.verb == verbApp || req.verb == verbConverge {
+		if s.flyToken, err = readSecret(req.flyTokenFile, "--fly-token-file"); err != nil {
+			return s, err
+		}
 	}
-	if s.porkbunKey, err = readSecret(req.porkbunKeyFile, "--porkbun-api-key-file"); err != nil {
-		return s, err
+	if req.verb == verbDNS || req.verb == verbConverge {
+		if s.porkbunKey, err = readSecret(req.porkbunKeyFile, "--porkbun-api-key-file"); err != nil {
+			return s, err
+		}
+		s.porkbunSecret, err = readSecret(req.porkbunSecretFile, "--porkbun-secret-key-file")
 	}
-	s.porkbunSecret, err = readSecret(req.porkbunSecretFile, "--porkbun-secret-key-file")
 	return s, err
 }
 
@@ -629,6 +683,8 @@ func (a *attempt) runPhases(ctx context.Context, steps []step) {
 			continue
 		case st.skip != "":
 			a.finish(st.name, result{outcome: outcomeSkipped, reason: st.skip})
+		case a.skipAfterInspect != "":
+			a.finish(st.name, result{outcome: outcomeSkipped, reason: a.skipAfterInspect})
 		default:
 			a.rec.setPhase(st.name, outcomeUncertain, "in progress")
 			if err := a.persist(); err != nil {
@@ -671,6 +727,9 @@ func (a *attempt) runPhases(ctx context.Context, steps []step) {
 	a.finish("cleanup", res)
 	a.rec.FinishedAt = strPtr(timestamp())
 	a.rec.Outcome = overall(a.rec.Phases)
+	if a.rec.Outcome == outcomeCompleted && a.skipped {
+		a.rec.Outcome = outcomeSkipped
+	}
 	if err := a.persist(); err != nil {
 		a.recordFailed = true
 		fmt.Fprintf(a.stderr, "deploy: write final record: %v\n", err)

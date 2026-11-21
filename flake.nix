@@ -143,13 +143,12 @@
         }
       );
 
-      # The NixOS actuator for `schema.#Site`: a hardened oneshot that runs
-      # `cue export <instance> -e site | unifi <diff|sync>`, plus a daily drift
-      # timer and a `unifi-plan` wrapper. `self` is threaded in so `package`
-      # and `schema` default to this flake's own outputs, with no `inputs`
-      # argument required of the consumer's module system.
+      # NixOS modules: `self` is threaded in so each module's `package` (and
+      # `schema` for unifi-sync) defaults to this flake's own outputs, with no
+      # `inputs` argument required of the consumer's module system.
       nixosModules = {
         unifi-sync = import ./nix/modules/unifi-sync { armstrong = self; };
+        deploy = import ./nix/modules/deploy { armstrong = self; };
         default = self.nixosModules.unifi-sync;
       };
 
@@ -251,6 +250,64 @@
             # onSuccessOf reached the consumer's own unit.
             grep -q 'OnSuccess=unifi-sync.service' \
               ${scratch.config.systemd.units."nixos-upgrade.service".unit}/nixos-upgrade.service
+            cp "$unit" $out
+          '';
+
+        deploy-vm = import ./nix/modules/deploy/test.nix {
+          inherit pkgs;
+          module = self.nixosModules.deploy;
+        };
+
+        deploy-eval =
+          let
+            scratch = nixpkgs.lib.nixosSystem {
+              modules = [
+                self.nixosModules.deploy
+                {
+                  nixpkgs.hostPlatform = pkgs.stdenv.hostPlatform.system;
+                  system.stateVersion = "25.05";
+                  boot.loader.grub.enable = false;
+                  fileSystems."/" = {
+                    device = "/dev/disk/by-label/nixos";
+                    fsType = "ext4";
+                  };
+
+                  modules.deploy = {
+                    enable = true;
+                    sourceRepository = "/srv/git/infra.git";
+                    commitFile = "/run/valley/deploy.env";
+                    flyTokenFile = "/run/secrets/fly-token";
+                    porkbunApiKeyFile = "/run/secrets/porkbun-api-key";
+                    porkbunSecretKeyFile = "/run/secrets/porkbun-secret-key";
+                  };
+                }
+              ];
+            };
+            failed = builtins.filter (a: !a.assertion) scratch.config.assertions;
+          in
+          assert nixpkgs.lib.assertMsg (failed == [ ]) (
+            "deploy-eval: " + nixpkgs.lib.concatMapStringsSep "; " (a: a.message) failed
+          );
+          pkgs.runCommand "armstrong-deploy-eval" { } ''
+            refresh=${
+              scratch.config.systemd.units."deploy-snapshot-refresh.service".unit
+            }/deploy-snapshot-refresh.service
+            grep -q 'ExecStart=.*/bin/deploy-snapshot-refresh' "$refresh"
+            ! grep -q 'EnvironmentFile=' "$refresh"
+            ! grep -q 'WantedBy=' "$refresh"
+
+            unit=${scratch.config.systemd.units."deploy-converge.service".unit}/deploy-converge.service
+            grep -q 'Requires=.*deploy-snapshot-refresh.service' "$unit"
+            grep -q 'After=.*deploy-snapshot-refresh.service' "$unit"
+            ! grep -q 'ExecStartPre=' "$unit"
+            ! grep -q 'EnvironmentFile=' "$unit"
+            grep -q 'ExecStart=.*/bin/deploy converge --infra file:///var/lib/deploy/snapshot.git --commit-file /run/valley/deploy.env' "$unit"
+            grep -q 'User=deploy' "$unit"
+            grep -q 'StateDirectory=deploy' "$unit"
+            grep -q 'LoadCredential=fly-token:/run/secrets/fly-token' "$unit"
+            grep -q 'SystemCallFilter=@system-service' "$unit"
+            grep -q 'SystemCallFilter=~@privileged' "$unit"
+            ! grep -q 'WantedBy=' "$unit"
             cp "$unit" $out
           '';
 

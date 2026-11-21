@@ -276,6 +276,7 @@ func (h *harness) appFixture() {
 // twice for twoIndexes.
 type image struct {
 	arch         string
+	layer        string // optional extra content so distinct test images get distinct digests
 	twoPlatforms bool
 	noDirs       bool
 	twoIndexes   bool // a second index.json, naming another manifest, follows the first
@@ -292,7 +293,7 @@ func writeImage(t *testing.T, path string, img image) string {
 	}
 	manifestFor := func(arch string) descriptor {
 		config := add("application/vnd.oci.image.config.v1+json", fmt.Appendf(nil, `{"architecture":%q,"os":"linux","rootfs":{"type":"layers","diff_ids":[]}}`, arch))
-		layer := add("application/vnd.oci.image.layer.v1.tar", []byte("layer for "+arch))
+		layer := add("application/vnd.oci.image.layer.v1.tar", []byte("layer for "+arch+img.layer))
 		m, _ := json.Marshal(map[string]any{
 			"schemaVersion": 2, "mediaType": mediaOCIManifest,
 			"config": config, "layers": []descriptor{layer},
@@ -417,6 +418,32 @@ func (h *harness) dnsSync(extra ...string) outcome {
 	return h.run(append([]string{"dns-sync", "--infra", h.infra, "--rev", h.rev,
 		"--porkbun-api-key-file", filepath.Join(h.root, "creds", "porkbun-key"),
 		"--porkbun-secret-key-file", filepath.Join(h.root, "creds", "porkbun-secret")}, extra...)...)
+}
+
+func (h *harness) convergeArgs(extra ...string) []string {
+	return append([]string{"converge", "--infra", h.infra, "--rev", h.rev,
+		"--fly-token-file", filepath.Join(h.root, "creds", "fly-token"),
+		"--porkbun-api-key-file", filepath.Join(h.root, "creds", "porkbun-key"),
+		"--porkbun-secret-key-file", filepath.Join(h.root, "creds", "porkbun-secret")}, extra...)
+}
+
+func (h *harness) converge(extra ...string) outcome {
+	h.t.Helper()
+	return h.run(h.convergeArgs(extra...)...)
+}
+
+func (h *harness) clearCalls() {
+	h.t.Helper()
+	if err := os.Remove(filepath.Join(h.root, "calls.jsonl")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *harness) saveLiveWorld(w *world) {
+	h.t.Helper()
+	if err := writeJSON(filepath.Join(h.root, "world.json"), w); err != nil {
+		h.t.Fatal(err)
+	}
 }
 
 func (h *harness) calls() []call {

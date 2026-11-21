@@ -35,14 +35,19 @@ var fakeTools = []string{"git", "cue", "dns", "nix", "flyctl", "skopeo"}
 
 // scenario tells the fakes how to behave in one test.
 type scenario struct {
-	System      string
-	StoreDir    string                // every build output lies here, as with real nix
-	Outputs     map[string]fakeOutput // by flake attribute
-	Deploy      deployBehaviour
-	CopyExit    int  // skopeo copy's exit status after the push lands
-	CorruptPush bool // the registry stores manifest bytes other than the archive's
-	ListFail    bool // flyctl list commands fail
-	PorkbunBase string
+	System        string
+	StoreDir      string                // every build output lies here, as with real nix
+	Outputs       map[string]fakeOutput // by flake attribute
+	ExtraPackages []string              // extra packages.<system> names returned by nix eval
+	EvalFail      bool                  // nix eval fails
+	EvalTouchLock bool                  // nix eval rewrites the checkout's flake.lock
+	Deploy        deployBehaviour
+	AppDeploys    map[string]deployBehaviour // per Fly app override of Deploy
+	CopyExit      int                        // skopeo copy's exit status after the push lands
+	CorruptPush   bool                       // the registry stores manifest bytes other than the archive's
+	ListFail      bool                       // flyctl list commands fail
+	AppListFail   map[string]bool            // per Fly app override of ListFail
+	PorkbunBase   string
 }
 
 type fakeOutput struct {
@@ -69,7 +74,8 @@ type deployBehaviour struct {
 	HangLists   bool // and hang until killed instead of failing
 }
 
-// world is the fake Fly app and registry, which the fakes change.
+// world is the fake Fly app (or apps, when Apps is set) and registry, which
+// the fakes change.
 type world struct {
 	App       string
 	Machines  []fakeMachine
@@ -78,6 +84,16 @@ type world struct {
 	Pending   []fakeMachine     // Machines the deploy left, shown after Lag lists
 	Lag       int
 	Broken    bool // list calls fail once ListsLeft runs out
+	ListsLeft int
+	Apps      map[string]*appState // multi-app worlds, keyed by Fly app name
+}
+
+type appState struct {
+	Machines  []fakeMachine
+	Volumes   []fakeVolume
+	Pending   []fakeMachine
+	Lag       int
+	Broken    bool
 	ListsLeft int
 }
 
@@ -266,7 +282,20 @@ func (f *fake) saveWorld(w *world) {
 //	  --no-update-lock-file --no-write-lock-file
 //	  --option accept-flake-config false --out-link <link>
 //	  git+file://<checkout>?rev=<rev>#packages.<system>.<attr>
+//
+// and
+//
+//	nix eval --extra-experimental-features 'nix-command flakes'
+//	  --no-update-lock-file --no-write-lock-file
+//	  --option accept-flake-config false --json --apply <expr>
+//	  git+file://<checkout>?rev=<rev>#.
 func (f *fake) nix() int {
+	evalHead := []string{"eval", "--extra-experimental-features", "nix-command flakes",
+		"--no-update-lock-file", "--no-write-lock-file", "--option", "accept-flake-config", "false",
+		"--json", "--apply", fmt.Sprintf(`f: builtins.attrNames ((f.packages or {}).%q or {})`, f.sc.System)}
+	if len(f.args) == len(evalHead)+1 && slices.Equal(f.args[:len(evalHead)], evalHead) {
+		return f.nixEval(f.args[len(evalHead)])
+	}
 	head := []string{"build", "--extra-experimental-features", "nix-command flakes",
 		"--no-update-lock-file", "--no-write-lock-file", "--option", "accept-flake-config", "false", "--out-link"}
 	if len(f.args) != len(head)+2 || !slices.Equal(f.args[:len(head)], head) {
@@ -315,6 +344,93 @@ func (f *fake) nix() int {
 	return 0
 }
 
+func (f *fake) nixEval(installable string) int {
+	ref, frag, ok := strings.Cut(installable, "#")
+	u, err := url.Parse(ref)
+	if !ok || frag != "." || err != nil || u.Scheme != "git+file" {
+		return f.unexpected()
+	}
+	checkout := u.Path
+	marker, _ := os.ReadFile(filepath.Join(checkout, "marker"))
+	f.info["rev"], f.info["marker"] = u.Query().Get("rev"), string(marker)
+	f.record()
+	f.canary(false)
+
+	if f.sc.EvalTouchLock {
+		lock, err := os.OpenFile(filepath.Join(checkout, "flake.lock"), os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		if _, err := lock.WriteString("\n"); err != nil {
+			lock.Close()
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		if err := lock.Close(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+	}
+	if f.sc.EvalFail {
+		fmt.Fprintln(os.Stderr, "error: evaluation of flake failed")
+		return 1
+	}
+	var names []string
+	for k := range f.sc.Outputs {
+		names = append(names, k)
+	}
+	names = append(names, f.sc.ExtraPackages...)
+	slices.Sort(names)
+	if names == nil {
+		names = []string{}
+	}
+	return writeStdout(names)
+}
+
+func (f *fake) deployBehaviour(app string) deployBehaviour {
+	if b, ok := f.sc.AppDeploys[app]; ok {
+		return b
+	}
+	return f.sc.Deploy
+}
+
+func (f *fake) listFails(app string) bool {
+	if fail, ok := f.sc.AppListFail[app]; ok {
+		return fail
+	}
+	return f.sc.ListFail
+}
+
+func (w *world) stateFor(app string) (*appState, func()) {
+	if w.Apps != nil {
+		st, ok := w.Apps[app]
+		if !ok {
+			return nil, nil
+		}
+		return st, func() {}
+	}
+	if app != w.App {
+		return nil, nil
+	}
+	st := &appState{
+		Machines:  w.Machines,
+		Volumes:   w.Volumes,
+		Pending:   w.Pending,
+		Lag:       w.Lag,
+		Broken:    w.Broken,
+		ListsLeft: w.ListsLeft,
+	}
+	return st, func() {
+		w.Machines = st.Machines
+		w.Volumes = st.Volumes
+		w.Pending = st.Pending
+		w.Lag = st.Lag
+		w.Broken = st.Broken
+		w.ListsLeft = st.ListsLeft
+	}
+}
+
 // flyctl accepts only machines list, volumes list and deploy, in the forms
 // deploy uses.
 func (f *fake) flyctl() int {
@@ -325,29 +441,34 @@ func (f *fake) flyctl() int {
 	case len(a) == 5 && (a[0] == "machines" || a[0] == "volumes") && a[1] == "list" && a[2] == "--app" && a[4] == "--json":
 		f.record()
 		f.canary(false)
-		if w.Broken && w.ListsLeft <= 0 && f.sc.Deploy.HangLists {
+		app := a[3]
+		st, sync := w.stateFor(app)
+		beh := f.deployBehaviour(app)
+		if st != nil && st.Broken && st.ListsLeft <= 0 && beh.HangLists {
 			time.Sleep(time.Hour) // until deploy kills it at its deadline
 		}
-		if a[3] != w.App || f.sc.ListFail || (w.Broken && w.ListsLeft <= 0) {
+		if st == nil || f.listFails(app) || (st.Broken && st.ListsLeft <= 0) {
 			fmt.Fprintln(os.Stderr, "Error: Could not find App")
 			return 1
 		}
-		if w.Broken {
-			w.ListsLeft--
+		if st.Broken {
+			st.ListsLeft--
+			sync()
 			f.saveWorld(w)
 		}
 		if a[0] == "volumes" {
-			return writeStdout(flyVolumes(w.Volumes))
+			return writeStdout(flyVolumes(st.Volumes))
 		}
-		if w.Pending != nil {
-			if w.Lag > 0 {
-				w.Lag--
+		if st.Pending != nil {
+			if st.Lag > 0 {
+				st.Lag--
 			} else {
-				w.Machines, w.Pending = w.Pending, nil
+				st.Machines, st.Pending = st.Pending, nil
 			}
+			sync()
 			f.saveWorld(w)
 		}
-		return writeStdout(flyMachines(w.App, w.Machines))
+		return writeStdout(flyMachines(app, st.Machines))
 	case len(a) == 7 && a[0] == "deploy" && a[1] == "--config" && a[3] == "--app" && a[5] == "--image":
 		f.record()
 		f.canary(true)
@@ -357,48 +478,52 @@ func (f *fake) flyctl() int {
 }
 
 func (f *fake) deploy(w *world, config, app, image string) int {
+	st, sync := w.stateFor(app)
 	var cfg struct {
 		App string `json:"app"`
 	}
-	if data, err := os.ReadFile(config); err != nil || json.Unmarshal(data, &cfg) != nil || cfg.App != app || app != w.App {
+	if data, err := os.ReadFile(config); err != nil || json.Unmarshal(data, &cfg) != nil || cfg.App != app || st == nil {
 		fmt.Fprintln(os.Stderr, "Error: bad config")
 		return 1
 	}
 	digest, ok := strings.CutPrefix(image, "registry.fly.io/"+app+"@")
-	if !ok || !w.hasManifest(digest) {
+	if !ok || !w.hasManifest(app, digest) {
 		fmt.Fprintln(os.Stderr, "Error: manifest unknown")
 		return 1
 	}
-	if f.sc.Deploy.Block {
+	beh := f.deployBehaviour(app)
+	if beh.Block {
 		f.block()
 	}
-	machines, volumes := landDeploy(w, f.sc.Deploy.Effect, digest)
+	machines, volumes := landDeploy(st, beh.Effect, digest)
 	switch {
-	case f.sc.Deploy.Effect == "transient-extra":
-		w.Machines = append(slices.Clone(machines), fakeMachine{ID: "m0-old", State: "destroying", Digest: w.Machines[0].Digest})
-		w.Pending, w.Lag = machines, 1
-	case f.sc.Deploy.Lag > 0:
-		w.Pending, w.Lag = machines, f.sc.Deploy.Lag
+	case beh.Effect == "transient-extra":
+		st.Machines = append(slices.Clone(machines), fakeMachine{ID: "m0-old", State: "destroying", Digest: st.Machines[0].Digest})
+		st.Pending, st.Lag = machines, 1
+	case beh.Lag > 0:
+		st.Pending, st.Lag = machines, beh.Lag
 	default:
-		w.Machines = machines
+		st.Machines = machines
 	}
-	w.Volumes = volumes
-	w.Broken, w.ListsLeft = f.sc.Deploy.BreakLists, f.sc.Deploy.ListsBefore
+	st.Volumes = volumes
+	st.Broken, st.ListsLeft = beh.BreakLists, beh.ListsBefore
+	sync()
 	f.saveWorld(w)
-	return f.sc.Deploy.Exit
+	return beh.Exit
 }
 
-func (w *world) hasManifest(digest string) bool {
-	for _, m := range w.Registry {
-		if "sha256:"+sha256Hex(m) == digest {
+func (w *world) hasManifest(app, digest string) bool {
+	prefix := app + ":"
+	for k, m := range w.Registry {
+		if strings.HasPrefix(k, prefix) && "sha256:"+sha256Hex(m) == digest {
 			return true
 		}
 	}
 	return false
 }
 
-func landDeploy(w *world, effect, digest string) ([]fakeMachine, []fakeVolume) {
-	ms, vs := slices.Clone(w.Machines), slices.Clone(w.Volumes)
+func landDeploy(st *appState, effect, digest string) ([]fakeMachine, []fakeVolume) {
+	ms, vs := slices.Clone(st.Machines), slices.Clone(st.Volumes)
 	for i := range ms {
 		ms[i].Digest = digest
 	}
@@ -420,14 +545,14 @@ func landDeploy(w *world, effect, digest string) ([]fakeMachine, []fakeVolume) {
 	case "stale":
 		for i := range ms {
 			if ms[i].State == "started" {
-				ms[i].Digest = w.Machines[i].Digest
+				ms[i].Digest = st.Machines[i].Digest
 				break
 			}
 		}
 	case "skip-idle":
 		for i := range ms {
 			if ms[i].State != "started" {
-				ms[i].Digest = w.Machines[i].Digest
+				ms[i].Digest = st.Machines[i].Digest
 			}
 		}
 	case "stop-all":

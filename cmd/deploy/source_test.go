@@ -79,6 +79,22 @@ func TestUsage(t *testing.T) {
 		return append([]string{"app", "demo", "--infra", h.infra, "--rev", h.rev, "--fly-token-file", token}, extra...)
 	}
 	dns := []string{"dns-sync", "--infra", h.infra, "--rev", h.rev, "--porkbun-api-key-file", key, "--porkbun-secret-key-file", key}
+	conv := []string{"converge", "--infra", h.infra, "--rev", h.rev, "--fly-token-file", token, "--porkbun-api-key-file", key, "--porkbun-secret-key-file", key}
+	convFile := func(path string) []string {
+		return []string{"converge", "--infra", h.infra, "--commit-file", path, "--fly-token-file", token, "--porkbun-api-key-file", key, "--porkbun-secret-key-file", key}
+	}
+	goodCommitFile := h.write("commit/good.env", "VALLEY_REPOSITORY=infra\nVALLEY_COMMIT="+h.rev+"\n")
+	emptyCommitFile := h.write("commit/empty.env", "")
+	missingCommitFile := h.write("commit/missing.env", "VALLEY_REPOSITORY=infra\n")
+	dupCommitFile := h.write("commit/dup.env", "VALLEY_COMMIT="+h.rev+"\nVALLEY_COMMIT="+h.rev+"\n")
+	shortCommitFile := h.write("commit/short.env", "VALLEY_COMMIT="+h.rev[:12]+"\n")
+	upperCommitFile := h.write("commit/upper.env", "VALLEY_COMMIT="+strings.ToUpper(h.rev)+"\n")
+	quotedCommitFile := h.write("commit/quoted.env", "VALLEY_COMMIT=\""+h.rev+"\"\n")
+	noEqCommitFile := h.write("commit/noeq.env", "not-an-assignment\nVALLEY_COMMIT="+h.rev+"\n")
+	badNameCommitFile := h.write("commit/badname.env", "BAD-NAME=1\nVALLEY_COMMIT="+h.rev+"\n")
+	blankLineCommitFile := h.write("commit/blank.env", "\nVALLEY_COMMIT="+h.rev+"\n")
+	commentLineCommitFile := h.write("commit/comment.env", "# comment\nVALLEY_COMMIT="+h.rev+"\n")
+	nulByteCommitFile := h.write("commit/nul.env", "VALLEY_COMMIT="+h.rev+"\nOTHER=a\x00b\n")
 	for _, tc := range []struct {
 		name     string
 		args     []string
@@ -95,6 +111,7 @@ func TestUsage(t *testing.T) {
 		{name: "uppercase --rev", args: []string{"app", "demo", "--infra", h.infra, "--rev", strings.ToUpper(h.rev), "--fly-token-file", token}},
 		{name: "no --fly-token-file", args: []string{"app", "demo", "--infra", h.infra, "--rev", h.rev}},
 		{name: "app dry run", args: app("--dry-run")},
+		{name: "app commit-file flag", args: app("--commit-file", goodCommitFile)},
 		{name: "app target override", args: app("--app", "other-app")},
 		{name: "app org override", args: app("--org", "other-org")},
 		{name: "app environment override", args: app("--environment", "staging")},
@@ -107,6 +124,26 @@ func TestUsage(t *testing.T) {
 		{name: "dns-sync argument", args: append(dns, "gunk.dev")},
 		{name: "dns-sync without a secret key", args: dns[:len(dns)-2]},
 		{name: "dns-sync with a Fly token", args: append(dns, "--fly-token-file", token)},
+		{name: "dns-sync commit-file flag", args: append(dns, "--commit-file", goodCommitFile)},
+		{name: "converge argument", args: append(conv, "demo")},
+		{name: "converge without --rev or --commit-file", args: []string{"converge", "--infra", h.infra, "--fly-token-file", token, "--porkbun-api-key-file", key, "--porkbun-secret-key-file", key}},
+		{name: "converge with both --rev and --commit-file", args: append(conv, "--commit-file", goodCommitFile)},
+		{name: "converge with empty --commit-file", args: convFile("")},
+		{name: "converge with missing --commit-file", args: convFile(filepath.Join(h.root, "commit", "does-not-exist.env"))},
+		{name: "converge with empty commit file", args: convFile(emptyCommitFile)},
+		{name: "converge with commit file missing VALLEY_COMMIT", args: convFile(missingCommitFile)},
+		{name: "converge with duplicate VALLEY_COMMIT", args: convFile(dupCommitFile)},
+		{name: "converge with short VALLEY_COMMIT", args: convFile(shortCommitFile)},
+		{name: "converge with uppercase VALLEY_COMMIT", args: convFile(upperCommitFile)},
+		{name: "converge with quoted VALLEY_COMMIT", args: convFile(quotedCommitFile)},
+		{name: "converge with non-assignment line in commit file", args: convFile(noEqCommitFile)},
+		{name: "converge with invalid variable name in commit file", args: convFile(badNameCommitFile)},
+		{name: "converge with blank line in commit file", args: convFile(blankLineCommitFile)},
+		{name: "converge with comment line in commit file", args: convFile(commentLineCommitFile)},
+		{name: "converge with NUL byte in commit file", args: convFile(nulByteCommitFile)},
+		{name: "converge without fly token", args: []string{"converge", "--infra", h.infra, "--rev", h.rev, "--porkbun-api-key-file", key, "--porkbun-secret-key-file", key}},
+		{name: "converge without porkbun secret", args: conv[:len(conv)-2]},
+		{name: "converge unknown flag", args: append(conv, "--app", "other")},
 		{name: "relative state directory", args: app(), stateDir: "state"},
 		{name: "unset state directory", args: app(), stateDir: "-"},
 	} {
@@ -132,7 +169,7 @@ func TestUsage(t *testing.T) {
 		})
 	}
 
-	for _, args := range [][]string{{"--help"}, {"app", "--help"}, {"dns-sync", "--help"}, {"--version"}} {
+	for _, args := range [][]string{{"--help"}, {"app", "--help"}, {"dns-sync", "--help"}, {"converge", "--help"}, {"--version"}} {
 		out, err := h.command(args...).Output()
 		if err != nil {
 			t.Errorf("deploy %v: %v", args, err)

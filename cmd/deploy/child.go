@@ -187,6 +187,11 @@ func (r *runner) run(ctx context.Context, s childSpec) ([]byte, error) {
 	}
 	if log := r.writeLog(s, stdout, stderr, err); err != nil && log != "" {
 		fmt.Fprintf(r.errOut(), "deploy: %s; log: %s\n", r.red.text(err.Error()), log)
+	} else if err != nil && r.logs == "" && r.stderr != nil {
+		msg, _ := r.red.capped(stderr.buf, stderr.total > int64(len(stderr.buf)), 4096)
+		if text := strings.TrimSpace(string(msg)); text != "" {
+			fmt.Fprintf(r.errOut(), "deploy: %s:\n%s\n", r.red.text(err.Error()), text)
+		}
 	}
 	if err != nil || !s.capture {
 		return nil, err

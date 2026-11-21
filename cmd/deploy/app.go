@@ -19,13 +19,13 @@ const registry = "registry.fly.io"
 
 var appRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
-// nixBuild builds packages.<system>.<attr> from the checkout at the requested
-// commit and returns the output's store path. The out-link is an
-// execution-only GC root inside the work directory, removed by cleanup.
-func (a *attempt) nixBuild(ctx context.Context, attr string) (string, error) {
-	flake := (&url.URL{Scheme: "git+file", Path: a.repo, RawQuery: "rev=" + a.req.rev}).String()
-	link := filepath.Join(a.work, "links", attr)
-	_, err := a.r.run(ctx, childSpec{
+// nixBuildAttr builds packages.<system>.<attr> from the checkout at rev and
+// returns the output's store path. The out-link is an execution-only GC root
+// inside work/links, removed when work is cleaned up.
+func nixBuildAttr(ctx context.Context, r *runner, work, repo, rev, system, attr string) (string, error) {
+	flake := (&url.URL{Scheme: "git+file", Path: repo, RawQuery: "rev=" + rev}).String()
+	link := filepath.Join(work, "links", attr)
+	_, err := r.run(ctx, childSpec{
 		label: "nix build " + attr,
 		tool:  "nix",
 		// The private HOME hides any user nix.conf, so the features this
@@ -35,9 +35,9 @@ func (a *attempt) nixBuild(ctx context.Context, attr string) (string, error) {
 			"--no-update-lock-file", "--no-write-lock-file",
 			"--option", "accept-flake-config", "false",
 			"--out-link", link,
-			flake + "#packages." + a.system + "." + attr,
+			flake + "#packages." + system + "." + attr,
 		},
-		dir: a.work,
+		dir: work,
 	})
 	if err != nil {
 		return "", err
@@ -50,6 +50,11 @@ func (a *attempt) nixBuild(ctx context.Context, attr string) (string, error) {
 		return "", fmt.Errorf("nix build %s: %w", attr, err)
 	}
 	return out, nil
+}
+
+// nixBuild builds packages.<system>.<attr> from the attempt's checkout.
+func (a *attempt) nixBuild(ctx context.Context, attr string) (string, error) {
+	return nixBuildAttr(ctx, a.r, a.work, a.repo, a.req.rev, a.system, attr)
 }
 
 // checkInStore refuses a resolved path outside the Nix store: an output that
@@ -274,7 +279,8 @@ func parseTargets(app string, machinesJSON, volumesJSON []byte) (*targets, error
 
 // inspectApp records the app before anything changes. An app without
 // Machines is refused here: an ordinary deploy would create them, which
-// verification rejects as a Machine count change.
+// verification rejects as a Machine count change. Under converge, it also
+// decides whether the app is provably already at this commit's outputs.
 func (a *attempt) inspectApp(ctx context.Context) result {
 	t, err := a.snapshot(ctx, time.Time{})
 	if err != nil {
@@ -283,6 +289,20 @@ func (a *attempt) inspectApp(ctx context.Context) result {
 	a.rec.TargetsBefore = t
 	if len(t.Machines) == 0 {
 		return failed("app %s has no Machines; deploy only updates existing ones", a.app)
+	}
+	if a.checkSkip {
+		skip, reason := a.canSkipApp()
+		if skip {
+			a.skipped = true
+			a.skipAfterInspect = reason
+		} else {
+			a.deployReason = reason
+			if a.req.dryRun {
+				a.skipAfterInspect = "dry run: would deploy: " + reason
+			} else {
+				fmt.Fprintf(a.stderr, "deploy: deploying app %s: %s\n", a.req.name, a.redact(reason))
+			}
+		}
 	}
 	return completed()
 }
@@ -375,10 +395,13 @@ func (a *attempt) uploadApp(ctx context.Context) result {
 	return completed()
 }
 
-// applyApp runs an ordinary fly deploy of the verified digest and then
-// observes the app, whatever the deploy's outcome. The observation never
-// changes that outcome.
+// applyApp records this attempt as the app's last mutating attempt, runs an
+// ordinary fly deploy of the verified digest, and then observes the app,
+// whatever the deploy's outcome. The observation never changes that outcome.
 func (a *attempt) applyApp(ctx context.Context) result {
+	if err := a.writeAppPointer(); err != nil {
+		return failed("write app pointer: %v", err)
+	}
 	image := registry + "/" + a.app + "@" + a.digest
 	_, err := a.r.run(ctx, childSpec{
 		label:   "flyctl deploy",

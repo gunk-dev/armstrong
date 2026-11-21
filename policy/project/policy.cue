@@ -9,6 +9,8 @@ project: {
 	let ownChecks = [
 		"cue-vet",
 		"deploy",
+		"deploy-eval",
+		"deploy-vm",
 		"dns",
 		"go-test",
 		"go-vet",
@@ -26,8 +28,9 @@ project: {
 		}
 	}
 
-	// unifi-sync-vm boots a NixOS machine and needs KVM. Every other check
-	// takes seconds once the Go modules are fetched.
+	// VM tests boot a NixOS machine and need KVM. Every other check takes
+	// seconds once the Go modules are fetched.
+	checks: "deploy-vm":     cost: "slow"
 	checks: "unifi-sync-vm": cost: "slow"
 
 	// The Go CLIs, the CUE schema and its examples, and the NixOS module, as

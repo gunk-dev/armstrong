@@ -27,6 +27,7 @@ Outputs, for `x86_64-linux` and `aarch64-linux`:
 | `packages.<system>.schema`   | `schema/*.cue` laid out as a CUE module package path                             |
 | `devShells.<system>.default` | go, cue, nixfmt, gh                                                              |
 | `nixosModules.unifi-sync`    | the NixOS unit that keeps a UniFi site converged (also `nixosModules.default`)   |
+| `nixosModules.deploy`        | the NixOS unit (`deploy-converge.service`) that runs `deploy converge`           |
 | `checks.<system>`            | everything CI tests: see [Running the checks](#running-the-checks)               |
 
 ### The CLIs
@@ -248,8 +249,10 @@ nix build .#checks.x86_64-linux.go-test
 | `schema`                 | `packages.schema` builds                                                                                    |
 | `cue-vet`                | `cue vet ./schema`                                                                                          |
 | `schema-consumer`        | `examples/unifi` evaluates against `packages.schema`                                                        |
-| `unifi-sync-eval`        | the NixOS module evaluates and renders its unit                                                             |
-| `unifi-sync-vm`          | the NixOS module's VM test (needs `/dev/kvm`)                                                               |
+| `unifi-sync-eval`        | `nixosModules.unifi-sync` evaluates and renders its unit                                                    |
+| `unifi-sync-vm`          | `nixosModules.unifi-sync`'s VM test (needs `/dev/kvm`)                                                      |
+| `deploy-eval`            | `nixosModules.deploy` evaluates and renders its unit                                                        |
+| `deploy-vm`              | `nixosModules.deploy`'s VM test (needs `/dev/kvm`)                                                          |
 | `nixfmt`                 | every `.nix` file is formatted                                                                              |
 | `yamllint`               | the workflow YAML lints clean                                                                               |
 | `zizmor`                 | the workflows pass zizmor's offline audits                                                                  |
@@ -330,7 +333,7 @@ overrides the API endpoint (used by tests).
 
 ## Deploy Runner
 
-`deploy` (`cmd/deploy/`) runs one deployment from an exact commit of an infra repository and records
+`deploy` (`cmd/deploy/`) runs deployments from an exact commit of an infra repository and records
 what it did:
 
 ```sh
@@ -340,22 +343,27 @@ deploy app flux --infra https://example.com/infra.git --rev "$rev" --fly-token-f
 deploy dns-sync --infra ~/src/infra --rev "$rev" \
   --porkbun-api-key-file /run/secrets/porkbun-key \
   --porkbun-secret-key-file /run/secrets/porkbun-secret --dry-run
+deploy converge --infra ~/src/infra --rev "$rev" \
+  --fly-token-file /run/secrets/fly-token \
+  --porkbun-api-key-file /run/secrets/porkbun-key \
+  --porkbun-secret-key-file /run/secrets/porkbun-secret
 ```
 
 `deploy app <name>` builds the infra flake's `deploy-<name>-config` (a directory holding only
 `fly.json`) and `deploy-<name>-image` (a single-platform OCI archive whose build runs the image's
 smoke check). It pushes the image to the Fly registry, deploys it by digest, and verifies the app.
 `deploy dns-sync` vets and exports the CUE zones under `dns/` and runs `dns sync --prune` once over
-all of them.
+all of them. `deploy converge` syncs DNS first, then checks the flake's apps in name order. It skips
+an app only if deploy history and live Machines match the requested outputs. A failed or uncertain
+attempt stops the run.
 
-Only committed content at `--rev` is used. One attempt runs at a time per state directory. Each
-attempt prints the path of its record, `runs/<attempt-id>/record.json`. It exits 0 when completed, 2
-on a usage error, 75 when another attempt holds the lock, 129, 130 or 143 when interrupted, and 1
-when anything else fails or is uncertain. An `uncertain` record means a write may have landed: look
-at the target before running again.
+Only committed content at `--rev` is used. Each invocation holds the state directory lock, and each
+attempt prints its record path. Check the target before retrying an `uncertain` attempt. Its write
+may have landed.
 
-The infra layout, phases, record fields and credential handling are in
-[docs/deploy.md](docs/deploy.md).
+On NixOS, start `deploy-converge.service` from an external trigger. The service refreshes a
+deploy-owned infra snapshot before running convergence. See the
+[deployment reference](docs/deploy.md) for setup, exit codes and the app skip rule.
 
 ## Reusable Workflows
 

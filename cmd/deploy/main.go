@@ -1,9 +1,12 @@
-// Command deploy runs one deployment from an exact revision of an infra
-// repository: `deploy app <name>` builds, uploads and deploys one Fly app, and
-// `deploy dns-sync` converges the repository's DNS zones on Porkbun.
+// Command deploy runs deployments from an exact revision of an infra
+// repository: `deploy app <name>` builds, uploads and deploys one Fly app,
+// `deploy dns-sync` converges the repository's DNS zones on Porkbun, and
+// `deploy converge` runs dns-sync followed by every app the flake exposes,
+// skipping apps that are already at that commit's outputs.
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -48,23 +51,28 @@ const (
 )
 
 const (
-	verbApp = "app"
-	verbDNS = "dns-sync"
+	verbApp      = "app"
+	verbDNS      = "dns-sync"
+	verbConverge = "converge"
 )
 
+const maxCommitFileBytes = 1 << 20
+
 var (
-	revRE  = regexp.MustCompile(`^[0-9a-f]{40}$`)
-	nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+	revRE     = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	nameRE    = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+	envNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
 // request is a validated invocation.
 type request struct {
-	verb     string
-	name     string // app only
-	dryRun   bool   // dns-sync only
-	infra    string // absolute directory or credential-free https/file URL
-	rev      string
-	stateDir string
+	verb                string
+	name                string // app only
+	dryRun              bool   // dns-sync and converge
+	infra               string // absolute directory or credential-free https/file URL
+	rev                 string
+	requireMainAncestor bool // true when rev came from --commit-file
+	stateDir            string
 
 	flyTokenFile      string
 	porkbunKeyFile    string
@@ -100,30 +108,33 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return execute(*req, stdout, stderr)
 }
 
-const rootLong = `deploy runs one deployment from an exact commit of an infra repository and
-records what it did.
+const rootLong = `deploy runs deployments from an exact commit of an infra repository and records
+what it did.
 
   deploy app <name>      build, upload and deploy one Fly app
   deploy dns-sync        converge the repository's DNS zones on Porkbun
+  deploy converge        run dns-sync, then deploy each app that differs
 
 Every command requires:
   --infra <checkout|git-url>  a repository directory, or an https:// or file://
                               Git URL without embedded credentials
   --rev <commit>              the full 40-character lowercase commit to deploy
-  DEPLOY_STATE_DIR            an absolute directory for deploy.lock and the
-                              per-attempt records under runs/<id>/record.json,
-                              owned by this user and writable by no one else
+                              (converge also accepts --commit-file <file>)
+  DEPLOY_STATE_DIR            an absolute directory for deploy.lock, per-app
+                              pointers under apps/ and per-attempt records
+                              under runs/<id>/record.json, owned by this user
+                              and writable by no one else
 
 Only committed content at --rev is used; the working tree of a checkout is
-ignored. One attempt runs at a time per state directory. Each attempt prints
-the absolute path of its record first, and moves through the phases source,
+ignored. One invocation runs at a time per state directory. Each attempt prints
+the absolute path of its record first, moves through the phases source,
 prepare, inspect, upload, apply, verify and cleanup, and keeps every child's
 redacted output under runs/<id>/logs. An uncertain record means a change to
 the target started and was confirmed neither done nor undone: inspect the
 target before running again.
 
 Exit status:
-  0    completed, or a completed dry run
+  0    completed, skipped, or a completed dry run
   2    usage error
   75   another attempt holds the lock
   129  interrupted by SIGHUP
@@ -134,7 +145,7 @@ Exit status:
 func newRootCmd(out **request) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "deploy",
-		Short:         "Deploy a Fly app or sync DNS from an exact infra revision",
+		Short:         "Deploy Fly apps and sync DNS from an exact infra revision",
 		Long:          rootLong,
 		Version:       version,
 		SilenceUsage:  true,
@@ -146,12 +157,12 @@ func newRootCmd(out **request) *cobra.Command {
 			return nil
 		},
 		RunE: func(*cobra.Command, []string) error {
-			return errors.New("a command is required: app or dns-sync")
+			return errors.New("a command is required: app, dns-sync or converge")
 		},
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
 	root.SetVersionTemplate("deploy {{.Version}}\n")
-	root.AddCommand(newAppCmd(out), newDNSSyncCmd(out))
+	root.AddCommand(newAppCmd(out), newDNSSyncCmd(out), newConvergeCmd(out))
 	return root
 }
 
@@ -166,11 +177,26 @@ func (c *commonFlags) register(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&c.rev, "rev", "", "full 40-character lowercase commit to deploy (required)")
 }
 
-func (c *commonFlags) request(verb string) (*request, error) {
+func (c *commonFlags) requestBase(verb string) (*request, error) {
 	if c.infra == "" {
 		return nil, usagef("--infra is required")
 	}
 	infra, err := parseInfra(c.infra)
+	if err != nil {
+		return nil, err
+	}
+	stateDir := os.Getenv("DEPLOY_STATE_DIR")
+	if stateDir == "" {
+		return nil, usagef("DEPLOY_STATE_DIR is not set")
+	}
+	if !filepath.IsAbs(stateDir) {
+		return nil, usagef("DEPLOY_STATE_DIR %q is not an absolute path", stateDir)
+	}
+	return &request{verb: verb, infra: infra, stateDir: filepath.Clean(stateDir)}, nil
+}
+
+func (c *commonFlags) request(verb string) (*request, error) {
+	req, err := c.requestBase(verb)
 	if err != nil {
 		return nil, err
 	}
@@ -180,14 +206,56 @@ func (c *commonFlags) request(verb string) (*request, error) {
 	if !revRE.MatchString(c.rev) {
 		return nil, usagef("--rev %q is not a full 40-character lowercase commit", c.rev)
 	}
-	stateDir := os.Getenv("DEPLOY_STATE_DIR")
-	if stateDir == "" {
-		return nil, usagef("DEPLOY_STATE_DIR is not set")
+	req.rev = c.rev
+	return req, nil
+}
+
+// readCommitFile reads path once as data, accepts only NAME=value lines,
+// ignores every name except VALLEY_COMMIT, and returns the 40-character
+// lowercase commit or a usage error.
+func readCommitFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", usagef("--commit-file: %v", err)
 	}
-	if !filepath.IsAbs(stateDir) {
-		return nil, usagef("DEPLOY_STATE_DIR %q is not an absolute path", stateDir)
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxCommitFileBytes+1))
+	if err != nil {
+		return "", usagef("--commit-file: %v", err)
 	}
-	return &request{verb: verb, infra: infra, rev: c.rev, stateDir: filepath.Clean(stateDir)}, nil
+	if len(data) > maxCommitFileBytes {
+		return "", usagef("--commit-file %s exceeds %d bytes", path, maxCommitFileBytes)
+	}
+	if bytes.IndexByte(data, 0) >= 0 {
+		return "", usagef("--commit-file %s contains a NUL byte", path)
+	}
+	text := strings.TrimSuffix(string(data), "\n")
+	if text == "" {
+		return "", usagef("--commit-file %s has no VALLEY_COMMIT", path)
+	}
+	var commit string
+	seen := false
+	for i, line := range strings.Split(text, "\n") {
+		name, val, ok := strings.Cut(line, "=")
+		if !ok || !envNameRE.MatchString(name) {
+			return "", usagef("--commit-file %s: line %d is not of the form NAME=value", path, i+1)
+		}
+		if name != "VALLEY_COMMIT" {
+			continue
+		}
+		if seen {
+			return "", usagef("--commit-file %s: duplicate VALLEY_COMMIT", path)
+		}
+		seen = true
+		if !revRE.MatchString(val) {
+			return "", usagef("--commit-file %s: VALLEY_COMMIT %q is not a full 40-character lowercase commit", path, val)
+		}
+		commit = val
+	}
+	if !seen {
+		return "", usagef("--commit-file %s has no VALLEY_COMMIT", path)
+	}
+	return commit, nil
 }
 
 // parseInfra accepts a repository directory, made absolute, or an
@@ -330,5 +398,94 @@ The key files hold the Porkbun API key and secret key; only dns sees them.`,
 	cmd.Flags().StringVar(&keyFile, "porkbun-api-key-file", "", "file holding the Porkbun API key (required)")
 	cmd.Flags().StringVar(&secretFile, "porkbun-secret-key-file", "", "file holding the Porkbun secret key (required)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the plan without changing any record")
+	return cmd
+}
+
+func newConvergeCmd(out **request) *cobra.Command {
+	var common commonFlags
+	var commitFile, tokenFile, keyFile, secretFile string
+	var dryRun bool
+	cmd := &cobra.Command{
+		Use:   "converge --infra <checkout|git-url> (--rev <commit> | --commit-file <file>) --fly-token-file <file> --porkbun-api-key-file <file> --porkbun-secret-key-file <file> [--dry-run]",
+		Short: "Converge DNS and every app the infra flake exposes at a commit",
+		Long: `Runs a sequence of ordinary attempts under one lock: dns-sync first, then each
+app the infra flake exposes for the packaged Nix system, in sorted order.
+
+The target commit comes from either --rev or --commit-file (mutually exclusive).
+--commit-file reads a file of NAME=value lines once as data, takes VALLEY_COMMIT
+(ignoring other names), and requires it to be an ancestor of (or equal to)
+refs/heads/main in --infra before any attempt starts.
+
+Apps are discovered from packages.<system>.deploy-<name>-image and
+packages.<system>.deploy-<name>-config; each app's config output is built during
+discovery to resolve its Fly app name. Unpaired outputs, invalid names, or two
+outputs targeting the same Fly app are refused before any attempt starts.
+
+An app is skipped only when the per-app pointer under DEPLOY_STATE_DIR/apps/
+names a completed deploy with the same flake app, Fly app, platform, fly.json
+SHA-256 and image digest, and live inspection confirms the Machines still settle
+on that digest (with a started Machine when fly.json keeps one running). Any
+doubt deploys. A skipped app is recorded with outcome "skipped" and a reason
+stating what was compared. Standalone "deploy app <name>" never skips.
+
+The first failed or uncertain attempt stops the sequence; remaining apps are
+not attempted. A summary at the end lists every target, its outcome and record
+path, and what was not attempted.
+
+--dry-run runs dns-sync --dry-run and, per app, builds, inspects and reports
+whether it would skip or deploy without changing anything.`,
+		Args: exactArgs(0, "converge takes no arguments"),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			req, err := common.requestBase(verbConverge)
+			if err != nil {
+				return err
+			}
+			revSet := cmd.Flags().Changed("rev")
+			fileSet := cmd.Flags().Changed("commit-file")
+			switch {
+			case revSet && fileSet:
+				return usagef("--rev and --commit-file are mutually exclusive")
+			case fileSet:
+				if commitFile == "" {
+					return usagef("--commit-file must not be empty")
+				}
+				rev, err := readCommitFile(commitFile)
+				if err != nil {
+					return err
+				}
+				req.rev = rev
+				req.requireMainAncestor = true
+			case revSet:
+				if common.rev == "" {
+					return usagef("--rev is required")
+				}
+				if !revRE.MatchString(common.rev) {
+					return usagef("--rev %q is not a full 40-character lowercase commit", common.rev)
+				}
+				req.rev = common.rev
+			default:
+				return usagef("--rev or --commit-file is required")
+			}
+			if tokenFile == "" {
+				return usagef("--fly-token-file is required")
+			}
+			if keyFile == "" || secretFile == "" {
+				return usagef("--porkbun-api-key-file and --porkbun-secret-key-file are both required")
+			}
+			req.dryRun = dryRun
+			req.flyTokenFile = tokenFile
+			req.porkbunKeyFile = keyFile
+			req.porkbunSecretFile = secretFile
+			*out = req
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&common.infra, "infra", "", "infra repository: a directory, or an https:// or file:// Git URL (required)")
+	cmd.Flags().StringVar(&common.rev, "rev", "", "full 40-character lowercase commit to deploy (mutually exclusive with --commit-file)")
+	cmd.Flags().StringVar(&commitFile, "commit-file", "", "file of NAME=value lines providing VALLEY_COMMIT, required to be on refs/heads/main (mutually exclusive with --rev)")
+	cmd.Flags().StringVar(&tokenFile, "fly-token-file", "", "file holding the Fly API token (required)")
+	cmd.Flags().StringVar(&keyFile, "porkbun-api-key-file", "", "file holding the Porkbun API key (required)")
+	cmd.Flags().StringVar(&secretFile, "porkbun-secret-key-file", "", "file holding the Porkbun secret key (required)")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "run dns-sync --dry-run and report per-app skip/deploy decisions without changing anything")
 	return cmd
 }
