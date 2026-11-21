@@ -18,8 +18,6 @@ project: {
 		"unifi",
 		"unifi-sync-eval",
 		"unifi-sync-vm",
-		"yamllint",
-		"zizmor",
 	]
 	for n in ownChecks {
 		checks: (n): {
@@ -35,8 +33,7 @@ project: {
 	// The Go CLIs, the CUE schema and its examples, and the NixOS module, as
 	// one class, because the checks read across these parts: the unifi tests
 	// shell out to cue against schema/, and unifi-sync-vm runs the unifi
-	// binary and the schema through the module's own unit. The workflow
-	// linters read only .github/.
+	// binary and the schema through the module's own unit.
 	classes: source: {
 		paths: "cmd/**":      true
 		paths: "internal/**": true
@@ -46,13 +43,7 @@ project: {
 		paths: "cue.mod/**":  true
 		paths: "examples/**": true
 		paths: "nix/**":      true
-		requires: {for n in ownChecks if n != "yamllint" && n != "zizmor" {(n): true}}
-	}
-
-	classes: workflows: {
-		paths: ".github/**": true
-		requires: yamllint:  true
-		requires: zizmor:    true
+		requires: {for n in ownChecks {(n): true}}
 	}
 
 	// flake.nix defines every check, flake.lock pins the nixpkgs each is
